@@ -1,0 +1,274 @@
+//! Winternitz one-time signatures (w = 2^16), ported verbatim from midstate
+//! `src/core/wots.rs` (midstate's key-reuse punishment section omitted: it
+//! builds midstate transactions).
+
+pub const W: usize = 16; // bits per digit
+pub const MSG_CHAINS: usize = 16; // 256 / W
+pub const CHECKSUM_CHAINS: usize = 2; // ceil(20 / 16)
+pub const CHAINS: usize = MSG_CHAINS + CHECKSUM_CHAINS; // 18
+pub const MAX_DIGIT: u32 = (1 << W) - 1; // 65_535
+pub const SIG_SIZE: usize = CHAINS * 32; // 576 bytes
+
+/// Generate a coin ID sequentially.
+/// Use this inside outer parallel loops (like MSS tree generation) to avoid thread thrashing.
+pub fn keygen_seq(seed: &[u8; 32]) -> [u8; 32] {
+    let mut inputs = [[0u8; 32]; CHAINS];
+    for i in 0..CHAINS {
+        inputs[i] = chain_sk(seed, i);
+    }
+    let targets = [MAX_DIGIT as usize; CHAINS];
+
+    // Process all 18 chains simultaneously using SIMD
+    let results = crate::core::wots_simd::process_wots_batch(&inputs, &targets);
+
+    let mut endpoints = [[0u8; 32]; CHAINS];
+    endpoints.copy_from_slice(&results);
+    compress(&endpoints)
+}
+/// Derive chain secret key element: sk[i] = BLAKE3(seed || i)
+fn chain_sk(seed: &[u8; 32], i: usize) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(seed);
+    hasher.update(&(i as u32).to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Compress all chain endpoints into a single 32-byte coin ID.
+fn compress(endpoints: &[[u8; 32]; CHAINS]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for ep in endpoints {
+        hasher.update(ep);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// Parse a 32-byte message into 16 × 16-bit digits (big-endian).
+fn message_digits(msg: &[u8; 32]) -> [u32; MSG_CHAINS] {
+    let mut digits = [0u32; MSG_CHAINS];
+    for i in 0..MSG_CHAINS {
+        digits[i] = u16::from_be_bytes([msg[i * 2], msg[i * 2 + 1]]) as u32;
+    }
+    digits
+}
+
+/// Compute the 2-digit checksum over the message digits.
+///
+/// checksum = Σ (MAX_DIGIT - d_i)  for all message digits
+///
+/// Max value: 16 × 65535 = 1,048,560 (0x000F_FFF0), fits in 20 bits.
+/// Encoded big-endian into 2 × 16-bit digits.
+fn checksum_digits(msg_digits: &[u32; MSG_CHAINS]) -> [u32; CHECKSUM_CHAINS] {
+    let sum: u32 = msg_digits.iter().map(|&d| MAX_DIGIT - d).sum();
+    [
+        (sum >> 16) & 0xFFFF, // high 16 bits
+        sum & 0xFFFF,         // low 16 bits
+    ]
+}
+
+/// Combine message + checksum digits into the full digit vector.
+fn all_digits(msg: &[u8; 32]) -> [u32; CHAINS] {
+    let md = message_digits(msg);
+    let cd = checksum_digits(&md);
+    let mut digits = [0u32; CHAINS];
+    digits[..MSG_CHAINS].copy_from_slice(&md);
+    digits[MSG_CHAINS..].copy_from_slice(&cd);
+    digits
+}
+
+/// Generate a coin ID (public key) from a seed (private key).
+/// Because SIMD processing is so fast, spawning Rayon threads for
+/// only 18 items adds latency. We route directly to the SIMD sequence.
+pub fn keygen(seed: &[u8; 32]) -> [u8; 32] {
+    keygen_seq(seed)
+}
+
+/// Sign a 32-byte message with the given seed.
+///
+/// For each digit d_i, reveals hash^{d_i}(sk_i).
+/// The verifier can hash the remaining (MAX_DIGIT - d_i) times to reach the endpoint.
+pub fn sign(seed: &[u8; 32], message: &[u8; 32]) -> [[u8; 32]; CHAINS] {
+    let digits = all_digits(message);
+
+    let mut inputs = [[0u8; 32]; CHAINS];
+    let mut targets = [0usize; CHAINS];
+
+    for i in 0..CHAINS {
+        inputs[i] = chain_sk(seed, i);
+        targets[i] = digits[i] as usize;
+    }
+
+    // Compute the signature via the variable-masking SIMD processor
+    let results = crate::core::wots_simd::process_wots_batch(&inputs, &targets);
+
+    let mut sig = [[0u8; 32]; CHAINS];
+    sig.copy_from_slice(&results);
+    sig
+}
+
+/// Verify a WOTS signature against a message and coin ID.
+///
+/// For each digit d_i, hashes sig[i] exactly (MAX_DIGIT - d_i) times
+/// and checks that all endpoints compress to the coin ID.
+///
+/// Average verification cost: CHAINS × (MAX_DIGIT / 2) ≈ 590K hashes.
+/// With BLAKE3: ~0.5–1 ms on modern hardware.
+pub fn verify(sig: &[[u8; 32]; CHAINS], message: &[u8; 32], coin_id: &[u8; 32]) -> bool {
+    let digits = all_digits(message);
+    let mut targets = [0usize; CHAINS];
+
+    for i in 0..CHAINS {
+        targets[i] = (MAX_DIGIT - digits[i]) as usize;
+    }
+
+    // Finish the hash chains simultaneously using SIMD
+    let results = crate::core::wots_simd::process_wots_batch(sig, &targets);
+
+    let mut endpoints = [[0u8; 32]; CHAINS];
+    endpoints.copy_from_slice(&results);
+    compress(&endpoints) == *coin_id
+}
+
+/// Serialize signature to bytes (18 × 32 = 576 bytes).
+pub fn sig_to_bytes(sig: &[[u8; 32]; CHAINS]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SIG_SIZE);
+    for chunk in sig {
+        out.extend_from_slice(chunk);
+    }
+    out
+}
+
+/// Deserialize signature from bytes.
+pub fn sig_from_bytes(bytes: &[u8]) -> Option<[[u8; 32]; CHAINS]> {
+    if bytes.len() != SIG_SIZE {
+        return None;
+    }
+    let mut sig = [[0u8; 32]; CHAINS];
+    for (i, chunk) in bytes.chunks_exact(32).enumerate() {
+        sig[i].copy_from_slice(chunk);
+    }
+    Some(sig)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::hash;
+
+    #[test]
+    fn sign_verify_round_trip() {
+        let seed: [u8; 32] = [0x42; 32];
+        let coin = keygen(&seed);
+        let msg = hash(b"test message");
+        let sig = sign(&seed, &msg);
+        assert!(verify(&sig, &msg, &coin));
+    }
+
+    #[test]
+    fn wrong_message_fails() {
+        let seed: [u8; 32] = [0x42; 32];
+        let coin = keygen(&seed);
+        let msg = hash(b"test message");
+        let sig = sign(&seed, &msg);
+        let bad_msg = hash(b"wrong message");
+        assert!(!verify(&sig, &bad_msg, &coin));
+    }
+
+    #[test]
+    fn wrong_key_fails() {
+        let seed: [u8; 32] = [0x42; 32];
+        let msg = hash(b"test message");
+        let sig = sign(&seed, &msg);
+        let other_seed: [u8; 32] = [0x43; 32];
+        let other_coin = keygen(&other_seed);
+        assert!(!verify(&sig, &msg, &other_coin));
+    }
+
+    #[test]
+    fn ser_deser_round_trip() {
+        let seed: [u8; 32] = [0x42; 32];
+        let msg = hash(b"test");
+        let sig = sign(&seed, &msg);
+        let bytes = sig_to_bytes(&sig);
+        assert_eq!(bytes.len(), SIG_SIZE);
+        assert_eq!(bytes.len(), 576);
+        let sig2 = sig_from_bytes(&bytes).unwrap();
+        assert_eq!(sig, sig2);
+    }
+
+    #[test]
+    fn signature_size_is_576() {
+        assert_eq!(CHAINS, 18);
+        assert_eq!(SIG_SIZE, 576);
+    }
+
+    #[test]
+    fn checksum_prevents_forgery() {
+        let msg1 = [0u8; 32];
+        let msg2 = {
+            let mut m = [0u8; 32];
+            m[0] = 1;
+            m
+        };
+        let d1 = all_digits(&msg1);
+        let d2 = all_digits(&msg2);
+
+        assert!(d2[0] > d1[0]);
+
+        let cs_decreased = (MSG_CHAINS..CHAINS).any(|i| d2[i] < d1[i]);
+        assert!(
+            cs_decreased,
+            "checksum must decrease when a message digit increases"
+        );
+    }
+
+    #[test]
+    fn digit_extraction() {
+        let mut msg = [0u8; 32];
+        msg[0] = 0x01;
+        msg[1] = 0x00;
+        let digits = message_digits(&msg);
+        assert_eq!(digits[0], 256);
+        assert_eq!(digits[1], 0);
+    }
+
+    #[test]
+    fn max_checksum_fits() {
+        let msg = [0u8; 32];
+        let md = message_digits(&msg);
+        let cd = checksum_digits(&md);
+        let sum: u32 = md.iter().map(|&d| MAX_DIGIT - d).sum();
+        assert_eq!(sum, 16 * 65535);
+        assert!(cd[0] <= MAX_DIGIT);
+        assert!(cd[1] <= MAX_DIGIT);
+    }
+
+    #[test]
+    fn all_ff_message() {
+        let msg = [0xff; 32];
+        let md = message_digits(&msg);
+        for &d in &md {
+            assert_eq!(d, 65535);
+        }
+        let cd = checksum_digits(&md);
+        assert_eq!(cd[0], 0);
+        assert_eq!(cd[1], 0);
+    }
+
+    #[test]
+    fn sig_from_bytes_wrong_length() {
+        assert!(sig_from_bytes(&[0u8; 100]).is_none());
+        assert!(sig_from_bytes(&[0u8; SIG_SIZE + 1]).is_none());
+        assert!(sig_from_bytes(&[]).is_none());
+    }
+
+    #[test]
+    fn keygen_deterministic() {
+        let seed = [0x42u8; 32];
+        assert_eq!(keygen(&seed), keygen(&seed));
+    }
+
+    #[test]
+    fn different_seeds_different_keys() {
+        assert_ne!(keygen(&[1u8; 32]), keygen(&[2u8; 32]));
+    }
+}
