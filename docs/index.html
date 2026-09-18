@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#07070a">
+  <meta name="description" content="Midwimble — a private cryptocurrency anchored to Midstate for durable checkpoints and post-quantum recovery.">
+  <title>Midwimble — Private state. Durable anchor.</title>
+  <link rel="icon" href="assets/midwimble-logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="site.css">
+</head>
+<body>
+  <div class="noise" aria-hidden="true"></div>
+
+  <header class="nav">
+    <a class="brand" href="#top" aria-label="Midwimble home">
+      <img src="assets/midwimble-logo.svg" alt="">
+      <span>midwimble</span>
+    </a>
+
+    <nav>
+      <a href="#architecture">Architecture</a>
+      <a href="#status">Status</a>
+      <a href="https://github.com/ciphernom/midwimble">GitHub</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="hero-copy">
+        <div class="eyebrow">PRIVATE STATE · DURABLE ANCHOR</div>
+        <h1>Money can be private<br><span>without forgetting where safety is.</span></h1>
+        <p class="lede">
+          Midwimble is a MimbleWimble-inspired privacy chain that periodically
+          anchors its state into <strong>Midstate</strong> — creating durable
+          checkpoints for recovery, finality and eventually anchored cut-through.
+        </p>
+
+        <div class="actions">
+          <a class="button primary" href="https://github.com/ciphernom/midwimble">View the code</a>
+          <a class="button ghost" href="#architecture">How it works</a>
+        </div>
+
+        <div class="status-line">
+          <span class="dot"></span>
+          <span>Research devnet · Rust · not for real value</span>
+        </div>
+      </div>
+
+      <div class="hero-mark">
+        <div class="halo halo-one"></div>
+        <div class="halo halo-two"></div>
+        <img src="assets/midwimble-logo.svg" alt="Midwimble logo">
+      </div>
+    </section>
+
+    <section class="manifesto">
+      <p>Most blockchains preserve every payment as archaeology.</p>
+      <p class="accent">Midwimble starts from a different premise.</p>
+      <h2>Money should be private by default.</h2>
+    </section>
+
+    <section id="architecture" class="architecture">
+      <div class="section-head">
+        <div>
+          <span class="kicker">TWO RIVERS</span>
+          <h2>One flows. One remembers.</h2>
+        </div>
+        <p>
+          Midwimble handles private economic activity. Midstate provides an
+          external, post-quantum-oriented cryptographic memory.
+        </p>
+      </div>
+
+      <div class="rivers" aria-label="Midstate and Midwimble architecture">
+        <div class="river-label midstate-label">MIDSTATE</div>
+        <svg viewBox="0 0 1200 320" role="img" aria-label="Two interwoven chains with checkpoints">
+          <defs>
+            <linearGradient id="mw" x1="0" x2="1">
+              <stop offset="0" stop-color="#6d28d9"/>
+              <stop offset=".5" stop-color="#a78bfa"/>
+              <stop offset="1" stop-color="#7c3aed"/>
+            </linearGradient>
+            <filter id="glow">
+              <feGaussianBlur stdDeviation="4" result="b"/>
+              <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+          </defs>
+
+          <path class="river state" d="M20 85 C190 15 310 145 470 85 S770 18 930 85 S1100 145 1180 85"/>
+          <path class="river wimble" d="M20 235 C190 305 310 175 470 235 S770 302 930 235 S1100 175 1180 235"/>
+
+          <g class="anchors">
+            <line x1="310" y1="103" x2="310" y2="217"/>
+            <circle cx="310" cy="103" r="8"/>
+            <circle cx="310" cy="217" r="8"/>
+
+            <line x1="685" y1="72" x2="685" y2="248"/>
+            <circle cx="685" cy="72" r="8"/>
+            <circle cx="685" cy="248" r="8"/>
+
+            <line x1="1010" y1="105" x2="1010" y2="215"/>
+            <circle cx="1010" cy="105" r="8"/>
+            <circle cx="1010" cy="215" r="8"/>
+          </g>
+        </svg>
+        <div class="river-label midwimble-label">MIDWIMBLE</div>
+      </div>
+
+      <div class="feature-grid">
+        <article>
+          <span class="num">01</span>
+          <h3>Private transactions</h3>
+          <p>
+            Confidential commitments, range proofs, stealth-style outputs and
+            one-time ownership keys are built into the accounting model.
+          </p>
+        </article>
+
+        <article>
+          <span class="num">02</span>
+          <h3>Midstate anchors</h3>
+          <p>
+            Midwimble checkpoints can be committed into Midstate explicitly
+            or through merged mining, without turning Midstate into a privacy chain.
+          </p>
+        </article>
+
+        <article>
+          <span class="num">03</span>
+          <h3>Dormant recovery</h3>
+          <p>
+            Outputs can carry hidden hash-based recovery commitments that remain
+            unused unless a future cryptographic catastrophe requires migration.
+          </p>
+        </article>
+
+        <article>
+          <span class="num">04</span>
+          <h3>Anchored cut-through</h3>
+          <p>
+            The planned pruning model uses finalized Midstate checkpoints as
+            horizons below which old spent history can eventually disappear.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section class="checkpoint">
+      <div class="checkpoint-copy">
+        <span class="kicker">WHY ANCHOR?</span>
+        <h2>A place to return to.</h2>
+        <p>
+          If the cryptography protecting Midwimble ever becomes unsafe, an
+          externally recorded checkpoint gives the network a deterministic
+          candidate state from before the break.
+        </p>
+        <p>
+          The anchor does not expose who paid whom. It records only enough to say:
+        </p>
+        <blockquote>This state existed.</blockquote>
+      </div>
+
+      <div class="checkpoint-card">
+        <div class="terminal-head">
+          <span></span><span></span><span></span>
+          <b>checkpoint</b>
+        </div>
+        <pre><code>version          1
+network          midwimble
+height           2,500,000
+header_hash      9f2a…71c4
+state_root       a84d…02b1
+cumulative_work  0000…e912
+previous         53bc…90af
+
+anchor → MIDSTATE</code></pre>
+      </div>
+    </section>
+
+    <section id="status" class="status">
+      <div class="section-head">
+        <div>
+          <span class="kicker">CURRENT STATUS</span>
+          <h2>Working code, unfinished protocol.</h2>
+        </div>
+        <p>
+          Midwimble is research software. The interesting parts are implemented
+          far enough to test, break and improve — not to pretend the work is done.
+        </p>
+      </div>
+
+      <div class="status-grid">
+        <div class="status-card implemented">
+          <span>IMPLEMENTED</span>
+          <ul>
+            <li>MimbleWimble-style transaction core</li>
+            <li>Confidential commitments and range proofs</li>
+            <li>Stealth-style outputs and receiver ownership</li>
+            <li>P2P networking, sync, reorg handling and mining</li>
+            <li>Midstate checkpoint construction and verification</li>
+            <li>Explicit and merged-mining anchor paths</li>
+            <li>Dormant recovery commitments and recovery logic</li>
+          </ul>
+        </div>
+
+        <div class="status-card planned">
+          <span>IN PROGRESS</span>
+          <ul>
+            <li>Anchored cut-through / pruning</li>
+            <li>Protocol hardening and adversarial review</li>
+            <li>Security audit</li>
+            <li>Production network parameters</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="closing">
+      <img src="assets/midwimble-logo.svg" alt="">
+      <h2>Private present.<br>Durable past.</h2>
+      <p>
+        Midwimble is an experiment in building a privacy chain that knows
+        what to do when cryptography changes.
+      </p>
+      <a class="button primary" href="https://github.com/ciphernom/midwimble">Explore Midwimble on GitHub</a>
+    </section>
+  </main>
+
+  <footer>
+    <span>Midwimble</span>
+    <span>Research software · Do not use for real value</span>
+    <a href="https://github.com/ciphernom/midwimble">github.com/ciphernom/midwimble</a>
+  </footer>
+</body>
+</html>
