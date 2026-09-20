@@ -173,8 +173,13 @@ impl Snapshot {
             .iter()
             .filter(|k| k.features == KernelFeatures::Coinbase)
             .count();
-        if (coinbase_kernels as u64) + 1 < cp.mw_height {
-            // Every block but genesis carries exactly one coinbase kernel.
+        // Every block that mints carries exactly one coinbase kernel. Blocks
+        // above the schedule's last rewarded height only carry one when they
+        // collect fees, so they are not counted here.
+        let minting_blocks = crate::core::types::EMISSION
+            .final_reward_height()
+            .map_or(cp.mw_height - 1, |end| end.min(cp.mw_height - 1));
+        if (coinbase_kernels as u64) < minting_blocks {
             bail!("snapshot is missing coinbase kernels");
         }
 
@@ -234,6 +239,20 @@ impl Snapshot {
             chain_mmr,
             header_hash: cp.mw_header_hash,
         };
+        // Two independent supply checks. The Pedersen audit proves the coins
+        // in the snapshot match its kernels; this one proves the number
+        // itself is one the emission schedule could ever have produced, so a
+        // node bootstrapping from a snapshot inherits the 1,000,000 cap
+        // rather than taking the snapshot's word for it.
+        let scheduled = crate::core::types::issued_before(cp.mw_height);
+        if state.supply != scheduled {
+            bail!(
+                "snapshot claims a supply of {} at height {}, but the schedule allows {}",
+                state.supply,
+                cp.mw_height,
+                scheduled
+            );
+        }
         state.verify_supply()?;
         if state.checkpoint_parts() != self.parts {
             bail!("rebuilt state does not reproduce the checkpoint");

@@ -3,7 +3,7 @@
 use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
 use midwimble::core::mw::StealthAddress;
-use midwimble::core::types::block_reward;
+use midwimble::core::types::{block_reward, format_amount, parse_amount};
 use midwimble::node::{Node, NodeConfig};
 use midwimble::rpc::{self, RpcClient};
 use midwimble::wallet::Wallet;
@@ -146,6 +146,9 @@ enum Cmd {
     },
     /// List GPUs and run the miner's shader self-test.
     GpuInfo,
+    /// Print this build's launch and consensus parameters, including the
+    /// genesis block id to compare against the launch announcement.
+    Params,
     /// Anchor a checkpoint of the local chain in Midstate (Commit transaction).
     Anchor {
         #[arg(long, default_value = "127.0.0.1:9434")]
@@ -227,11 +230,12 @@ enum WalletCmd {
     Send {
         #[arg(long)]
         to: String,
+        /// Amount in coins, e.g. `--amount 0.25` (8 decimal places).
         #[arg(long)]
-        amount: u64,
-        /// Fee in base units (defaults to the relay minimum for the inputs used).
+        amount: String,
+        /// Fee in coins (defaults to the relay minimum for the inputs used).
         #[arg(long)]
-        fee: Option<u64>,
+        fee: Option<String>,
     },
 }
 
@@ -317,6 +321,95 @@ fn ctrlc_like(f: impl FnOnce() + Send + 'static) {
     });
 }
 
+/// `YYYY-MM-DD HH:MM UTC` for a Unix timestamp (Hinnant's civil-from-days,
+/// to avoid a date crate for one command).
+fn utc(ts: u64) -> String {
+    let days = (ts / 86_400) as i64;
+    let secs = ts % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
+        secs / 3600,
+        secs % 3600 / 60
+    )
+}
+
+fn print_params() {
+    use midwimble::core::state::calculate_work;
+    use midwimble::core::types::{
+        count_leading_zeros, network_anchor, ASERT_HALF_LIFE, BITCOIN_BLOCK_HASH,
+        BITCOIN_BLOCK_HEIGHT, BITCOIN_BLOCK_TIME, COINBASE_MATURITY, EMISSION,
+        GENESIS_TARGET, GENESIS_TIMESTAMP, HALVING_INTERVAL, LAUNCH_PARAMETERS_SET,
+        MAX_SUPPLY, MIN_FEE_PER_WEIGHT, NETWORK_MAGIC, TARGET_BLOCK_TIME,
+    };
+    let at = |height: u64| utc(GENESIS_TIMESTAMP + height * TARGET_BLOCK_TIME);
+    let kind = match (LAUNCH_PARAMETERS_SET, cfg!(feature = "fast-mining")) {
+        (_, true) => "FAST-MINING TEST BUILD (never run this on a real network)",
+        (true, false) => "mainnet",
+        (false, false) => "DEVNET: launch parameters are still placeholders",
+    };
+    out!("build                {kind}");
+    out!("network magic        {}", String::from_utf8_lossy(NETWORK_MAGIC));
+    out!("network anchor       {}", hex::encode(network_anchor()));
+    out!(
+        "bitcoin anchor       height {BITCOIN_BLOCK_HEIGHT}, mined {}",
+        utc(BITCOIN_BLOCK_TIME)
+    );
+    out!("                     {BITCOIN_BLOCK_HASH}");
+    out!("genesis time         {} ({GENESIS_TIMESTAMP})", utc(GENESIS_TIMESTAMP));
+    let work = calculate_work(&GENESIS_TARGET);
+    out!(
+        "genesis target       {} ({} leading zero bits; 60 s blocks at ~{} attempts/s)",
+        hex::encode(GENESIS_TARGET),
+        count_leading_zeros(&GENESIS_TARGET),
+        work / TARGET_BLOCK_TIME as u128
+    );
+    out!(
+        "genesis block        {}",
+        hex::encode(midwimble::core::Batch::genesis().extension.final_hash)
+    );
+    out!("");
+    out!(
+        "block time           {TARGET_BLOCK_TIME} s, ASERT half-life {} h, coinbase maturity {COINBASE_MATURITY}",
+        ASERT_HALF_LIFE / 3600
+    );
+    out!("relay fee floor      {MIN_FEE_PER_WEIGHT} units per weight");
+    out!("");
+    out!("max supply           {} (8 decimal places, reached exactly)", format_amount(MAX_SUPPLY));
+    if EMISSION.slow_start > 0 {
+        out!(
+            "slow start           blocks 1..={}, ending ~{}",
+            EMISSION.slow_start,
+            at(EMISSION.slow_start)
+        );
+    }
+    out!("era-0 reward         {}", format_amount(EMISSION.initial_reward));
+    out!(
+        "halving interval     {HALVING_INTERVAL} blocks ({} s, Bitcoin's era length)",
+        HALVING_INTERVAL * TARGET_BLOCK_TIME
+    );
+    for k in 1..=6u64 {
+        let h = k * HALVING_INTERVAL;
+        out!(
+            "  halving {k}          height {h:>10}  reward {}  ~{}",
+            format_amount(block_reward(h)),
+            at(h)
+        );
+    }
+    if let Some(end) = EMISSION.final_reward_height() {
+        out!("last minting block   height {end}, ~{}", at(end));
+    }
+    out!("(dates assume the hashrate stays near its launch calibration; ASERT keeps them within a day or two)");
+}
+
 fn sync_wallet(wallet: &mut Wallet, client: &RpcClient) -> Result<u64> {
     wallet.sync_from_node(client)
 }
@@ -354,6 +447,13 @@ fn run(cli: Cli) -> Result<()> {
                 .and_then(|l| l.parse::<tracing::Level>().ok())
                 .unwrap_or(tracing::Level::INFO);
             tracing_subscriber::fmt().with_max_level(level).init();
+            if !midwimble::core::types::LAUNCH_PARAMETERS_SET {
+                tracing::warn!(
+                    "this build carries placeholder launch parameters (network magic {}), so it is \
+                     a devnet build: see docs/LAUNCH.md",
+                    String::from_utf8_lossy(midwimble::core::types::NETWORK_MAGIC)
+                );
+            }
             let mut config = NodeConfig::new(data_dir, listen.parse()?);
             config.bootstrap = peers.iter().map(|p| p.parse()).collect::<Result<_, _>>()?;
             config.mine_to = mine_to.as_deref().map(StealthAddress::decode).transpose()?;
@@ -518,6 +618,10 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::GpuInfo => gpu_info(),
+        Cmd::Params => {
+            print_params();
+            Ok(())
+        }
         Cmd::Anchor {
             rpc,
             midstate_rpc,
@@ -636,13 +740,13 @@ fn run(cli: Cli) -> Result<()> {
                     let b = w.balance(client.height()?);
                     out!(
                         "spendable: {}\nimmature:  {}\npending:   {}",
-                        b.spendable,
-                        b.immature,
-                        b.pending
+                        format_amount(b.spendable),
+                        format_amount(b.immature),
+                        format_amount(b.pending)
                     );
                     out!(
-                        "(one block reward is currently {} units)",
-                        block_reward(client.height()?)
+                        "(one block reward is currently {})",
+                        format_amount(block_reward(client.height()?))
                     );
                 }
                 WalletCmd::Coins => {
@@ -651,7 +755,7 @@ fn run(cli: Cli) -> Result<()> {
                         out!(
                             "{} value={} height={} coinbase={} spent={:?} pending={}",
                             hex::encode(c.output.commitment),
-                            c.value,
+                            format_amount(c.value),
                             c.height,
                             c.coinbase,
                             c.spent_height,
@@ -660,6 +764,8 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 WalletCmd::Send { to, amount, fee } => {
+                    let amount = parse_amount(&amount)?;
+                    let fee = fee.as_deref().map(parse_amount).transpose()?;
                     let mut w = Wallet::open(&path, &password()?)?;
                     sync_wallet(&mut w, &client)?;
                     let to = StealthAddress::decode(&to)?;
