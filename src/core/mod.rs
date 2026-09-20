@@ -2,6 +2,7 @@
 
 pub mod anchor;
 pub mod auxpow;
+pub mod bond;
 pub mod extension;
 pub mod filter;
 pub mod finality;
