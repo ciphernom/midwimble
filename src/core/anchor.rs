@@ -101,8 +101,9 @@ pub struct HeaderLink {
     pub final_hash: [u8; 32],
 }
 
-fn header_pow_ok(prev: [u8; 32], link: &HeaderLink, min_work: u128) -> bool {
-    let mining = compute_header_hash(&BatchHeader {
+/// The mining hash a Midstate header link commits its proof of work to.
+pub(crate) fn link_mining_hash(prev: [u8; 32], link: &HeaderLink) -> [u8; 32] {
+    compute_header_hash(&BatchHeader {
         height: 0,
         prev_midstate: [0; 32],
         post_tx_midstate: link.post_tx_midstate,
@@ -115,7 +116,11 @@ fn header_pow_ok(prev: [u8; 32], link: &HeaderLink, min_work: u128) -> bool {
         state_root: link.state_root,
         prev_header_hash: prev,
         aux_pow: None,
-    });
+    })
+}
+
+pub(crate) fn header_pow_ok(prev: [u8; 32], link: &HeaderLink, min_work: u128) -> bool {
+    let mining = link_mining_hash(prev, link);
     link.final_hash < link.target
         && calculate_work(&link.target) >= min_work
         && create_extension(mining, link.nonce).final_hash == link.final_hash

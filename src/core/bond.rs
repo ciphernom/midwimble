@@ -13,8 +13,10 @@
 //! epoch's snapshot, agreed inside midwimble's own chain) arrives with the
 //! header change described in the design document.
 
+use super::anchor::{header_pow_ok, HeaderLink};
 use super::auxpow::midstate_coin_id;
 use super::mmr::{verify_utxo_proof, UtxoProof};
+use super::state::calculate_work;
 use super::types::{hash, hash_concat};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
@@ -262,14 +264,111 @@ impl BondProof {
     }
 }
 
+/// Midstate's genesis time. Its ASERT, like midwimble's, is anchored here, so
+/// its height tracks `(t − genesis) / 60` — running ahead of that by
+/// `240 · log2(hashrate / calibration)` blocks, never behind it for long.
+const MIDSTATE_GENESIS_TIMESTAMP: u64 = 1_772_274_770;
+
+/// Pads the clock estimate of midstate's height by seven days, more than
+/// midstate's lead over its schedule at any plausible hashrate (about 3,500
+/// blocks at today's roughly 28,000 times its calibration).
+pub const CLOCK_MARGIN: u64 = 7 * 24 * 60;
+
+/// Midstate's height as judged from a midwimble block's timestamp, estimated
+/// high on purpose: an error can only retire a bond early, never let it mine
+/// after it could have been spent. Deterministic from midwimble's own chain,
+/// so a stalled or unreachable midstate never stops a bonded miner.
+pub fn est_midstate_height(timestamp: u64) -> u64 {
+    timestamp.saturating_sub(MIDSTATE_GENESIS_TIMESTAMP) / 60 + CLOCK_MARGIN
+}
+
 impl Bond {
-    /// Version-1 eligibility at an epoch's snapshot: proven against that very
-    /// snapshot, large enough, and locked long enough beyond it. The value is a
-    /// gate, never a weight — a bigger bond buys no more mining power.
-    pub fn eligible_at(&self, snapshot_height: u64) -> bool {
-        self.proven_at == snapshot_height
-            && self.value >= MIN_MINING_BOND
-            && self.bonded_until >= snapshot_height.saturating_add(MIN_REMAINING_BOND_LOCK)
+    /// Version-1 eligibility for a block with this timestamp: large enough,
+    /// and still locked for at least `MIN_REMAINING_BOND_LOCK` beyond the
+    /// estimated midstate height. Nothing can spend a bond before its lock
+    /// height, so the proof it was registered with keeps holding until then.
+    /// The value is a gate, never a weight: a bigger bond buys no more mining
+    /// power.
+    pub fn eligible_at(&self, block_timestamp: u64) -> bool {
+        self.value >= MIN_MINING_BOND
+            && self.bonded_until
+                >= est_midstate_height(block_timestamp).saturating_add(MIN_REMAINING_BOND_LOCK)
+    }
+}
+
+// ── Registration ─────────────────────────────────────────────────────────────
+
+/// A registration must show a day of work above its proof's header, measured
+/// in blocks of the *registering midwimble block's own target*.
+///
+/// Why midwimble's target and not the midstate headers' own: those headers
+/// are the registrant's to choose. On a private fork they could claim easy
+/// targets and make "a day" cheap. Midwimble's target is consensus, cannot be
+/// lowered without out-hashing midwimble, and is in the same units — both
+/// chains run the same proof of work at the same 60-second spacing — so it
+/// measures the merged hashrate. Faking a registration therefore costs at least
+/// a day of midwimble's entire network's work, however midstate's block reward
+/// has decayed.
+pub const REGISTRATION_WORK_BLOCKS: u128 = 24 * 60;
+
+/// No header counts for more than 1/60 of the requirement, so a registration
+/// needs at least 60 headers' worth of real work. Without the cap, one
+/// improbably lucky hash on a very hard target could stand in for the day.
+pub const REGISTRATION_MIN_HEADERS: u128 = 60;
+
+/// Bounds a registration's size (144 bytes a header) and verification cost (a
+/// full extension per header). Honest runs are about `1440 × share` headers,
+/// where `share` is midwimble's fraction of midstate's hashrate.
+pub const REGISTRATION_MAX_HEADERS: usize = 4_000;
+
+/// The work a registration in a block with this target must show.
+pub fn registration_work(midwimble_target: &[u8; 32]) -> u128 {
+    calculate_work(midwimble_target).saturating_mul(REGISTRATION_WORK_BLOCKS)
+}
+
+/// A bond proof plus the midstate headers that bury it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BondRegistration {
+    pub proof: BondProof,
+    /// `prev_header_hash` of the proof's header.
+    pub prev_header_hash: [u8; 32],
+    /// The proof's header, then the midstate headers built on it.
+    pub headers: Vec<HeaderLink>,
+}
+
+impl BondRegistration {
+    /// Verifies a registration carried by a midwimble block with target
+    /// `midwimble_target`. The cheap checks run first; each header's proof of
+    /// work costs a full extension, so it is checked last, in chain order, and
+    /// the first bad header stops it. Forcing that work on a node costs the
+    /// sender a real header's worth of hashing each time.
+    pub fn verify(&self, midwimble_target: &[u8; 32]) -> Result<Bond> {
+        if self.headers.len() > REGISTRATION_MAX_HEADERS {
+            bail!("registration carries more than {REGISTRATION_MAX_HEADERS} headers");
+        }
+        let (proven, above) = self
+            .headers
+            .split_first()
+            .ok_or_else(|| anyhow!("registration carries no midstate headers"))?;
+        let required = registration_work(midwimble_target);
+        let cap = (required / REGISTRATION_MIN_HEADERS).max(1);
+        let credited = above.iter().fold(0u128, |sum, h| {
+            sum.saturating_add(calculate_work(&h.target).min(cap))
+        });
+        if credited < required {
+            bail!(
+                "{credited} units of midstate work above the bond's header; a block at this target requires {required}"
+            );
+        }
+        let bond = self.proof.verify(&proven.state_root)?;
+        let mut prev = self.prev_header_hash;
+        for (i, header) in self.headers.iter().enumerate() {
+            if !header_pow_ok(prev, header, 0) {
+                bail!("midstate header {i} of the registration fails its proof of work");
+            }
+            prev = header.final_hash;
+        }
+        Ok(bond)
     }
 }
 
@@ -433,28 +532,138 @@ mod tests {
 
     #[test]
     fn eligibility_is_a_gate() {
-        let snapshot = 300_000;
+        let t = 1_800_000_000;
         let bond = Bond {
             id: [0; 32],
             mining_key: [0x11; 32],
             value: MIN_MINING_BOND,
-            bonded_until: snapshot + MIN_REMAINING_BOND_LOCK,
-            proven_at: snapshot,
+            bonded_until: est_midstate_height(t) + MIN_REMAINING_BOND_LOCK,
+            proven_at: 300_000,
         };
-        assert!(bond.eligible_at(snapshot));
-        // Running down the lock is how a bond unbonds.
-        assert!(!bond.eligible_at(snapshot + 1));
+        assert!(bond.eligible_at(t));
+        // A minute later one more block of the lock has run down: that is how
+        // a bond unbonds, with no state to track.
+        assert!(!bond.eligible_at(t + 60));
         assert!(!Bond {
             value: MIN_MINING_BOND / 2,
             ..bond
         }
-        .eligible_at(snapshot));
-        // A proof against any other midstate height says nothing about the
-        // snapshot.
-        assert!(!Bond {
-            proven_at: snapshot - 1,
-            ..bond
+        .eligible_at(t));
+        // The clock runs a week ahead of midstate's nominal schedule.
+        assert_eq!(est_midstate_height(MIDSTATE_GENESIS_TIMESTAMP), CLOCK_MARGIN);
+    }
+
+    /// Registrations mine real midstate-style headers, so these run with the
+    /// test build's short extensions.
+    #[cfg(feature = "fast-mining")]
+    mod registration {
+        use super::*;
+        use crate::core::anchor::link_mining_hash;
+        use crate::core::extension::create_extension;
+
+        /// About 64 units of work per header.
+        const HEADER_TARGET: [u8; 32] = {
+            let mut t = [0xff; 32];
+            t[0] = 0x03;
+            t
+        };
+        /// 3 units of work: a day is 4,320 units, capped at 72 a header, so 68
+        /// ordinary headers are enough and 60 are not.
+        const MW_TARGET: [u8; 32] = {
+            let mut t = [0; 32];
+            t[0] = 0x40;
+            t
+        };
+
+        fn mine(prev: [u8; 32], state_root: [u8; 32], target: [u8; 32], i: u64) -> HeaderLink {
+            let mut link = HeaderLink {
+                post_tx_midstate: hash(&i.to_le_bytes()),
+                state_root,
+                timestamp: 1_800_000_000 + 60 * i,
+                target,
+                nonce: 0,
+                final_hash: [0; 32],
+            };
+            let mining = link_mining_hash(prev, &link);
+            loop {
+                let fin = create_extension(mining, link.nonce).final_hash;
+                if fin < target {
+                    link.final_hash = fin;
+                    return link;
+                }
+                link.nonce += 1;
+            }
         }
-        .eligible_at(snapshot));
+
+        /// The bond's proof header, with `n` ordinary headers on top.
+        fn registration(n: u64) -> BondRegistration {
+            let (proof, root) = proven(&coin(), 300_000);
+            let prev = hash(b"the header below the proof's");
+            let mut headers = vec![mine(prev, root, HEADER_TARGET, 0)];
+            for i in 1..=n {
+                let last = headers.last().unwrap().final_hash;
+                headers.push(mine(last, hash(&i.to_be_bytes()), HEADER_TARGET, i));
+            }
+            BondRegistration {
+                proof,
+                prev_header_hash: prev,
+                headers,
+            }
+        }
+
+        #[test]
+        fn a_day_of_work_registers_the_bond() {
+            assert_eq!(registration_work(&MW_TARGET), 4_320);
+            let bond = registration(70).verify(&MW_TARGET).unwrap();
+            assert_eq!(bond.id, coin().coin_id());
+            assert_eq!(bond.mining_key, [0x11; 32]);
+        }
+
+        #[test]
+        fn less_than_a_day_does_not() {
+            assert!(registration(60).verify(&MW_TARGET).is_err());
+        }
+
+        /// The yardstick is the registering block's own target: the same
+        /// headers fall short once midwimble's hashrate has doubled.
+        #[test]
+        fn the_bar_rises_with_midwimbles_hashrate() {
+            let mut harder = MW_TARGET;
+            harder[0] = 0x20;
+            assert!(registration(70).verify(&harder).is_err());
+        }
+
+        #[test]
+        fn one_lucky_header_cannot_carry_the_day() {
+            let mut reg = registration(59);
+            let last = reg.headers.last().unwrap().final_hash;
+            let mut hard = [0xffu8; 32];
+            hard[0] = 0;
+            hard[1] = 0x03;
+            // Uncapped, this one header would be worth several days.
+            reg.headers.push(mine(last, hash(b"lucky"), hard, 60));
+            assert!(calculate_work(&hard) > registration_work(&MW_TARGET));
+            assert!(reg.verify(&MW_TARGET).is_err());
+        }
+
+        #[test]
+        fn broken_links_bad_work_and_wrong_roots_are_caught() {
+            let good = registration(70);
+            let mut swapped = good.clone();
+            swapped.headers.swap(10, 11);
+            assert!(swapped.verify(&MW_TARGET).is_err());
+            let mut forged = good.clone();
+            forged.headers[30].nonce ^= 1;
+            assert!(forged.verify(&MW_TARGET).is_err());
+            let mut elsewhere = good.clone();
+            elsewhere.headers[0].state_root = hash(b"another state");
+            assert!(elsewhere.verify(&MW_TARGET).is_err());
+            let mut bloated = good.clone();
+            let extra = good.headers[1].clone();
+            bloated
+                .headers
+                .extend(std::iter::repeat(extra).take(REGISTRATION_MAX_HEADERS));
+            assert!(bloated.verify(&MW_TARGET).is_err());
+        }
     }
 }
