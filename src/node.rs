@@ -40,7 +40,7 @@ use crate::core::filter::CompactFilter;
 use crate::core::mw::{Context, StealthAddress, Transaction};
 use crate::core::snapshot::Snapshot;
 use crate::core::state::{apply_batch, apply_batch_skip_pow, choose_best_state};
-use crate::core::template::{build_template, select_transactions};
+use crate::core::template::{select_transactions};
 use crate::core::types::{
     compute_header_hash, utxo_leaf, Batch, BatchHeader, State, DIFFICULTY_LOOKBACK, KERNEL_WEIGHT,
     MAX_BLOCK_WEIGHT, MEDIAN_TIME_PAST_WINDOW, OUTPUT_WEIGHT,
@@ -113,11 +113,15 @@ pub struct NodeConfig {
     pub checkpoint: Option<[u8; 32]>,
     /// How long checkpoint bootstrap may take.
     pub bootstrap_timeout: Duration,
+    /// The mining bond this node signs its templates with (`core/bond.rs`).
+    /// Required to mine from `bond::BONDED_MINING_FROM`.
+    pub mining_bond: Option<crate::core::bond::MinerBond>,
 }
 
 impl NodeConfig {
     pub fn new(data_dir: impl Into<PathBuf>, listen: Multiaddr) -> Self {
         Self {
+            mining_bond: None,
             data_dir: data_dir.into(),
             listen,
             bootstrap: Vec::new(),
@@ -171,9 +175,15 @@ pub struct NodeHandle {
     info: Arc<RwLock<NodeInfo>>,
     storage: Storage,
     commands: mpsc::UnboundedSender<Command>,
+    mining_bond: Option<crate::core::bond::MinerBond>,
 }
 
 impl NodeHandle {
+    /// The bond this node signs templates with, for the template RPC.
+    pub fn mining_bond(&self) -> Option<crate::core::bond::MinerBond> {
+        self.mining_bond.clone()
+    }
+
     pub fn info(&self) -> NodeInfo {
         self.info.read().expect("node info lock poisoned").clone()
     }
@@ -490,6 +500,7 @@ impl Node {
             anchors_known: 0,
         }));
         let handle = NodeHandle {
+            mining_bond: config.mining_bond.clone(),
             info: info.clone(),
             storage: storage.clone(),
             commands: cmd_tx,
@@ -2464,14 +2475,28 @@ impl Node {
             self.miner.stop();
             return;
         }
-        let budget = MAX_BLOCK_WEIGHT - OUTPUT_WEIGHT - KERNEL_WEIGHT;
+        // Signed as this node's bond, whose registration rides in its blocks
+        // (taking room from transactions) until the chain has it.
+        let bond = self.config.mining_bond.clone();
+        let registration_weight = bond
+            .as_ref()
+            .filter(|b| !self.state.bonds.contains_key(&b.bond_id))
+            .and_then(|b| b.registration.as_ref())
+            .map_or(0, |r| r.weight());
+        let budget =
+            (MAX_BLOCK_WEIGHT - OUTPUT_WEIGHT - KERNEL_WEIGHT).saturating_sub(registration_weight);
         let txs = select_transactions(&self.mempool.candidates(), self.state.height, budget);
-        let template = build_template(
-            &self.state,
-            self.timestamps.make_contiguous(),
+        let payouts = [(payout, 1u64)];
+        let state = &self.state;
+        let timestamps: &[u64] = self.timestamps.make_contiguous();
+        let template = crate::core::template::build_template_bonded(
+            state,
+            timestamps,
             &txs,
-            &payout,
+            &payouts,
+            [0u8; 32],
             None,
+            bond.as_ref(),
         )
         .or_else(|e| {
             tracing::warn!(
@@ -2479,14 +2504,17 @@ impl Node {
                 txs.len(),
                 e
             );
-            build_template(
-                &self.state,
-                self.timestamps.make_contiguous(),
+            crate::core::template::build_template_bonded(
+                state,
+                timestamps,
                 &[],
-                &payout,
+                &payouts,
+                [0u8; 32],
                 None,
+                bond.as_ref(),
             )
-        });
+        })
+        .map(|(t, _)| t);
         match template {
             Ok(t) => self.miner.start(t),
             Err(e) => tracing::error!("Cannot build a block template: {:#}", e),

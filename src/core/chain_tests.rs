@@ -579,7 +579,7 @@ fn heavier_fork_wins() {
 // the production rules through `apply_batch`.
 
 use super::bond::{
-    authorization_message, check_miner_authorization, est_midstate_height, test_registration,
+    authorization_message, check_miner_authorization, est_midstate_height, devnet_registration,
     MinerBond, MIN_REMAINING_BOND_LOCK,
 };
 use super::state::apply_registrations;
@@ -593,7 +593,7 @@ fn bonded_miner(chain: &TestChain, seed: &[u8], bonded_until: u64) -> MinerBond 
     let secret = Scalar::from_bytes_mod_order(hash(seed));
     let mining_key = RistrettoPoint::mul_base(&secret).compress().to_bytes();
     let registration =
-        test_registration(mining_key, bonded_until, hash(seed), &chain.state.target);
+        devnet_registration(mining_key, bonded_until, hash(seed), &chain.state.target);
     MinerBond {
         secret,
         bond_id: registration.bond_id(),

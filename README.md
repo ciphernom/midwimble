@@ -220,6 +220,8 @@ midwimble node --data-dir ./node --mine-to <address> [--backend gpu] [--prune]
 midwimble node --data-dir ./node --checkpoint <checkpoint id>   # checkpoint verification
 midwimble wallet --wallet w.mww balance
 midwimble wallet --wallet w.mww send --to <address> --amount 0.25   # amounts in coins
+midwimble bond new --file bond.json              # mining requires a bond: docs/BONDED_POW.md
+midwimble node --mining-bond bond.json --mine-to <address>
 
 # merged mining against a midstate node
 midwimble merge-mine --midstate-rpc 127.0.0.1:8545 --midstate-address <hex> \

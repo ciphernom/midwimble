@@ -334,6 +334,16 @@ pub fn registration_work(midwimble_target: &[u8; 32]) -> u128 {
     calculate_work(midwimble_target).saturating_mul(REGISTRATION_WORK_BLOCKS)
 }
 
+/// Work the headers `above` a bond's proof are credited with, towards a
+/// registration in a block with `midwimble_target`: each counts for at most
+/// 1/60 of the requirement.
+pub fn credited_work(above: &[HeaderLink], midwimble_target: &[u8; 32]) -> u128 {
+    let cap = (registration_work(midwimble_target) / REGISTRATION_MIN_HEADERS).max(1);
+    above.iter().fold(0u128, |sum, h| {
+        sum.saturating_add(calculate_work(&h.target).min(cap))
+    })
+}
+
 /// A bond proof plus the midstate headers that bury it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BondRegistration {
@@ -359,10 +369,7 @@ impl BondRegistration {
             .split_first()
             .ok_or_else(|| anyhow!("registration carries no midstate headers"))?;
         let required = registration_work(midwimble_target);
-        let cap = (required / REGISTRATION_MIN_HEADERS).max(1);
-        let credited = above.iter().fold(0u128, |sum, h| {
-            sum.saturating_add(calculate_work(&h.target).min(cap))
-        });
+        let credited = credited_work(above, midwimble_target);
         if credited < required {
             bail!(
                 "{credited} units of midstate work above the bond's header; a block at this target requires {required}"
@@ -516,6 +523,16 @@ pub struct MinerBond {
     pub registration: Option<BondRegistration>,
 }
 
+impl std::fmt::Debug for MinerBond {
+    /// Never prints the secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MinerBond")
+            .field("bond_id", &hex::encode(self.bond_id))
+            .field("registered_here", &self.registration.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl MinerBond {
     pub fn mining_key(&self) -> [u8; 32] {
         RistrettoPoint::mul_base(&self.secret).compress().to_bytes()
@@ -528,9 +545,10 @@ impl MinerBond {
 
 /// A registration for `mining_key` that meets the registration rule at
 /// `midwimble_target`, over a throwaway midstate-shaped state and headers.
-/// Test builds only: it mines real headers, with short extensions.
-#[cfg(all(test, feature = "fast-mining"))]
-pub(crate) fn test_registration(
+/// Fast-mining (devnet and test) builds only: it mines real headers with
+/// short extensions, which a real network's registrations could never use.
+#[cfg(feature = "fast-mining")]
+pub fn devnet_registration(
     mining_key: [u8; 32],
     bonded_until: u64,
     salt: [u8; 32],
@@ -604,10 +622,145 @@ pub(crate) fn test_registration(
     }
 }
 
+// ── The producer's bond file and midstate RPC parsing ──────────────────────
+
+/// What a block producer keeps on disk (`midwimble node --mining-bond`): the
+/// mining secret and, as `midwimble bond register` fills them in, the bond
+/// coin, the proof taken against midstate's tip, and the finished
+/// registration. Guard it like a wallet key: whoever holds it can mine as the
+/// bond (though never spend it; that takes the owner's midstate key).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BondFile {
+    /// Mining secret, hex.
+    pub secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coin: Option<BondCoin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<BondProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration: Option<BondRegistration>,
+}
+
+impl BondFile {
+    pub fn generate() -> Self {
+        Self {
+            secret: hex::encode(super::mw::crypto::random_scalar().to_bytes()),
+            ..Self::default()
+        }
+    }
+
+    pub fn secret(&self) -> Result<Scalar> {
+        let bytes: [u8; 32] = hex::decode(&self.secret)?
+            .try_into()
+            .map_err(|_| anyhow!("bond file secret must be 32 bytes"))?;
+        super::mw::crypto::scalar_from_bytes(&bytes)
+            .ok_or_else(|| anyhow!("bond file secret is not a canonical scalar"))
+    }
+
+    pub fn mining_key(&self) -> Result<[u8; 32]> {
+        Ok(RistrettoPoint::mul_base(&self.secret()?).compress().to_bytes())
+    }
+
+    /// What the node mines with. Needs a finished registration.
+    pub fn miner_bond(&self) -> Result<MinerBond> {
+        let registration = self.registration.clone().ok_or_else(|| {
+            anyhow!("this bond is not registered yet: finish `midwimble bond register` first")
+        })?;
+        let bond = MinerBond {
+            secret: self.secret()?,
+            bond_id: registration.bond_id(),
+            registration: Some(registration),
+        };
+        let registered_key = bond.registration.as_ref().unwrap().proof.coin.script.mining_key;
+        if bond.mining_key() != registered_key {
+            bail!("this file's secret is not the registered bond's mining key");
+        }
+        Ok(bond)
+    }
+}
+
+/// One header of midstate's `GET /headers` response, as a link plus the hash
+/// of the header before it.
+pub fn header_link_from_json(h: &serde_json::Value) -> Result<(HeaderLink, [u8; 32])> {
+    use super::auxpow::bytes32;
+    let u64_of = |v: &serde_json::Value| {
+        v.as_u64().ok_or_else(|| anyhow!("midstate header field is not a u64"))
+    };
+    let link = HeaderLink {
+        post_tx_midstate: bytes32(&h["post_tx_midstate"])?,
+        state_root: bytes32(&h["state_root"])?,
+        timestamp: u64_of(&h["timestamp"])?,
+        target: bytes32(&h["target"])?,
+        nonce: u64_of(&h["extension"]["nonce"])?,
+        final_hash: bytes32(&h["extension"]["final_hash"])?,
+    };
+    Ok((link, bytes32(&h["prev_header_hash"])?))
+}
+
+/// A bond proof from midstate's `GET /utxo_proof/:coin_id` response.
+pub fn bond_proof_from_json(coin: BondCoin, v: &serde_json::Value) -> Result<BondProof> {
+    use super::auxpow::bytes32;
+    if let Some(e) = v.get("error") {
+        bail!("midstate refused the proof: {e}");
+    }
+    let roots = MidstateRoots {
+        coins: bytes32(&v["coins_root"])?,
+        commitments: bytes32(&v["commitments_root"])?,
+        chain_mmr: bytes32(&v["chain_mmr_root"])?,
+        burned_wots: match &v["burned_wots_root"] {
+            serde_json::Value::Null => None,
+            b => Some(bytes32(b)?),
+        },
+    };
+    Ok(BondProof {
+        coin,
+        midstate_height: v["height"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("proof has no height"))?,
+        roots,
+        smt: serde_json::from_value(v["proof"].clone())?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::mmr::UtxoAccumulator;
+
+    /// A real midstate mainnet header, height 297691, checked against its
+    /// predecessor's hash with the exact code registrations use. Production
+    /// builds only: it needs the real million-step extension.
+    #[cfg(not(feature = "fast-mining"))]
+    #[test]
+    fn verifies_a_real_midstate_header() {
+        let prev = [
+            0, 0, 0, 69, 80, 103, 194, 112, 22, 147, 243, 28, 0, 248, 178, 198, 115, 71, 111,
+            209, 96, 194, 254, 189, 159, 129, 242, 85, 223, 228, 248, 243,
+        ];
+        let mut target = [255u8; 32];
+        target[..6].copy_from_slice(&[0, 0, 4, 193, 32, 127]);
+        let link = HeaderLink {
+            post_tx_midstate: [
+                77, 173, 143, 201, 58, 55, 42, 180, 120, 49, 199, 104, 109, 234, 237, 174, 168,
+                31, 199, 241, 102, 160, 92, 127, 150, 150, 136, 33, 175, 108, 75, 79,
+            ],
+            state_root: [
+                84, 171, 15, 189, 239, 148, 177, 127, 181, 83, 162, 142, 181, 144, 7, 138, 72,
+                17, 227, 169, 3, 9, 21, 136, 138, 20, 150, 166, 46, 120, 122, 200,
+            ],
+            timestamp: 1_789_993_393,
+            target,
+            nonce: 9_297_194_912_428,
+            final_hash: [
+                0, 0, 0, 102, 168, 40, 225, 155, 113, 82, 165, 33, 248, 48, 166, 12, 34, 149,
+                135, 177, 254, 193, 74, 112, 88, 28, 39, 93, 45, 106, 77, 205,
+            ],
+        };
+        assert!(header_pow_ok(prev, &link, 0));
+        let mut flipped = link.clone();
+        flipped.state_root[31] ^= 1;
+        assert!(!header_pow_ok(prev, &flipped, 0));
+    }
 
     fn script() -> BondScript {
         BondScript {
