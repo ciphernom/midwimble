@@ -205,7 +205,22 @@ pub fn build_template_bonded(
     }
     let registrations: Vec<BondRegistration> = match bond {
         Some(b) if !state.bonds.contains_key(&b.bond_id) => match &b.registration {
-            Some(registration) => vec![registration.clone()],
+            Some(registration) => {
+                // The full check (every header's proof of work) runs when the
+                // block is applied. This cheap one catches the likely mistake
+                // first: a registration assembled against an easier target
+                // than the chain's, such as a pre-launch build's placeholder.
+                let above = registration.headers.get(1..).unwrap_or(&[]);
+                if crate::core::bond::credited_work(above, &state.target)
+                    < crate::core::bond::registration_work(&state.target)
+                {
+                    bail!(
+                        "the bond's registration no longer carries a day of work at this chain's \
+                         target; re-run `midwimble bond register` with --midwimble-rpc"
+                    );
+                }
+                vec![registration.clone()]
+            }
             None => bail!("the mining bond is not registered on this chain and no registration is configured"),
         },
         _ => Vec::new(),
