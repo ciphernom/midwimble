@@ -348,8 +348,10 @@ fn print_params() {
         count_leading_zeros, network_anchor, ASERT_HALF_LIFE, BITCOIN_BLOCK_HASH,
         BITCOIN_BLOCK_HEIGHT, BITCOIN_BLOCK_TIME, COINBASE_MATURITY, EMISSION,
         GENESIS_TARGET, GENESIS_TIMESTAMP, HALVING_INTERVAL, LAUNCH_PARAMETERS_SET,
-        MAX_SUPPLY, MIN_FEE_PER_WEIGHT, NETWORK_MAGIC, TARGET_BLOCK_TIME,
+        MAX_SUPPLY, MIDSTATE_BLOCK_HASH, MIDSTATE_BLOCK_HEIGHT, MIN_FEE_PER_WEIGHT, NETWORK_MAGIC,
+        TARGET_BLOCK_TIME,
     };
+    use midwimble::core::bond::{BONDED_MINING_FROM, MIN_MINING_BOND};
     let at = |height: u64| utc(GENESIS_TIMESTAMP + height * TARGET_BLOCK_TIME);
     let kind = match (LAUNCH_PARAMETERS_SET, cfg!(feature = "fast-mining")) {
         (_, true) => "FAST-MINING TEST BUILD (never run this on a real network)",
@@ -364,6 +366,8 @@ fn print_params() {
         utc(BITCOIN_BLOCK_TIME)
     );
     out!("                     {BITCOIN_BLOCK_HASH}");
+    out!("midstate anchor      height {MIDSTATE_BLOCK_HEIGHT}");
+    out!("                     {MIDSTATE_BLOCK_HASH}");
     out!("genesis time         {} ({GENESIS_TIMESTAMP})", utc(GENESIS_TIMESTAMP));
     let work = calculate_work(&GENESIS_TARGET);
     out!(
@@ -382,6 +386,14 @@ fn print_params() {
         ASERT_HALF_LIFE / 3600
     );
     out!("relay fee floor      {MIN_FEE_PER_WEIGHT} units per weight");
+    if BONDED_MINING_FROM == u64::MAX {
+        out!("bonded mining        optional in this test build (verified when present)");
+    } else {
+        out!(
+            "bonded mining        every block from height {BONDED_MINING_FROM}; bonds of at least {} gMDS",
+            MIN_MINING_BOND >> 30
+        );
+    }
     out!("");
     out!("max supply           {} (8 decimal places, reached exactly)", format_amount(MAX_SUPPLY));
     if EMISSION.slow_start > 0 {

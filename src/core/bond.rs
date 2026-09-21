@@ -17,7 +17,12 @@ use super::anchor::{header_pow_ok, HeaderLink};
 use super::auxpow::midstate_coin_id;
 use super::mmr::{verify_utxo_proof, UtxoProof};
 use super::state::calculate_work;
-use super::types::{hash, hash_concat};
+use super::mw::crypto::{schnorr_sign, schnorr_verify, SchnorrSig};
+use super::types::{
+    compute_header_hash, fold_unsigned, hash, hash_concat, hash_domain, Batch, BatchHeader,
+    NETWORK_MAGIC,
+};
+use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 
@@ -219,7 +224,7 @@ impl MidstateRoots {
 
 /// Evidence that a bond coin was unspent in the midstate state committed by
 /// one particular header.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BondProof {
     pub coin: BondCoin,
     /// Height of the midstate header the proof is against.
@@ -290,10 +295,13 @@ impl Bond {
     /// The value is a gate, never a weight: a bigger bond buys no more mining
     /// power.
     pub fn eligible_at(&self, block_timestamp: u64) -> bool {
-        self.value >= MIN_MINING_BOND
-            && self.bonded_until
-                >= est_midstate_height(block_timestamp).saturating_add(MIN_REMAINING_BOND_LOCK)
+        eligible(self.value, self.bonded_until, block_timestamp)
     }
+}
+
+fn eligible(value: u64, bonded_until: u64, block_timestamp: u64) -> bool {
+    value >= MIN_MINING_BOND
+        && bonded_until >= est_midstate_height(block_timestamp).saturating_add(MIN_REMAINING_BOND_LOCK)
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────
@@ -327,7 +335,7 @@ pub fn registration_work(midwimble_target: &[u8; 32]) -> u128 {
 }
 
 /// A bond proof plus the midstate headers that bury it.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BondRegistration {
     pub proof: BondProof,
     /// `prev_header_hash` of the proof's header.
@@ -369,6 +377,230 @@ impl BondRegistration {
             prev = header.final_hash;
         }
         Ok(bond)
+    }
+}
+
+// ── Bonded mining in consensus ──────────────────────────────────────────────
+
+/// First height whose block must be authorised by a registered, eligible
+/// bond. Genesis is fixed data that nobody mines, so bonded mining begins
+/// with the first mined block.
+#[cfg(not(feature = "fast-mining"))]
+pub const BONDED_MINING_FROM: u64 = 1;
+/// Test builds: an authorisation is optional, but checked in full whenever a
+/// block carries one. Temporary, until the node, pool and merge miner sign
+/// their templates and the integration tests mine bonded blocks.
+#[cfg(feature = "fast-mining")]
+pub const BONDED_MINING_FROM: u64 = u64::MAX;
+
+/// A block carries at most one registration. A producer registers its own
+/// bond in the first block it mines, and the cap bounds how much
+/// verification any one block can demand.
+pub const MAX_REGISTRATIONS_PER_BLOCK: usize = 1;
+
+/// Registration weight: four units per 144-byte header and 256 for the ~8 KB
+/// proof, in line with what transaction data weighs per byte.
+const REGISTRATION_BASE_WEIGHT: u64 = 256;
+const REGISTRATION_WEIGHT_PER_HEADER: u64 = 4;
+
+/// A registered bond as the chain's state holds it, keyed by bond id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BondEntry {
+    pub mining_key: [u8; 32],
+    pub value: u64,
+    pub bonded_until: u64,
+}
+
+impl BondEntry {
+    /// See [`Bond::eligible_at`].
+    pub fn eligible_at(&self, block_timestamp: u64) -> bool {
+        eligible(self.value, self.bonded_until, block_timestamp)
+    }
+}
+
+impl BondRegistration {
+    /// The bond's id: its midstate coin id.
+    pub fn bond_id(&self) -> [u8; 32] {
+        self.proof.coin.coin_id()
+    }
+
+    /// The state entry this registration creates, once it has verified.
+    pub fn entry(&self) -> BondEntry {
+        BondEntry {
+            mining_key: self.proof.coin.script.mining_key,
+            value: self.proof.coin.value,
+            bonded_until: self.proof.coin.script.bonded_until,
+        }
+    }
+
+    pub fn weight(&self) -> u64 {
+        REGISTRATION_BASE_WEIGHT + REGISTRATION_WEIGHT_PER_HEADER * self.headers.len() as u64
+    }
+}
+
+/// A block's bonded-mining authorisation: the bond it is mined under, and
+/// that bond's mining-key signature over [`authorization_message`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MinerAuth {
+    pub bond_id: [u8; 32],
+    pub signature: SchnorrSig,
+}
+
+impl MinerAuth {
+    pub fn hash(&self) -> [u8; 32] {
+        hash_domain(
+            b"midwimble.miner-auth.v1",
+            &[&self.bond_id, &self.signature.e, &self.signature.s],
+        )
+    }
+}
+
+/// What a bonded miner signs for `batch` on a chain whose midstate is
+/// `prev_midstate`: the mining hash the block would have without its
+/// authorisation. The signature covers every other byte of the block, and the
+/// proof of work then covers the signature, so a found block cannot be
+/// re-attributed to another bond. Merged mining keeps that property, because
+/// the midstate parent commits to the full mining hash.
+pub fn authorization_message(prev_midstate: &[u8; 32], batch: &Batch) -> [u8; 32] {
+    let header = BatchHeader {
+        height: 0,
+        prev_header_hash: batch.prev_header_hash,
+        prev_midstate: *prev_midstate,
+        post_tx_midstate: fold_unsigned(prev_midstate, batch),
+        extension: batch.extension.clone(),
+        timestamp: batch.timestamp,
+        target: batch.target,
+        state_root: batch.state_root,
+        aux_pow: None,
+    };
+    hash_domain(
+        b"midwimble.block-authorisation.v1",
+        &[&compute_header_hash(&header), NETWORK_MAGIC],
+    )
+}
+
+/// Checks `batch`'s authorisation against the bond set, which already
+/// includes any registration the block itself carries.
+pub fn check_miner_authorization(
+    bonds: &im::HashMap<[u8; 32], BondEntry>,
+    prev_midstate: &[u8; 32],
+    batch: &Batch,
+) -> Result<()> {
+    let auth = batch
+        .miner
+        .as_ref()
+        .ok_or_else(|| anyhow!("block is not authorised by a mining bond"))?;
+    let bond = bonds.get(&auth.bond_id).ok_or_else(|| {
+        anyhow!("block is mined under an unregistered bond {}", hex::encode(auth.bond_id))
+    })?;
+    if !bond.eligible_at(batch.timestamp) {
+        bail!(
+            "bond {} is not eligible at this block's time (too small, or its lock ends too soon)",
+            hex::encode(auth.bond_id)
+        );
+    }
+    let message = authorization_message(prev_midstate, batch);
+    if !schnorr_verify(&bond.mining_key, &message, &auth.signature) {
+        bail!("the block's miner signature does not verify under its bond's mining key");
+    }
+    Ok(())
+}
+
+/// What a block producer needs in order to mine under a bond.
+#[derive(Clone)]
+pub struct MinerBond {
+    pub secret: Scalar,
+    pub bond_id: [u8; 32],
+    /// The bond's registration, carried in this producer's blocks until the
+    /// chain has it.
+    pub registration: Option<BondRegistration>,
+}
+
+impl MinerBond {
+    pub fn mining_key(&self) -> [u8; 32] {
+        RistrettoPoint::mul_base(&self.secret).compress().to_bytes()
+    }
+
+    pub fn sign(&self, message: &[u8; 32]) -> SchnorrSig {
+        schnorr_sign(&self.secret, message)
+    }
+}
+
+/// A registration for `mining_key` that meets the registration rule at
+/// `midwimble_target`, over a throwaway midstate-shaped state and headers.
+/// Test builds only: it mines real headers, with short extensions.
+#[cfg(all(test, feature = "fast-mining"))]
+pub(crate) fn test_registration(
+    mining_key: [u8; 32],
+    bonded_until: u64,
+    salt: [u8; 32],
+    midwimble_target: &[u8; 32],
+) -> BondRegistration {
+    use super::anchor::link_mining_hash;
+    use super::extension::create_extension;
+    use super::mmr::UtxoAccumulator;
+    let coin = BondCoin {
+        script: BondScript {
+            mining_key,
+            bonded_until,
+            owner_pk: hash(b"test bond owner"),
+        },
+        value: MIN_MINING_BOND,
+        salt,
+    };
+    let mut coins = UtxoAccumulator::new();
+    for i in 0..8u8 {
+        coins.insert(hash(&[i, 0xb0]), true);
+    }
+    coins.insert(coin.coin_id(), true);
+    let height = 300_000;
+    let roots = MidstateRoots {
+        coins: coins.root(true),
+        commitments: hash(b"commitments"),
+        chain_mmr: hash(b"chain mmr"),
+        burned_wots: Some(hash(b"burned")),
+    };
+    let proof = BondProof {
+        coin,
+        midstate_height: height,
+        roots,
+        smt: coins.prove(&coin.coin_id(), true).expect("the bond coin is a member"),
+    };
+    // Headers worth 256 units each, or the per-header cap if that is lower.
+    let mut header_target = [0xffu8; 32];
+    header_target[0] = 0;
+    let required = registration_work(midwimble_target);
+    let per = calculate_work(&header_target).min((required / REGISTRATION_MIN_HEADERS).max(1));
+    let above = (required / per) as u64 + 1;
+    let mine = |prev: [u8; 32], state_root: [u8; 32], i: u64| {
+        let mut link = HeaderLink {
+            post_tx_midstate: hash(&i.to_le_bytes()),
+            state_root,
+            timestamp: 1_800_000_000 + 60 * i,
+            target: header_target,
+            nonce: 0,
+            final_hash: [0; 32],
+        };
+        let mining = link_mining_hash(prev, &link);
+        loop {
+            let fin = create_extension(mining, link.nonce).final_hash;
+            if fin < header_target {
+                link.final_hash = fin;
+                return link;
+            }
+            link.nonce += 1;
+        }
+    };
+    let prev = hash(b"the header below the bond's");
+    let mut headers = vec![mine(prev, roots.state_root(height).unwrap(), 0)];
+    for i in 1..=above {
+        let last = headers.last().unwrap().final_hash;
+        headers.push(mine(last, hash(&i.to_be_bytes()), i));
+    }
+    BondRegistration {
+        proof,
+        prev_header_hash: prev,
+        headers,
     }
 }
 

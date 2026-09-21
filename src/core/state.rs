@@ -213,6 +213,21 @@ pub fn validate_block_contents(batch: &Batch, height: u64, skip_crypto: bool) ->
     let body = &batch.body;
     body.validate_structure(Context::Block)?;
 
+    // Bond registrations: at most one a block, each proving a day of midstate
+    // work above its bond, measured against this block's own target.
+    if batch.registrations.len() > super::bond::MAX_REGISTRATIONS_PER_BLOCK {
+        bail!(
+            "block carries {} bond registrations; at most {} are allowed",
+            batch.registrations.len(),
+            super::bond::MAX_REGISTRATIONS_PER_BLOCK
+        );
+    }
+    if !skip_crypto {
+        for registration in &batch.registrations {
+            registration.verify(&batch.target)?;
+        }
+    }
+
     // What this block is allowed to pay out. Once issuance has reached
     // MAX_SUPPLY (about 95 years in) a block with no fees has nothing to
     // claim, and a coinbase would have to invent a zero-valued output to
@@ -454,6 +469,7 @@ fn apply_batch_internal(
 
     // 4. State transition and root.
     let mut next = apply_body(state, &batch.body, batch.coinbase.as_ref())?;
+    apply_registrations(&mut next, &batch.registrations)?;
     let expected_root = next.state_root();
     if batch.state_root != expected_root {
         bail!(
@@ -464,12 +480,14 @@ fn apply_batch_internal(
     }
 
     // 5. Proof of work against the header this block actually produces.
-    let post_tx_midstate = fold_midstate(
-        &state.mw_midstate,
-        &batch.body,
-        batch.coinbase.as_ref(),
-        &batch.state_root,
-    );
+    // 4b. Bonded mining. From BONDED_MINING_FROM every mined block must be
+    //     authorised by an eligible bond; before that an authorisation is
+    //     optional, but checked in full whenever a block carries one.
+    if !is_genesis && (height >= super::bond::BONDED_MINING_FROM || batch.miner.is_some()) {
+        super::bond::check_miner_authorization(&next.bonds, &state.mw_midstate, batch)?;
+    }
+
+    let post_tx_midstate = super::types::fold_block(&state.mw_midstate, batch);
     let candidate_header = BatchHeader {
         height,
         prev_header_hash: state.header_hash,
@@ -612,4 +630,21 @@ mod tests {
         fake.timestamp += 1;
         assert!(apply_batch(&mut State::genesis(), &fake, &[]).is_err());
     }
+}
+
+/// Adds a block's (already verified) bond registrations to the bond set. A
+/// bond can be registered once; after that it simply stops being eligible
+/// when its lock runs down.
+pub fn apply_registrations(
+    next: &mut State,
+    registrations: &[super::bond::BondRegistration],
+) -> Result<()> {
+    for registration in registrations {
+        let id = registration.bond_id();
+        if next.bonds.contains_key(&id) {
+            bail!("bond {} is already registered", hex::encode(id));
+        }
+        next.bonds.insert(id, registration.entry());
+    }
+    Ok(())
 }

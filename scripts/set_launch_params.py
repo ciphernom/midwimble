@@ -69,16 +69,30 @@ def hex32(s: str, what: str) -> str:
     return s
 
 
-def fetch_midstate_target(rpc: str) -> tuple[str, int]:
+def midstate_get(rpc: str, path: str):
     url = rpc if rpc.startswith("http") else f"http://{rpc}"
     try:
-        with urllib.request.urlopen(f"{url.rstrip('/')}/state", timeout=15) as r:
-            state = json.load(r)
+        with urllib.request.urlopen(f"{url.rstrip('/')}{path}", timeout=15) as r:
+            return json.load(r)
     except Exception as e:  # noqa: BLE001 - any failure here is fatal and explained
-        die(f"could not read {url}/state from the midstate node: {e}")
+        die(f"could not read {path} from the midstate node at {url}: {e}")
+
+
+def fetch_midstate(rpc: str) -> tuple[str, int, str]:
+    """Midstate's live target, and its tip as an anchor: (target, height, hash).
+
+    The tip's height is confirmed against `/headers`, whose `final_hash` is
+    the block hash, rather than assumed from `/state`'s height convention."""
+    state = midstate_get(rpc, "/state")
     if state.get("is_syncing"):
-        die("the midstate node is still syncing; its target is stale")
-    return hex32(state["target"], "midstate target"), int(state.get("height", 0))
+        die("the midstate node is still syncing; its tip and target are stale")
+    tip_hash = hex32(state["header_hash"], "midstate header_hash")
+    reported = int(state["height"])
+    for h in (reported, reported - 1):
+        got = midstate_get(rpc, f"/headers/{h}/1").get("headers", [])
+        if got and bytes(got[0]["extension"]["final_hash"]).hex() == tip_hash:
+            return hex32(state["target"], "midstate target"), h, tip_hash
+    die("could not match the midstate tip hash to a stored header; is the node's /headers endpoint patched in?")
 
 
 def leading_zero_bits(t: int) -> int:
@@ -107,6 +121,13 @@ pub const BITCOIN_BLOCK_HEIGHT: u64 = {p['btc_height']};
 /// The anchor block's own timestamp ({utc(p['btc_time'])}). Genesis may not precede it.
 pub const BITCOIN_BLOCK_TIME: u64 = {p['btc_time']:_};
 
+/// Midstate block anchoring the genesis: midstate's tip at launch. Like the
+/// Bitcoin anchor it could not be known before it was mined, and it pins the
+/// midstate chain that bonded mining is judged against.
+pub const MIDSTATE_BLOCK_HASH: &str =
+    "{p['ms_hash']}";
+pub const MIDSTATE_BLOCK_HEIGHT: u64 = {p['ms_height']};
+
 /// Mainnet genesis time; see [`GENESIS_TIMESTAMP`].
 const LAUNCH_GENESIS_TIMESTAMP: u64 = {p['genesis_time']:_}; // {utc(p['genesis_time'])}
 
@@ -134,9 +155,13 @@ def main() -> None:
     tgt.add_argument("--midstate-rpc", help="read the live target from a midstate node (host:port)")
     tgt.add_argument("--midstate-target", help="midstate's current target, as reported by its /state")
     tgt.add_argument("--genesis-target", help="use this target as-is (expert use)")
-    ap.add_argument("--merge-share", type=float, default=0.5,
+    ap.add_argument("--midstate-block-height", type=int,
+                    help="midstate anchor block (read from --midstate-rpc if omitted)")
+    ap.add_argument("--midstate-block-hash", help="hash of that midstate block")
+    ap.add_argument("--merge-share", type=float, default=0.25,
                     help="share of midstate's hashrate expected to mine midwimble at launch "
-                         "(default 0.5; lower it if bonded mining limits participation)")
+                         "(default 0.25: bonded mining from block 1 means only MDS holders mine "
+                         "at first)")
     ap.add_argument("--types-rs", type=pathlib.Path, default=REPO / "src/core/types.rs")
     ap.add_argument("--dry-run", action="store_true", help="print the block instead of writing it")
     a = ap.parse_args()
@@ -169,8 +194,8 @@ def main() -> None:
         note = "Given explicitly on the command line."
     else:
         if a.midstate_rpc:
-            ms_hex, ms_height = fetch_midstate_target(a.midstate_rpc)
-            source = f"midstate's target at height {ms_height}"
+            ms_hex, live_height, live_hash = fetch_midstate(a.midstate_rpc)
+            source = f"midstate's target at height {live_height}"
         else:
             ms_hex, source = hex32(a.midstate_target, "--midstate-target"), "midstate's target"
         ms = int(ms_hex, 16)
@@ -185,8 +210,23 @@ def main() -> None:
     if leading_zero_bits(target) < 16:
         warn("the genesis target has fewer than 16 leading zero bits; is that really intended?")
 
+    if a.midstate_block_hash or a.midstate_block_height is not None:
+        if not (a.midstate_block_hash and a.midstate_block_height is not None):
+            die("give both --midstate-block-hash and --midstate-block-height")
+        ms_hash, ms_height = hex32(a.midstate_block_hash, "--midstate-block-hash"), a.midstate_block_height
+    elif a.midstate_rpc:
+        if 'live_hash' not in locals():
+            _, live_height, live_hash = fetch_midstate(a.midstate_rpc)
+        ms_hash, ms_height = live_hash, live_height
+    else:
+        die("the genesis also commits to a midstate block: pass --midstate-rpc, or "
+            "--midstate-block-hash and --midstate-block-height")
+    if ms_hash == "0" * 64:
+        die("the midstate anchor hash is all zeros")
+
     params = dict(magic=magic, btc_hash=btc_hash, btc_height=a.bitcoin_height, btc_time=btc_time,
-                  genesis_time=genesis, target=target, target_note=note)
+                  genesis_time=genesis, target=target, target_note=note,
+                  ms_hash=ms_hash, ms_height=ms_height)
     block = render(params)
 
     src = a.types_rs.read_text()
@@ -206,6 +246,7 @@ def main() -> None:
     print()
     print(f"network magic      {magic}")
     print(f"bitcoin anchor     {a.bitcoin_height}  {btc_hash}  ({utc(btc_time)})")
+    print(f"midstate anchor    {ms_height}  {ms_hash}")
     print(f"mining opens       {utc(genesis)}")
     print(f"slow start ends    ~{utc(genesis + SLOW_START_BLOCKS * BLOCK_TIME)}")
     print(f"genesis target     {leading_zero_bits(target)} leading zero bits, "

@@ -18,6 +18,7 @@
 //! because there are no Commit transactions, so fork choice is plain
 //! cumulative proof-of-work.
 
+use super::bond::{BondEntry, BondRegistration, MinerAuth};
 use super::auxpow::AuxPow;
 use super::mmr::{MerkleMountainRange, UtxoAccumulator};
 use super::mw::crypto::{self, Point32, Scalar32, IDENTITY};
@@ -119,6 +120,13 @@ pub const BITCOIN_BLOCK_HASH: &str =
 pub const BITCOIN_BLOCK_HEIGHT: u64 = 938708;
 /// The anchor block's own timestamp. Genesis may not precede it.
 pub const BITCOIN_BLOCK_TIME: u64 = 1_772_274_770;
+
+/// Midstate block anchoring the genesis: midstate's tip at launch. Like the
+/// Bitcoin anchor it cannot be known before it is mined, and it pins the
+/// midstate chain that bonded mining is judged against. Placeholder: zeros.
+pub const MIDSTATE_BLOCK_HASH: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+pub const MIDSTATE_BLOCK_HEIGHT: u64 = 0;
 
 /// Mainnet genesis time; see [`GENESIS_TIMESTAMP`].
 const LAUNCH_GENESIS_TIMESTAMP: u64 = 1_789_430_400; // 2026-09-15 00:00:00 UTC — placeholder
@@ -492,6 +500,8 @@ pub struct StateRootParts {
     pub kernel_excess_sum: Point32,
     pub total_kernel_offset: Scalar32,
     pub supply: u64,
+    /// Commitment to the registered bond set ([`bonds_root`]).
+    pub bonds_root: [u8; 32],
 }
 
 impl StateRootParts {
@@ -505,6 +515,7 @@ impl StateRootParts {
                 &self.kernel_excess_sum,
                 &self.total_kernel_offset,
                 &self.supply.to_le_bytes(),
+                &self.bonds_root,
             ],
         )
     }
@@ -542,6 +553,9 @@ pub struct State {
     pub chain_mmr: MerkleMountainRange,
     /// `extension.final_hash` of the tip.
     pub header_hash: [u8; 32],
+    /// Registered mining bonds, by bond id (`core/bond.rs`).
+    #[serde(default)]
+    pub bonds: im::HashMap<[u8; 32], BondEntry>,
 }
 
 impl State {
@@ -553,11 +567,14 @@ impl State {
             &[
                 &anchor,
                 &BITCOIN_BLOCK_HEIGHT.to_le_bytes(),
+                MIDSTATE_BLOCK_HASH.as_bytes(),
+                &MIDSTATE_BLOCK_HEIGHT.to_le_bytes(),
                 GENESIS_INSCRIPTION,
             ],
         );
         Self {
             mw_midstate: initial,
+            bonds: im::HashMap::new(),
             utxos: im::HashMap::new(),
             utxo_set: UtxoAccumulator::new(),
             kernels: UtxoAccumulator::new(),
@@ -596,6 +613,7 @@ impl State {
     pub fn root_parts(&self) -> StateRootParts {
         StateRootParts {
             utxo_root: self.utxo_set.root(true),
+            bonds_root: bonds_root(&self.bonds),
             kernel_root: self.kernels.root(true),
             chain_mmr_root: self.chain_mmr.root(true),
             kernel_excess_sum: self.kernel_excess_sum,
@@ -669,7 +687,7 @@ pub struct Batch {
     /// Every included transaction, aggregated into one (canonical order,
     /// summed offsets). Midstate's `transactions: Vec<Transaction>`.
     pub body: Transaction,
-    /// Required on every block except genesis.
+    /// Present exactly when the block has something to claim (reward + fees).
     pub coinbase: Option<Coinbase>,
     pub extension: Extension,
     pub timestamp: u64,
@@ -679,6 +697,13 @@ pub struct Batch {
     /// (`auxpow::aux_block_id`) and the work lives in the parent block.
     #[serde(default)]
     pub aux_pow: Option<AuxPow>,
+    /// Bond registrations (`core/bond.rs`): a block producer registers its
+    /// own bond in the first block it mines. At most one per block.
+    #[serde(default)]
+    pub registrations: Vec<BondRegistration>,
+    /// Bonded-mining authorisation, required from `bond::BONDED_MINING_FROM`.
+    #[serde(default)]
+    pub miner: Option<MinerAuth>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -726,6 +751,55 @@ pub fn fold_midstate(
     hash_concat(&m, state_root)
 }
 
+/// [`fold_block`] without the miner's authorisation: what a bonded miner
+/// signs over. Registrations fold in after midstate's own items.
+pub fn fold_unsigned(prev_midstate: &[u8; 32], batch: &Batch) -> [u8; 32] {
+    let m = fold_midstate(
+        prev_midstate,
+        &batch.body,
+        batch.coinbase.as_ref(),
+        &batch.state_root,
+    );
+    if batch.registrations.is_empty() {
+        m
+    } else {
+        hash_concat(&m, &registrations_hash(&batch.registrations))
+    }
+}
+
+/// Folds a whole block into the running midstate: midstate's fold, then the
+/// block's bond registrations, then its miner authorisation. The mining hash
+/// covers the result, so the proof of work commits to every byte of the
+/// block, signature included. Blocks with neither fold exactly as before.
+pub fn fold_block(prev_midstate: &[u8; 32], batch: &Batch) -> [u8; 32] {
+    let unsigned = fold_unsigned(prev_midstate, batch);
+    match &batch.miner {
+        Some(auth) => hash_concat(&unsigned, &auth.hash()),
+        None => unsigned,
+    }
+}
+
+pub fn registrations_hash(registrations: &[BondRegistration]) -> [u8; 32] {
+    let bytes = bincode::serialize(registrations).expect("registrations serialize");
+    hash_domain(b"midwimble.registrations.v1", &[&bytes])
+}
+
+/// Commitment to the registered bond set: every entry, in bond-id order.
+pub fn bonds_root(bonds: &im::HashMap<[u8; 32], BondEntry>) -> [u8; 32] {
+    let mut ids: Vec<&[u8; 32]> = bonds.keys().collect();
+    ids.sort();
+    let mut h = blake3::Hasher::new();
+    h.update(b"midwimble.bonds.v1");
+    for id in ids {
+        let e = &bonds[id];
+        h.update(id);
+        h.update(&e.mining_key);
+        h.update(&e.value.to_le_bytes());
+        h.update(&e.bonded_until.to_le_bytes());
+    }
+    *h.finalize().as_bytes()
+}
+
 impl Batch {
     /// Header derived from the full batch; `height` is left for the caller.
     pub fn header(&self) -> BatchHeader {
@@ -733,12 +807,7 @@ impl Batch {
             height: 0,
             prev_header_hash: self.prev_header_hash,
             prev_midstate: self.prev_midstate,
-            post_tx_midstate: fold_midstate(
-                &self.prev_midstate,
-                &self.body,
-                self.coinbase.as_ref(),
-                &self.state_root,
-            ),
+            post_tx_midstate: fold_block(&self.prev_midstate, self),
             extension: self.extension.clone(),
             timestamp: self.timestamp,
             target: self.target,
@@ -748,7 +817,9 @@ impl Batch {
     }
 
     pub fn weight(&self) -> u64 {
-        self.body.weight() + self.coinbase.as_ref().map_or(0, Coinbase::weight)
+        self.body.weight()
+            + self.coinbase.as_ref().map_or(0, Coinbase::weight)
+            + self.registrations.iter().map(BondRegistration::weight).sum::<u64>()
     }
 
     /// The canonical genesis block: no transactions, no reward.
@@ -780,6 +851,8 @@ impl Batch {
             };
             let extension = super::extension::create_extension(compute_header_hash(&header), 0);
             Batch {
+                registrations: Vec::new(),
+                miner: None,
                 prev_midstate: state.mw_midstate,
                 prev_header_hash: state.header_hash,
                 body,

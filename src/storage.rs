@@ -33,7 +33,7 @@ use crate::core::mw::crypto::{compress, decompress, scalar_from_bytes, Point32, 
 use crate::core::mw::{Kernel, StoredGroup};
 use crate::core::snapshot::{mmr_from_peaks, mmr_peak_values, Snapshot, SNAPSHOT_HEADERS};
 use crate::core::state::{calculate_target, calculate_work};
-use crate::core::types::{block_reward, fold_midstate, utxo_leaf, UtxoEntry};
+use crate::core::types::{block_reward, utxo_leaf, UtxoEntry};
 use crate::core::{Batch, BatchHeader, State};
 use anyhow::{anyhow, bail, Context, Result};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -69,6 +69,10 @@ pub struct StateMeta {
     pub height: u64,
     pub timestamp: u64,
     pub header_hash: [u8; 32],
+    /// Registered mining bonds. Kept here so every undo record's copy of the
+    /// previous meta restores them on a reorg.
+    #[serde(default)]
+    pub bonds: im::HashMap<[u8; 32], crate::core::bond::BondEntry>,
 }
 
 impl StateMeta {
@@ -83,6 +87,7 @@ impl StateMeta {
             height: s.height,
             timestamp: s.timestamp,
             header_hash: s.header_hash,
+            bonds: s.bonds.clone(),
         }
     }
 
@@ -111,12 +116,7 @@ impl StateMeta {
             0
         };
         Ok(Self {
-            mw_midstate: fold_midstate(
-                &self.mw_midstate,
-                &batch.body,
-                batch.coinbase.as_ref(),
-                &batch.state_root,
-            ),
+            mw_midstate: crate::core::types::fold_block(&self.mw_midstate, batch),
             kernel_excess_sum: compress(&excess),
             total_kernel_offset: offset.to_bytes(),
             supply: self
@@ -128,6 +128,13 @@ impl StateMeta {
             height: height + 1,
             timestamp: batch.timestamp,
             header_hash: batch.extension.final_hash,
+            bonds: {
+                let mut bonds = self.bonds.clone();
+                for registration in &batch.registrations {
+                    bonds.insert(registration.bond_id(), registration.entry());
+                }
+                bonds
+            },
         })
     }
 }
@@ -380,6 +387,7 @@ impl Storage {
 
         let mut state = State {
             mw_midstate: meta.mw_midstate,
+            bonds: meta.bonds.clone(),
             utxos,
             utxo_set: UtxoAccumulator::from_canonical_coins(leaves, true),
             kernels: UtxoAccumulator::from_canonical_coins(kernel_ids, true),
@@ -821,6 +829,7 @@ impl Storage {
             utxos,
             groups,
             kernels,
+            bonds: state.bonds.iter().map(|(id, e)| (*id, *e)).collect(),
         })
     }
 
