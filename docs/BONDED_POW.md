@@ -10,8 +10,8 @@ A miner with a 1,000 gMDS bond has exactly the mining power of one with the
 minimum. There is no slashing in v1: a bond is locked capital and an admission
 ticket, nothing more.
 
-Status: the bond template, its midstate-side compiler and the proof
-verification exist and are tested (`core/bond.rs` here; `script.rs`, `mmr.rs`,
+Status: the bond template, its midstate-side compiler, proof verification,
+registration verification and the eligibility rule exist and are tested (`core/bond.rs` here; `script.rs`, `mmr.rs`,
 `node.rs` and the RPC in midstate). Nothing is wired into block validation
 yet; the consensus wiring is listed at the end.
 
@@ -75,9 +75,9 @@ A registration is an item in a midwimble block carrying:
 
 1. The `BondProof`: the coin (script, value, salt), the SMT inclusion proof, and
    the four roots its midstate header commits to (see below).
-2. The run of midstate headers from that header, `P`, to `P + REGISTRATION_DEPTH`,
-   checked for linkage and proof of work by the same code that checks anchors
-   (`core/anchor.rs`).
+2. The proof's header `P` and the midstate headers built on it, checked for
+   linkage and proof of work by the same code that checks anchors
+   (`core/anchor.rs`). They must carry a day of work (see below).
 
 It adds `bond_id → (mining key, bonded_until, value)` to a bond set committed
 in midwimble's state root, and pays the ordinary fee by weight: about 8 KB of
@@ -152,27 +152,49 @@ deterministic from midwimble's chain alone.
 | `MIN_MINING_BOND` | 2^34 units (16 gMDS) | About 11 days of revenue for a miner with 0.1% of midstate's hashrate: real capital, within an enthusiast's reach. Must be a power of two. |
 | `MIN_REMAINING_BOND_LOCK` | 43,200 blocks (30 days) | The effective unbonding delay. |
 | `CLOCK_MARGIN` | 10,080 blocks (7 days) | Covers midstate running ahead of its schedule. |
-| `REGISTRATION_DEPTH` | 100+ blocks | See the open question below. |
+| `REGISTRATION_WORK_BLOCKS` | 1,440 | A day, in blocks of the registering block's target. |
+| `REGISTRATION_MIN_HEADERS` | 60 | Caps any one header at 1/60 of the requirement. |
+| `REGISTRATION_MAX_HEADERS` | 4,000 | Bounds size (144 bytes a header) and verification cost. |
 
-## Open question: the cost of forging a registration
+## How much work a registration needs
 
-A registration's header run is checked for proof of work, not for being on
-midstate's canonical chain. Someone could create a bond coin on a *private*
-midstate fork, bury it under `REGISTRATION_DEPTH` privately mined headers,
-register it, and never lock real capital.
+A registration's midstate headers are checked for proof of work, not for being
+on midstate's canonical chain. Someone could create a bond coin on a *private*
+midstate fork, bury it, register it, and never lock real capital. The defence is
+to make that burial cost more than a bond is worth. The rule, implemented in
+`BondRegistration::verify`:
 
-That costs `REGISTRATION_DEPTH` blocks of real midstate work. Today, at 1 gMDS
-per block, 100 blocks is roughly 100 gMDS of hashing to fake a 16 gMDS bond,
-which is uneconomic. But midstate halves every year, and the network's hashing
-spend follows its revenue. After three halvings the same 100 blocks cost less
-than the bond they fake.
+```text
+required = 1440 × work(target of the registering midwimble block)
+credited = Σ over the headers above P of min(work(header's target), required / 60)
+registration is valid only if credited ≥ required
+```
 
-The requirement should therefore be expressed as work rather than as a block
-count. For example, it could be "at least one day of midstate's current network
-work above the proof's header", with the work target read from the midstate
-headers themselves. Alternatively, registrations could be required to build on a
-midstate header midwimble has already anchored. This needs deciding before
-bonded mining ships.
+Three details matter:
+
+- **The yardstick is midwimble's own target, not the headers'.** The headers are
+  the registrant's to choose, and on a private fork they could claim easy targets
+  and make "a day" cheap. Midwimble's target is consensus: nobody can lower it
+  without out-hashing midwimble. Both chains run the same proof of work at the
+  same spacing, so the target is in the same units and measures the merged
+  hashrate. Forging a registration costs at least a day of midwimble's whole
+  network's work, however far midstate's block reward has decayed. That decay
+  was the flaw in a fixed block count.
+- **No header counts for more than 1/60 of the day.** A registration therefore
+  needs at least 60 headers' worth of real work, and one improbably lucky hash
+  on a very hard target cannot stand in for it.
+- **Cheap checks come first.** The work sum and the bond proof are checked
+  before any header's proof of work, and each of those costs a full extension
+  (one mining attempt). Forcing that cost onto a node costs the sender real
+  hashing.
+
+Strictly, this is a day of the *merged* share of midstate's hashrate rather than
+of midstate's whole network. An honest run is correspondingly about
+`1440 × share` headers. At a 50% share that is roughly 720 headers, 104 KB and
+720 extensions to verify. Midstate reports about 100 attempts a second on a
+Raspberry Pi 5, so that is around seven seconds on a Pi, once per bond. To
+demand a full midstate day instead, scale `REGISTRATION_WORK_BLOCKS` by
+`1 / share`.
 
 ## Privacy
 
@@ -197,7 +219,7 @@ Consensus:
 
 - the header's `miner` field;
 - the bond set in midwimble's state (committed in its root);
-- registration items and their validation;
+- registration items in blocks (validated by `BondRegistration::verify`);
 - authorisation checks in block validation.
 
 Mining:
