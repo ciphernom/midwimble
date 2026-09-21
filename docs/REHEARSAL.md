@@ -64,6 +64,8 @@ The bond stays locked until the height the script printed. Once midstate
 passes that height, spend it back the same way as in the exit drill; the script
 prints the exact command.
 
-The same bond can mine on the real network after launch. It must be registered
-there with `midwimble bond register`, because the rehearsal network's
-registration belongs to the rehearsal chain.
+A bond is eligible only while more than 30 days of its lock remain. The
+rehearsal locks for the minimum term plus a day, so its bond can mine for about
+a day, which is all the rehearsal needs. After that it simply waits out its
+lock. For the real launch, lock a new bond shortly before launch day, with a
+term covering as long as you mean to mine (`midwimble bond address --until`).
