@@ -1,6 +1,5 @@
 # Rust build output
 target/
-scripts/
 
 # Local scratch / logs
 output.txt
