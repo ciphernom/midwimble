@@ -7,7 +7,7 @@ use super::mw::{
     build_transaction, scan_output, Context, Input, Kernel, KernelFeatures, Payment, Spendable,
     StealthAddress, Transaction, TxBody, WalletKeys,
 };
-use super::state::{apply_batch, apply_body, choose_best_state};
+use super::state::{apply_batch, apply_body, choose_best_state, validate_block_contents};
 use super::template::{build_template, select_transactions};
 use super::types::*;
 use anyhow::Result;
@@ -466,6 +466,99 @@ fn input_signature_cannot_move_to_another_output() {
     assert!(genuine.verify_signature());
     assert!(!moved.verify_signature());
     let _ = (Kernel::new, KernelFeatures::Plain, TxBody::default()); // silence unused imports in some cfgs
+}
+
+/// Once the cap is reached there is nothing to mint, so a block with no fees
+/// carries no coinbase at all. Without this rule the chain would stall the
+/// first time the mempool ran dry after the last coin was issued: a coinbase
+/// is mandatory today, and a coinbase paying zero cannot be built.
+#[test]
+fn blocks_after_the_last_coin_need_no_coinbase() {
+    let mut alice = TestWallet::new();
+    let chain = funded_chain(&mut alice);
+    let end = EMISSION
+        .final_reward_height()
+        .expect("the schedule reaches the cap");
+    assert_eq!(block_reward(end + 1), 0);
+
+    // A state whose next block is past the end of issuance.
+    let mut after = chain.state.clone();
+    after.height = end + 1;
+    let supply = issued_before(after.height);
+    after.supply = supply;
+
+    // An empty block there pays nobody and carries no coinbase.
+    let template = build_template(&after, &chain.timestamps, &[], &alice.address(), None).unwrap();
+    assert!(template.batch.coinbase.is_none());
+    validate_block_contents(&template.batch, after.height, false).unwrap();
+    let next = apply_body(&after, &template.batch.body, None).unwrap();
+    assert_eq!(next.supply, supply, "no coins after the cap");
+
+    // Claiming anything there is invalid.
+    let mut forged = template.batch.clone();
+    forged.coinbase = Some(super::mw::build_coinbase(&[(alice.address(), 1)]).unwrap());
+    assert!(validate_block_contents(&forged, after.height, true).is_err());
+}
+
+/// Fees still have to be claimed after issuance ends: an unclaimed fee would
+/// leave the chain's Pedersen supply audit permanently unbalanced.
+#[test]
+fn fees_after_the_last_coin_still_need_a_coinbase() {
+    let mut alice = TestWallet::new();
+    let mut chain = funded_chain(&mut alice);
+    let bob = TestWallet::new();
+    let fee = 5_000u64;
+    let coins = alice.spendable_at(chain.state.height);
+    let tx = build_transaction(
+        &coins,
+        &[Payment {
+            to: bob.address(),
+            value: 1_000_000,
+        }],
+        &alice.address(),
+        fee,
+        0,
+    )
+    .unwrap()
+    .tx;
+
+    let end = EMISSION.final_reward_height().unwrap();
+    let mut after = chain.state.clone();
+    after.height = end + 1;
+    after.supply = issued_before(after.height);
+
+    let template =
+        build_template(&after, &chain.timestamps, &[tx.clone()], &alice.address(), None).unwrap();
+    let cb = template
+        .batch
+        .coinbase
+        .as_ref()
+        .expect("a fee-paying block still pays the miner");
+    cb.verify_sum(fee).expect("the coinbase claims the fees");
+    validate_block_contents(&template.batch, after.height, false).unwrap();
+
+    // Dropping the coinbase would burn the fee, and is rejected.
+    let mut stripped = template.batch.clone();
+    stripped.coinbase = None;
+    assert!(validate_block_contents(&stripped, after.height, true).is_err());
+
+    // The chain itself is unaffected at ordinary heights.
+    chain.mine(&[tx], &alice.address()).unwrap();
+}
+
+/// Slow-start blocks are worth only a few hundred base units, and a pool
+/// splits them across up to 32 payees. Nobody weighted may round to nothing.
+#[test]
+fn tiny_rewards_still_pay_every_payee() {
+    let payees: Vec<(StealthAddress, u64)> = (0..32)
+        .map(|i| (TestWallet::new().address(), 1 + i as u64 * 97))
+        .collect();
+    for total in [32u64, 100, 553, 1_108, 23_932_616] {
+        let split = super::template::split_by_weight(total, &payees).unwrap();
+        assert_eq!(split.len(), payees.len(), "someone was dropped at {total}");
+        assert!(split.iter().all(|(_, v)| *v > 0));
+        assert_eq!(split.iter().map(|(_, v)| *v).sum::<u64>(), total);
+    }
 }
 
 #[test]

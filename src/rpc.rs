@@ -73,6 +73,18 @@ pub async fn serve_on(node: NodeHandle, listener: tokio::net::TcpListener) -> Re
     Ok(())
 }
 
+fn midwimble_max_supply() -> u64 {
+    crate::core::types::MAX_SUPPLY
+}
+
+/// Height of the next halving, or `null` once nothing is left to halve.
+/// Explorers and halving countdowns read this.
+fn next_halving(height: u64) -> Option<u64> {
+    let interval = crate::core::types::HALVING_INTERVAL;
+    let next = (height / interval + 1) * interval;
+    (crate::core::types::block_reward(next) > 0).then_some(next)
+}
+
 async fn state(AxState(node): AxState<NodeHandle>) -> Json<Value> {
     let info = node.info();
     let s = &info.state;
@@ -84,6 +96,11 @@ async fn state(AxState(node): AxState<NodeHandle>) -> Json<Value> {
         "timestamp": s.timestamp,
         "state_root": hex::encode(s.state_root()),
         "supply": s.supply,
+        "max_supply": midwimble_max_supply(),
+        "decimals": 8,
+        "block_reward": crate::core::types::block_reward(s.height),
+        "era": s.height / crate::core::types::HALVING_INTERVAL,
+        "next_halving_height": next_halving(s.height),
         "utxos": s.utxos.len(),
         "kernels": s.kernels.len(),
         "peer_id": info.peer_id,

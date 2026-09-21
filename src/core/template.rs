@@ -122,6 +122,13 @@ pub fn build_template(
 
 /// Splits `total` by weight (floor), giving the rounding remainder to the
 /// first entry. Zero-weight and zero-amount entries are dropped.
+///
+/// Every weighted payee is given one base unit before the split when the
+/// total stretches that far. During the slow start a block is worth a few
+/// hundred base units, and a plain proportional split would round the
+/// smallest of a pool's 31 payees to nothing — which their own audit reads as
+/// the pool refusing to pay them (`pool::audit_job`), so they would stop
+/// hashing on day one. One base unit each costs the split at most 32 units.
 pub fn split_by_weight(
     total: u64,
     weights: &[(StealthAddress, u64)],
@@ -130,9 +137,15 @@ pub fn split_by_weight(
     if sum == 0 {
         bail!("payout weights sum to zero");
     }
+    let payees = weights.iter().filter(|(_, w)| *w > 0).count() as u64;
+    let floor = if payees > 0 && total >= payees { 1 } else { 0 };
+    let rest = (total - floor * payees) as u128;
     let mut out: Vec<(StealthAddress, u64)> = weights
         .iter()
-        .map(|(a, w)| (*a, ((total as u128 * *w as u128) / sum) as u64))
+        .map(|(a, w)| {
+            let share = ((rest * *w as u128) / sum) as u64;
+            (*a, if *w > 0 { share + floor } else { share })
+        })
         .collect();
     let paid: u64 = out.iter().map(|(_, v)| *v).sum();
     let first = weights
@@ -170,12 +183,19 @@ pub fn build_template_with(
     let amount = block_reward(height)
         .checked_add(fees)
         .ok_or_else(|| anyhow!("reward overflow"))?;
-    let split = split_by_weight(amount, payouts)?;
-    let (coinbase, receipts) = build_coinbase_with(&split, extra)?;
-    let receipts: Vec<(StealthAddress, PayoutReceipt)> =
-        split.iter().map(|(a, _)| *a).zip(receipts).collect();
+    // After the last coin is issued, a block with no fees pays nobody and
+    // carries no coinbase at all (`state::validate_block_contents`).
+    let (coinbase, receipts) = if amount == 0 {
+        (None, Vec::new())
+    } else {
+        let split = split_by_weight(amount, payouts)?;
+        let (cb, receipts) = build_coinbase_with(&split, extra)?;
+        let receipts: Vec<(StealthAddress, PayoutReceipt)> =
+            split.iter().map(|(a, _)| *a).zip(receipts).collect();
+        (Some(cb), receipts)
+    };
 
-    let next = apply_body(state, &body, Some(&coinbase))?;
+    let next = apply_body(state, &body, coinbase.as_ref())?;
     let state_root = next.state_root();
     let timestamp = timestamp
         .unwrap_or_else(|| current_timestamp().max(min_next_timestamp(previous_timestamps)));
@@ -184,7 +204,7 @@ pub fn build_template_with(
         prev_midstate: state.mw_midstate,
         prev_header_hash: state.header_hash,
         body,
-        coinbase: Some(coinbase),
+        coinbase,
         extension: Extension {
             nonce: 0,
             final_hash: [0u8; 32],

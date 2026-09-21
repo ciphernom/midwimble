@@ -845,10 +845,19 @@ pub fn audit_job(
     if &compute_header_hash(&batch.header()) != mining_hash {
         bail!("template does not hash to the announced mining hash");
     }
-    let cb = batch
-        .coinbase
-        .as_ref()
-        .ok_or_else(|| anyhow!("template has no coinbase"))?;
+    // After issuance ends a block with no fees pays nobody and carries no
+    // coinbase (`core::state::validate_block_contents`). There is no score
+    // commitment and no payout to check, and consensus rejects such a block
+    // if it did have something to claim, so the pool gains nothing by it.
+    let cb = match batch.coinbase.as_ref() {
+        Some(cb) => cb,
+        None => {
+            if batch.body.fee().unwrap_or(u64::MAX) != 0 {
+                bail!("template drops a coinbase but its transactions pay fees");
+            }
+            return Ok(());
+        }
+    };
     let key = addr_key(address);
     let score = proof["score"].as_u64().unwrap_or(0);
     let index = proof["index"].as_u64().unwrap_or(0) as usize;

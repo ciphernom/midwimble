@@ -68,18 +68,83 @@ pub fn count_leading_zeros(hash: &[u8; 32]) -> u32 {
     zeros
 }
 
-// ── Network identity ────────────────────────────────────────────────────────
+// ── Network identity and launch parameters ──────────────────────────────────
+
+/// Compile-time hex decoding, so launch parameters read as the hex strings
+/// they are announced as.
+const fn hex32(s: &str) -> [u8; 32] {
+    let b = s.as_bytes();
+    assert!(b.len() == 64, "a 32-byte hex string is 64 characters");
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        let hi = hex_digit(b[2 * i]);
+        let lo = hex_digit(b[2 * i + 1]);
+        out[i] = hi * 16 + lo;
+        i += 1;
+    }
+    out
+}
+
+const fn hex_digit(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        b'A'..=b'F' => c - b'A' + 10,
+        _ => panic!("not a hex digit"),
+    }
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║ LAUNCH PARAMETERS                                                        ║
+// ║                                                                          ║
+// ║ Everything between the markers is written by                             ║
+// ║ `scripts/set_launch_params.py` on launch day (see `docs/LAUNCH.md`).     ║
+// ║ The values below are devnet placeholders: they carry midstate's own      ║
+// ║ Bitcoin anchor and genesis target, so a build made from them is a        ║
+// ║ devnet build and says so (`LAUNCH_PARAMETERS_SET`).                      ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// @launch-params:begin
 
 /// Distinguishes this network from midstate and from other deployments of
-/// this code. Feeds the genesis midstate, every signed message, and the DHT
-/// rendezvous key. **Change it for each network you launch.**
+/// this code. Feeds the genesis midstate, every signed message, the merged-
+/// mining commitment and the DHT rendezvous key.
 pub const NETWORK_MAGIC: &[u8] = b"MIDWIMBLE_DEVNET_V1";
 
-/// Bitcoin block anchoring the genesis (midstate's anchor; replace at launch
-/// with a recent block to prove the chain was not premined before it).
+/// Bitcoin block anchoring the genesis. Its hash cannot be known before it is
+/// mined, so a chain committing to it cannot have been started (or quietly
+/// pre-mined) any earlier. **Pick a block mined after the code freeze.**
 pub const BITCOIN_BLOCK_HASH: &str =
     "000000000000000000018f5ad5625d43356136c2e50c6dc18967a90a18f0af2e";
 pub const BITCOIN_BLOCK_HEIGHT: u64 = 938708;
+/// The anchor block's own timestamp. Genesis may not precede it.
+pub const BITCOIN_BLOCK_TIME: u64 = 1_772_274_770;
+
+/// Mainnet genesis time; see [`GENESIS_TIMESTAMP`].
+const LAUNCH_GENESIS_TIMESTAMP: u64 = 1_789_430_400; // 2026-09-15 00:00:00 UTC — placeholder
+
+/// Mainnet genesis target; see [`GENESIS_TARGET`]. Placeholder: midstate's
+/// genesis target, which is calibrated for one machine and is roughly four
+/// orders of magnitude too easy for a network of merged miners.
+const LAUNCH_GENESIS_TARGET: [u8; 32] =
+    hex32("0011ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+
+/// False while the parameters above are placeholders. The node says so at
+/// startup and `midwimble params` prints it, so a release built without
+/// running the launch script cannot be mistaken for the real network.
+pub const LAUNCH_PARAMETERS_SET: bool = false;
+
+// @launch-params:end
+
+/// Genesis cannot predate the Bitcoin block it commits to.
+const _: () = assert!(LAUNCH_GENESIS_TIMESTAMP >= BITCOIN_BLOCK_TIME);
+
+/// A build claiming real launch parameters must not carry the devnet
+/// placeholder target (midstate's genesis target, 0x0011ff…) or anything
+/// easier: it would open the chain with thousands of near-free blocks.
+const _: () = assert!(
+    !LAUNCH_PARAMETERS_SET || (LAUNCH_GENESIS_TARGET[0] == 0 && LAUNCH_GENESIS_TARGET[1] < 0x11)
+);
 
 const GENESIS_INSCRIPTION: &[u8] =
     b"midwimble: midstate consensus and networking, pluribit mimblewimble";
@@ -118,19 +183,21 @@ pub const PRUNE_DEPTH: u64 = 1000;
 /// mine thousands of near-free blocks until it caught up with the schedule.
 /// Blocks cannot be mined before this instant (timestamps must exceed it).
 #[cfg(not(feature = "fast-mining"))]
-pub const GENESIS_TIMESTAMP: u64 = 1_789_430_400; // 2026-09-15 00:00:00 UTC — devnet placeholder
+pub const GENESIS_TIMESTAMP: u64 = LAUNCH_GENESIS_TIMESTAMP;
 #[cfg(feature = "fast-mining")]
 pub const GENESIS_TIMESTAMP: u64 = 1_700_000_000;
 
-/// Midstate's genesis target (calibrated for ~60 s blocks on its reference
-/// hardware with the SIMD miner).
+/// The target block 1 must meet, and the reference point ASERT measures
+/// every later target against.
+///
+/// Calibrate it on launch day from the midstate node's own `/state` target:
+/// both chains run the same proof of work at the same 60-second spacing, so
+/// `GENESIS_TARGET = midstate_target / expected_merge_mining_share`. Too easy
+/// and the first hours produce thousands of near-free blocks while ASERT
+/// catches up; too hard only makes early blocks slow, which the slow start
+/// makes harmless. Err on the side of too hard.
 #[cfg(not(feature = "fast-mining"))]
-pub const GENESIS_TARGET: [u8; 32] = {
-    let mut t = [0xffu8; 32];
-    t[0] = 0x00;
-    t[1] = 0x11;
-    t
-};
+pub const GENESIS_TARGET: [u8; 32] = LAUNCH_GENESIS_TARGET;
 #[cfg(feature = "fast-mining")]
 pub const GENESIS_TARGET: [u8; 32] = {
     let mut t = [0xffu8; 32];
@@ -147,12 +214,212 @@ pub const EXTENSION_ITERATIONS: u64 = 100;
 // ── Economics ───────────────────────────────────────────────────────────────
 
 pub const BLOCKS_PER_YEAR: u64 = 365 * 24 * 3600 / TARGET_BLOCK_TIME;
-/// Midstate's initial reward (2^30), halving yearly to a floor of 1.
-pub const INITIAL_REWARD: u64 = 1_073_741_824;
 
+/// Base units in one coin: amounts carry 8 decimal places.
+pub const COIN: u64 = 100_000_000;
+
+/// Every coin that will ever exist: 1,000,000.00000000, reached exactly.
+pub const MAX_SUPPLY: u64 = 1_000_000 * COIN;
+
+/// Blocks per era; the reward halves at each multiple of this height.
+///
+/// 2,100,000 × 60 s = 126,000,000 s, the same wall-clock era as Bitcoin's
+/// 210,000 × 600 s. ASERT is anchored to the genesis timestamp rather than a
+/// sliding window, so the chain tracks that schedule instead of drifting ahead
+/// of it: halvings land within a day or so of `GENESIS_TIMESTAMP + k ×
+/// 126,000,000 s` as long as the hashrate stays within a few dozen times its
+/// launch calibration.
+pub const HALVING_INTERVAL: u64 = 2_100_000;
+
+/// Slow start: the reward climbs linearly from ~0 to [`INITIAL_REWARD`] over
+/// the first 30 days.
+///
+/// Launch day is when the least is known about the chain and when whoever
+/// happens to hold hashrate — or has quietly pre-mined against a published
+/// genesis — can take the most. Ramping the reward makes that window close to
+/// worthless (day one pays about 5.7 coins rather than 343) and buys the time
+/// difficulty discovery, merged-mining integration and word of mouth all need.
+/// A plain proof-of-work chain pays for this in early security; a merge-mined
+/// one does not, because its hashrate comes from midstate at nearly no extra
+/// cost to the miner.
+#[cfg(not(feature = "fast-mining"))]
+pub const SLOW_START_BLOCKS: u64 = 30 * 24 * 60;
+#[cfg(feature = "fast-mining")]
+pub const SLOW_START_BLOCKS: u64 = 0;
+
+/// Era-0 reward once the slow start is over: 0.23932616 coins.
+///
+/// The smallest reward whose schedule reaches [`MAX_SUPPLY`]; the 0.034 coins
+/// it overshoots by are trimmed off the final blocks, so issuance stops at
+/// exactly 1,000,000.00000000 rather than approaching it.
+pub const INITIAL_REWARD: u64 = 23_932_616;
+
+/// A slow start that outlasted its own era would make the schedule
+/// meaningless, and the closed form below assumes it does not.
+const _: () = assert!(SLOW_START_BLOCKS < HALVING_INTERVAL);
+
+/// The emission curve: a linear slow start, then halvings, then a hard cap.
+///
+/// Defined by its *running total* rather than by a per-block formula. The
+/// cumulative form has a closed form at every height, which makes three
+/// things true that matter more than elegance:
+///
+/// * the cap is exact by construction — the last block to mint pays whatever
+///   is left rather than a full reward, and every block after it pays nothing;
+/// * any node can check a claimed supply at any height in microseconds, so a
+///   snapshot or checkpoint cannot smuggle in coins the schedule never
+///   allowed (see `core/snapshot.rs`);
+/// * `block_reward` is just the difference between two neighbouring totals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Emission {
+    pub initial_reward: u64,
+    pub halving_interval: u64,
+    pub slow_start: u64,
+    pub max_supply: u64,
+}
+
+/// The schedule this build enforces.
+pub const EMISSION: Emission = Emission {
+    initial_reward: INITIAL_REWARD,
+    halving_interval: HALVING_INTERVAL,
+    slow_start: SLOW_START_BLOCKS,
+    max_supply: MAX_SUPPLY,
+};
+
+/// Mainnet's schedule, whatever features this build carries. Tests assert the
+/// real curve's properties even when compiled with `fast-mining`.
+pub const MAINNET_EMISSION: Emission = Emission {
+    initial_reward: 23_932_616,
+    halving_interval: 2_100_000,
+    slow_start: 30 * 24 * 60,
+    max_supply: 1_000_000 * COIN,
+};
+
+impl Emission {
+    /// Issuance scheduled for blocks `1..height`, before the cap applies.
+    /// Genesis (height 0) mints nothing.
+    fn scheduled_before(&self, height: u64) -> u128 {
+        let last = match height.checked_sub(1) {
+            None | Some(0) => return 0,
+            Some(h) => h as u128,
+        };
+        let reward = self.initial_reward as u128;
+        let ramp = self.slow_start as u128;
+        let interval = self.halving_interval as u128;
+
+        // Slow start: after m blocks, reward·m(m+1)/2·ramp coins, so each
+        // block pays about reward·h/ramp and the ramp's last block pays the
+        // full reward.
+        let m = last.min(ramp);
+        let mut total = if ramp == 0 {
+            0
+        } else {
+            reward * m * (m + 1) / (2 * ramp)
+        };
+        // The rest of era 0.
+        if last > ramp {
+            total += (last.min(interval - 1) - ramp) * reward;
+        }
+        // Eras 1, 2, …: [k·interval, (k+1)·interval) paying reward >> k.
+        let mut k = 1u32;
+        while k < 64 {
+            let start = k as u128 * interval;
+            if start > last {
+                break;
+            }
+            let era_reward = reward >> k;
+            if era_reward == 0 {
+                break;
+            }
+            let end = last.min(start + interval - 1);
+            total += (end - start + 1) * era_reward;
+            k += 1;
+        }
+        total
+    }
+
+    /// Coins in existence with `height` as the next block's height — that is,
+    /// after every block below `height` has been applied. A chain state's
+    /// `supply` field always equals this.
+    pub fn issued_before(&self, height: u64) -> u64 {
+        self.scheduled_before(height)
+            .min(self.max_supply as u128) as u64
+    }
+
+    /// What the block at `height` may mint.
+    pub fn block_reward(&self, height: u64) -> u64 {
+        if height == 0 {
+            return 0;
+        }
+        self.issued_before(height.saturating_add(1)) - self.issued_before(height)
+    }
+
+    /// Height of the last block that mints anything, if the cap is ever
+    /// reached. Everything above it pays fees only.
+    pub fn final_reward_height(&self) -> Option<u64> {
+        let (mut lo, mut hi) = (1u64, 64u64.saturating_mul(self.halving_interval));
+        if self.issued_before(hi.saturating_add(1)) < self.max_supply {
+            return None;
+        }
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.issued_before(mid.saturating_add(1)) >= self.max_supply {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        Some(lo)
+    }
+}
+
+/// What the block at `height` may mint, under this build's schedule.
 pub fn block_reward(height: u64) -> u64 {
-    let halvings = height / BLOCKS_PER_YEAR;
-    INITIAL_REWARD >> halvings.min(30)
+    EMISSION.block_reward(height)
+}
+
+/// The supply a state whose next block is `height` must have.
+pub fn issued_before(height: u64) -> u64 {
+    EMISSION.issued_before(height)
+}
+
+// ── Amounts ─────────────────────────────────────────────────────────────────
+
+/// Formats base units as coins, e.g. `23_932_616` → `"0.23932616"`.
+pub fn format_amount(units: u64) -> String {
+    format!("{}.{:08}", units / COIN, units % COIN)
+}
+
+/// Parses an amount written in coins, e.g. `"0.239"` → `23_900_000` units.
+pub fn parse_amount(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    let (whole, frac) = match s.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (s, ""),
+    };
+    if whole.is_empty() && frac.is_empty() {
+        anyhow::bail!("empty amount");
+    }
+    if !whole.bytes().chain(frac.bytes()).all(|c| c.is_ascii_digit()) {
+        anyhow::bail!("'{s}' is not an amount in coins (digits and one '.')");
+    }
+    if frac.len() > 8 {
+        anyhow::bail!("amounts carry at most 8 decimal places");
+    }
+    let scale = 10u64.pow(8 - frac.len() as u32);
+    let whole: u64 = if whole.is_empty() { 0 } else { whole.parse()? };
+    let frac: u64 = if frac.is_empty() { 0 } else { frac.parse()? };
+    let units = whole
+        .checked_mul(COIN)
+        .and_then(|u| u.checked_add(frac * scale))
+        .ok_or_else(|| anyhow::anyhow!("amount out of range"))?;
+    if units > MAX_SUPPLY {
+        anyhow::bail!(
+            "{s} is more than the whole {} coin supply (amounts are in coins, not base units)",
+            MAX_SUPPLY / COIN
+        );
+    }
+    Ok(units)
 }
 
 /// Blocks before a coinbase output may be spent (pluribit's rule; midstate had
@@ -176,7 +443,14 @@ pub const MAX_BLOCK_WEIGHT: u64 = 40_000;
 /// Relay limit for one transaction.
 pub const MAX_TX_WEIGHT: u64 = 10_000;
 /// Minimum relay fee per weight unit (local policy, not consensus).
-pub const MIN_FEE_PER_WEIGHT: u64 = 1_000;
+///
+/// 100 units puts an ordinary one-input, two-output payment at 4,600 base
+/// units (0.000046 coins) and a full block of spam at 0.04 coins. It is a
+/// tenth of what this code inherited, because the supply it is denominated
+/// against is about a tenth the size: the point is to keep the floor where it
+/// was *relative to the coin*, which for a privacy chain matters twice over —
+/// every payment anyone is willing to make also enlarges the anonymity set.
+pub const MIN_FEE_PER_WEIGHT: u64 = 100;
 
 // ── UTXO records ────────────────────────────────────────────────────────────
 
@@ -538,16 +812,93 @@ mod tests {
         assert_ne!(network_anchor(), hash(BITCOIN_BLOCK_HASH.as_bytes()));
     }
 
+    /// The properties the schedule is chosen for, checked against mainnet's
+    /// parameters even when this build carries `fast-mining`.
     #[test]
-    fn block_reward_schedule() {
-        assert_eq!(block_reward(0), INITIAL_REWARD);
-        assert_eq!(block_reward(BLOCKS_PER_YEAR), INITIAL_REWARD / 2);
-        assert_eq!(block_reward(u64::MAX), 1);
-        // Total issuance fits comfortably inside the 64-bit range proofs.
-        let total: u128 = (0..=30u32)
-            .map(|h| (INITIAL_REWARD >> h) as u128 * BLOCKS_PER_YEAR as u128)
-            .sum();
-        assert!(total < (1u128 << 63));
+    fn mainnet_emission_reaches_the_cap_exactly() {
+        let e = MAINNET_EMISSION;
+        let end = e.final_reward_height().expect("the cap is reached");
+        assert_eq!(e.issued_before(end + 1), MAX_SUPPLY);
+        assert_eq!(e.block_reward(end + 1), 0);
+        assert!(e.block_reward(end) > 0);
+        // Genesis mints nothing, and nothing mints after the cap.
+        assert_eq!(e.block_reward(0), 0);
+        assert_eq!(e.issued_before(0), 0);
+        assert_eq!(e.block_reward(u64::MAX), 0);
+        assert_eq!(e.issued_before(u64::MAX), MAX_SUPPLY);
+        // ~95 years: long enough that fees, not issuance, are the endgame.
+        assert!((49_000_000..51_000_000).contains(&end), "ends at {end}");
+    }
+
+    #[test]
+    fn mainnet_emission_shape() {
+        let e = MAINNET_EMISSION;
+        // The ramp rises every block, never reverses, and ends at the full
+        // reward, which then holds until the first halving.
+        assert!(e.block_reward(1) > 0);
+        for h in 1..e.slow_start {
+            assert!(
+                e.block_reward(h + 1) >= e.block_reward(h),
+                "ramp dips at {h}"
+            );
+        }
+        assert_eq!(e.block_reward(e.slow_start), e.initial_reward);
+        assert_eq!(e.block_reward(e.slow_start + 1), e.initial_reward);
+        assert_eq!(e.block_reward(e.halving_interval - 1), e.initial_reward);
+        // Halvings land on the era boundaries.
+        for k in 1..20u32 {
+            let h = k as u64 * e.halving_interval;
+            assert_eq!(e.block_reward(h), e.initial_reward >> k, "era {k}");
+            assert_eq!(e.block_reward(h - 1), e.initial_reward >> (k - 1));
+        }
+        // Half of everything inside the first era, as intended.
+        let era_one = e.issued_before(e.halving_interval);
+        assert!(era_one > MAX_SUPPLY / 2 - MAX_SUPPLY / 200);
+        assert!(era_one < MAX_SUPPLY / 2);
+        // The first month is worth about half a percent of the supply.
+        let month = e.issued_before(e.slow_start + 1);
+        assert!(month < MAX_SUPPLY / 150, "slow start minted {month}");
+    }
+
+    /// `issued_before` is the running total of `block_reward`; consensus
+    /// relies on the two never disagreeing.
+    #[test]
+    fn issuance_is_the_running_total_of_the_rewards() {
+        for e in [MAINNET_EMISSION, EMISSION] {
+            let mut running: u128 = 0;
+            let probes = (0..2_000).chain([
+                e.slow_start.saturating_sub(1),
+                e.slow_start,
+                e.slow_start + 1,
+                e.halving_interval - 2,
+                e.halving_interval - 1,
+                e.halving_interval,
+                e.halving_interval + 1,
+                2 * e.halving_interval,
+            ]);
+            for h in probes {
+                running = e.issued_before(h) as u128 + e.block_reward(h) as u128;
+                assert_eq!(running, e.issued_before(h + 1) as u128, "height {h}");
+            }
+            let _ = running;
+            // Never more than the cap, at any height.
+            assert!(e.issued_before(u64::MAX) <= e.max_supply);
+        }
+    }
+
+    #[test]
+    fn amounts_round_trip() {
+        assert_eq!(format_amount(INITIAL_REWARD), "0.23932616");
+        assert_eq!(format_amount(0), "0.00000000");
+        assert_eq!(format_amount(MAX_SUPPLY), "1000000.00000000");
+        assert_eq!(parse_amount("0.23932616").unwrap(), INITIAL_REWARD);
+        assert_eq!(parse_amount("1").unwrap(), COIN);
+        assert_eq!(parse_amount(" 1.5 ").unwrap(), 150_000_000);
+        assert_eq!(parse_amount(".5").unwrap(), 50_000_000);
+        assert_eq!(parse_amount("0.00000001").unwrap(), 1);
+        for bad in ["", "1.234567891", "-1", "1e8", "1.2.3", "abc", "1000001"] {
+            assert!(parse_amount(bad).is_err(), "accepted {bad}");
+        }
     }
 
     #[test]

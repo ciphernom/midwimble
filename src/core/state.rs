@@ -212,15 +212,52 @@ pub fn validate_block_contents(batch: &Batch, height: u64, skip_crypto: bool) ->
     let is_genesis = height == 0;
     let body = &batch.body;
     body.validate_structure(Context::Block)?;
+
+    // What this block is allowed to pay out. Once issuance has reached
+    // MAX_SUPPLY (about 95 years in) a block with no fees has nothing to
+    // claim, and a coinbase would have to invent a zero-valued output to
+    // exist at all — so at that point it is dropped instead. Fees must still
+    // always be claimed: an unclaimed fee would leave the chain's Pedersen
+    // audit (`State::verify_supply`) unbalanced forever.
+    let fees = body.fee()?;
+    let amount = block_reward(height)
+        .checked_add(fees)
+        .ok_or_else(|| anyhow!("reward overflow"))?;
+
     let coinbase = match (&batch.coinbase, is_genesis) {
-        (Some(cb), false) => cb,
+        (Some(cb), false) => {
+            if amount == 0 {
+                bail!("block {} carries a coinbase with nothing to claim", height);
+            }
+            cb
+        }
         (None, true) => {
             if !body.is_empty() {
                 bail!("genesis must be empty");
             }
             return Ok(());
         }
-        (None, false) => bail!("block {} has no coinbase", height),
+        (None, false) => {
+            if amount != 0 {
+                bail!(
+                    "block {} has no coinbase but {} to claim",
+                    height,
+                    format_amount(amount)
+                );
+            }
+            if batch.weight() > MAX_BLOCK_WEIGHT {
+                bail!(
+                    "block weight {} exceeds {}",
+                    batch.weight(),
+                    MAX_BLOCK_WEIGHT
+                );
+            }
+            body.verify_sums()?;
+            if !skip_crypto {
+                body.verify_crypto()?;
+            }
+            return Ok(());
+        }
         (Some(_), true) => bail!("genesis must not carry a coinbase"),
     };
     coinbase.validate_structure()?;
@@ -251,10 +288,6 @@ pub fn validate_block_contents(batch: &Batch, height: u64, skip_crypto: bool) ->
 
     // Balance: the body balances on its own, and the coinbase claims exactly
     // reward + declared fees.
-    let fees = body.fee()?;
-    let amount = block_reward(height)
-        .checked_add(fees)
-        .ok_or_else(|| anyhow!("reward overflow"))?;
     body.verify_sums()?;
     coinbase.verify_sum(amount)?;
 
@@ -358,11 +391,18 @@ pub fn apply_body(state: &State, body: &Transaction, coinbase: Option<&Coinbase>
         scalar_from_bytes(&body.kernel_offset).ok_or_else(|| anyhow!("invalid kernel offset"))?;
     next.total_kernel_offset = (total + offset).to_bytes();
 
-    if coinbase.is_some() {
-        next.supply = next
-            .supply
-            .checked_add(block_reward(height))
-            .ok_or_else(|| anyhow!("supply overflow"))?;
+    // The supply is a pure function of height: whatever the block's shape,
+    // it mints exactly what the schedule allows, and nothing after the cap.
+    next.supply = next
+        .supply
+        .checked_add(block_reward(height))
+        .ok_or_else(|| anyhow!("supply overflow"))?;
+    if next.supply != issued_before(height + 1) {
+        bail!(
+            "supply {} does not match the emission schedule at height {}",
+            next.supply,
+            height
+        );
     }
     Ok(next)
 }

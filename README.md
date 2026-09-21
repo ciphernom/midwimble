@@ -39,6 +39,21 @@ recovery design.
 - **State root:** covers the UTXO set, the kernel set, the chain MMR, the
   running excess sum, the total offset and the supply.
 
+### Emission (`core/types.rs`, `docs/LAUNCH.md`)
+
+- **Supply:** exactly 1,000,000.00000000 coins (8 decimals), reached exactly
+  rather than approached, at about block 49.7 million (~95 years).
+- **Slow start:** the reward ramps linearly over the first 30 days, so the
+  blocks mined while the network is small and least known are worth little.
+- **Halvings:** 0.23932616 per block in era 0, halving every 2,100,000 blocks,
+  the same wall-clock era as Bitcoin's. ASERT's genesis anchoring keeps the
+  halving dates predictable to within a day or two.
+- **Checkable anywhere:** the schedule is defined by its running total, so any
+  node can verify a supply claim at any height; checkpoint-synced nodes check
+  the snapshot they start from.
+- **After the cap:** a block pays only its fees, and a block with none carries
+  no coinbase.
+
 ### Transactions (pluribit, hardened)
 
 - **Commitments:** Pedersen commitments on Ristretto255 with aggregated
@@ -174,8 +189,11 @@ cargo test --lib                                       # production constants (1
 cargo test --no-default-features --features fast-mining --lib   # core only (159 tests)
 ```
 
-`fast-mining` makes proof of work trivial, moves genesis to 2023 and sets
-coinbase maturity to 3. Never ship a binary built with it. Release builds have
+`fast-mining` makes proof of work trivial, moves genesis to 2023, sets
+coinbase maturity to 3 and skips the slow start. Never ship a binary built with
+it. `midwimble params` prints a build's launch parameters, emission calendar and
+genesis block id; a build whose launch parameters are still placeholders says
+so there and at node startup. Release builds have
 not been compiled in this environment.
 
 The integration tests run real nodes on localhost:
@@ -201,7 +219,7 @@ midwimble wallet --wallet w.mww create            # prints a v1 address + 24 wor
 midwimble node --data-dir ./node --mine-to <address> [--backend gpu] [--prune]
 midwimble node --data-dir ./node --checkpoint <checkpoint id>   # checkpoint verification
 midwimble wallet --wallet w.mww balance
-midwimble wallet --wallet w.mww send --to <address> --amount 1000000
+midwimble wallet --wallet w.mww send --to <address> --amount 0.25   # amounts in coins
 
 # merged mining against a midstate node
 midwimble merge-mine --midstate-rpc 127.0.0.1:8545 --midstate-address <hex> \
@@ -242,8 +260,10 @@ verify. The vendored copy keys the file by a seed fingerprint.
 
 ## Before any real launch
 
-- [ ] Set `GENESIS_TIMESTAMP` to the launch time. ASERT is anchored to it.
-- [ ] Choose a fresh `NETWORK_MAGIC` and Bitcoin anchor.
+- [x] Emission schedule, supply cap and decimals (`core/types.rs`).
+- [ ] Run `scripts/set_launch_params.py` on launch day: network magic, a
+  Bitcoin anchor mined after the code freeze, the genesis time, and a genesis
+  target calibrated from midstate's live target (`docs/LAUNCH.md`).
 - [ ] Get a cryptographic review of:
   - the ownership scheme (owner sum, kernel AND-proof, transcript binding);
   - the merged-mining proof;
