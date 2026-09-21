@@ -32,6 +32,9 @@ pub struct Snapshot {
     pub utxos: Vec<(Point32, UtxoEntry)>,
     pub groups: Vec<StoredGroup>,
     pub kernels: Vec<Kernel>,
+    /// The registered bond set, checked through the state root.
+    #[serde(default)]
+    pub bonds: Vec<([u8; 32], crate::core::bond::BondEntry)>,
 }
 
 /// Peak values of an MMR, in position order.
@@ -225,6 +228,7 @@ impl Snapshot {
 
         let tip = self.headers.last().expect("checked");
         let state = State {
+            bonds: self.bonds.iter().copied().collect(),
             mw_midstate: tip.post_tx_midstate,
             utxos,
             utxo_set,

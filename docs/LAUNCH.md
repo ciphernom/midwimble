@@ -15,6 +15,7 @@ obviously broken or unfair launch.
 |---|---|---|
 | `NETWORK_MAGIC` | `MIDWIMBLE_MAINNET_V1` | Separates the network from devnets and testnets. Every signature, the merged-mining commitment and the DHT key depend on it. |
 | `BITCOIN_BLOCK_*` | A Bitcoin block mined *after* the code freeze | The genesis commits to its hash, so the chain provably could not have existed earlier. |
+| `MIDSTATE_BLOCK_*` | Midstate's tip at release | The same proof on midstate's one-minute clock, and it pins the midstate chain bonded mining is judged against. |
 | `LAUNCH_GENESIS_TIMESTAMP` | When mining opens, shortly after that block | ASERT measures the whole schedule from this instant. |
 | `LAUNCH_GENESIS_TARGET` | Midstate's live target ÷ expected merged-mining share | The reference hashrate ASERT adjusts around. |
 | `LAUNCH_PARAMETERS_SET` | `true` | Until it is, the node warns that it is a devnet build. |
@@ -38,12 +39,16 @@ explorers, then:
 scripts/set_launch_params.py \
     --bitcoin-height N --bitcoin-hash <hash> --bitcoin-time <its timestamp, UTC> \
     --genesis-time <when mining opens, UTC> \
-    --midstate-rpc 127.0.0.1:8545 --merge-share 0.5
+    --midstate-rpc 127.0.0.1:8545
 
 cargo test --lib
 cargo build --release
 ./target/release/midwimble params
 ```
+
+`--midstate-rpc` reads both the live target and the midstate anchor. It
+matches the tip's hash against `/headers` rather than trusting a height
+convention, so the node must run the midstate patch that adds that endpoint.
 
 Tag the release, publish the binaries, and publish the `genesis block` line
 that `params` prints. Anyone can run `midwimble params` on their own build and
@@ -86,9 +91,10 @@ The two ways of getting it wrong are not symmetric:
 - **Too hard**: early blocks are slow until ASERT eases, about four hours per
   halving of the difficulty. During the slow start that costs almost nothing.
 
-So err towards hard. `--merge-share 0.5` is a sensible default for plain merged
-mining. If bonded mining ships at launch, fewer miners will be able to
-participate on day one, so use a lower share.
+So err towards hard. Bonded mining is required from block 1, so only miners
+who hold MDS and have registered a bond can take part at first. The script's
+default `--merge-share` is therefore 0.25 rather than the 0.5 plain merged
+mining would suggest.
 
 ## Choosing the date
 
@@ -124,4 +130,5 @@ These are carried over from the README and are not settled by this document:
   the recovery commitments.
 - A real minimum work for anchor verification (the CLI defaults to 0).
 - The anchoring cadence, finality depth and archive-node policy.
-- Whether bonded mining ships at launch.
+- The minimum bond (`MIN_MINING_BOND`, proposed at 16 gMDS). Bonded mining
+  itself is decided: it is required from block 1.

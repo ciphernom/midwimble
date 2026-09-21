@@ -10,10 +10,13 @@ A miner with a 1,000 gMDS bond has exactly the mining power of one with the
 minimum. There is no slashing in v1: a bond is locked capital and an admission
 ticket, nothing more.
 
-Status: the bond template, its midstate-side compiler, proof verification,
-registration verification and the eligibility rule exist and are tested (`core/bond.rs` here; `script.rs`, `mmr.rs`,
-`node.rs` and the RPC in midstate). Nothing is wired into block validation
-yet; the consensus wiring is listed at the end.
+Status: bonded mining is wired into consensus and required from block 1 in
+production builds (`bond::BONDED_MINING_FROM`). The bond template, its
+midstate-side compiler, proof and registration verification, the bond set and
+block authorisation all exist and are tested (`core/bond.rs`, `core/state.rs`,
+`core/template.rs` here; `script.rs`, `mmr.rs`, `node.rs` and the RPC in
+midstate). The node does not sign templates yet, so a production node cannot
+mine until that plumbing lands (see the end).
 
 ## How this differs from the draft
 
@@ -110,16 +113,25 @@ handing out a proof that verifies against nothing.
 
 ## Mining with a bond
 
-The header gains `miner: { mining_key, signature }`. The signature is 64-byte
-Ristretto Schnorr, the same scheme as midwimble's transactions: a quantum
+A block carries `miner: { bond_id, signature }`. It is folded into
+`post_tx_midstate` after everything else, so the header layout and the mining
+hash are unchanged and merged mining works exactly as before. The signature is
+Ristretto Schnorr, the same scheme as midwimble's transactions. A quantum
 attacker able to forge it could already forge coin ownership, so post-quantum
-signatures here would add about 1.2 KB per header for no real gain.
+signatures would add bytes without adding security.
 
-The signature covers the header's mining hash computed with the signature field
-zeroed. The proof of work then covers the signature, so a found block cannot be
-re-attributed to another key. Merged mining keeps the same property, because
-the midstate parent commits to the midwimble mining hash. Pools sign with the
-operator's key; workers need nothing.
+The signature covers the mining hash the block would have without its
+authorisation (`bond::authorization_message`): every other byte of the block.
+The proof of work then covers the signature, so a found block cannot be
+re-attributed to another bond, and merged mining keeps this because the
+midstate parent commits to the full mining hash. Pools sign with the
+operator's bond; workers need nothing.
+
+Registered bonds live in the chain state, committed in its root
+(`types::bonds_root`). They are stored in `StateMeta`, so every undo record's
+copy of the previous meta restores them on a reorg, and snapshots carry them. A
+block carries at most one registration, checked against the block's own
+target.
 
 A block is authorised when its key belongs to a registered bond with:
 
@@ -208,23 +220,22 @@ enumerable. The wallet tooling should make the private path the default:
 
 ## Launch interaction
 
-If bonded mining is active from genesis, only MDS holders can mine midwimble.
-The 30-day slow start then also serves as the window to acquire MDS and
-register. Fewer miners can take part on day one, so calibrate the genesis target
-with a lower `--merge-share` (0.1 to 0.25 rather than 0.5).
+Bonded mining is required from block 1. Genesis is fixed data that nobody
+mines, and block 1's producer registers its own bond in block 1 itself. The
+genesis also commits to a midstate block (`MIDSTATE_BLOCK_*`), pinning the
+midstate chain the launch was made against. Only MDS holders can mine at first,
+so the 30-day slow start doubles as the window to acquire MDS and register, and
+the launch script's default `--merge-share` is 0.25.
 
 ## Still to build
 
-Consensus:
+Node plumbing:
 
-- the header's `miner` field;
-- the bond set in midwimble's state (committed in its root);
-- registration items in blocks (validated by `BondRegistration::verify`);
-- authorisation checks in block validation.
-
-Mining:
-
-- signing in templates, the miner, the pool and the merge miner.
+- a mining-bond setting for the node, which then signs every template it
+  builds (`template::build_template_bonded`). The pool and merge miner take
+  their templates from the node, so they need no signing code of their own.
+- switching test builds from "authorisation optional" to required once the
+  integration tests can mine bonded blocks.
 
 Tooling:
 

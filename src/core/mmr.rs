@@ -815,7 +815,7 @@ impl MerkleMountainRange {
 /// climb logic is identical at the level of "which order do I hash the
 /// pair in" — only the way the climb is *navigated* differs between the
 /// two structures.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProofElement {
     pub hash: [u8; 32],
     pub is_right: bool,
@@ -1895,7 +1895,7 @@ impl UtxoAccumulator {
 /// This struct is `Serialize + Deserialize` and may travel over the
 /// network to light clients. The on-wire layout is exactly the field
 /// order shown here; do not reorder.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UtxoProof {
     /// Reserved; always `0` for SMT proofs (the SMT path is determined by
     /// the coin itself, not by an arbitrary leaf index).

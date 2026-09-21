@@ -6,6 +6,10 @@
 //! [`apply_body`], the same function consensus uses, so a template can never
 //! disagree with validation about it.
 
+use super::bond::{
+    authorization_message, check_miner_authorization, BondRegistration, MinerAuth, MinerBond,
+    BONDED_MINING_FROM,
+};
 use super::extension::create_extension;
 use super::mw::{build_coinbase_with, PayoutReceipt, StealthAddress, Transaction};
 use super::state::{apply_body, current_timestamp, min_next_timestamp, validate_block_contents};
@@ -168,6 +172,20 @@ pub fn build_template_with(
     extra: [u8; 32],
     timestamp: Option<u64>,
 ) -> Result<(BlockTemplate, Vec<(StealthAddress, PayoutReceipt)>)> {
+    build_template_bonded(state, previous_timestamps, txs, payouts, extra, timestamp, None)
+}
+
+/// [`build_template_with`], mined under `bond`: the block carries the bond's
+/// registration until the chain has it, and is signed by its mining key.
+pub fn build_template_bonded(
+    state: &State,
+    previous_timestamps: &[u64],
+    txs: &[Transaction],
+    payouts: &[(StealthAddress, u64)],
+    extra: [u8; 32],
+    timestamp: Option<u64>,
+    bond: Option<&MinerBond>,
+) -> Result<(BlockTemplate, Vec<(StealthAddress, PayoutReceipt)>)> {
     let height = state.height;
     if height == 0 {
         bail!("genesis is not mined");
@@ -178,6 +196,20 @@ pub fn build_template_with(
             crate::core::mw::crypto::MAX_GROUP_OUTPUTS
         );
     }
+    // Bonded mining: from BONDED_MINING_FROM a template needs a bond to sign
+    // with, and carries that bond's registration until the chain has it.
+    if height >= BONDED_MINING_FROM && bond.is_none() {
+        bail!(
+            "bonded mining is required from height {BONDED_MINING_FROM}: configure a mining bond"
+        );
+    }
+    let registrations: Vec<BondRegistration> = match bond {
+        Some(b) if !state.bonds.contains_key(&b.bond_id) => match &b.registration {
+            Some(registration) => vec![registration.clone()],
+            None => bail!("the mining bond is not registered on this chain and no registration is configured"),
+        },
+        _ => Vec::new(),
+    };
     let body = Transaction::aggregate(txs)?;
     let fees = body.fee()?;
     let amount = block_reward(height)
@@ -195,7 +227,8 @@ pub fn build_template_with(
         (Some(cb), receipts)
     };
 
-    let next = apply_body(state, &body, coinbase.as_ref())?;
+    let mut next = apply_body(state, &body, coinbase.as_ref())?;
+    super::state::apply_registrations(&mut next, &registrations)?;
     let state_root = next.state_root();
     let timestamp = timestamp
         .unwrap_or_else(|| current_timestamp().max(min_next_timestamp(previous_timestamps)));
@@ -205,6 +238,8 @@ pub fn build_template_with(
         prev_header_hash: state.header_hash,
         body,
         coinbase,
+        registrations,
+        miner: None,
         extension: Extension {
             nonce: 0,
             final_hash: [0u8; 32],
@@ -217,6 +252,14 @@ pub fn build_template_with(
     // Structural self-check (skip proofs: they were verified on admission and
     // the coinbase was just built here).
     validate_block_contents(&batch, height, true)?;
+    if let Some(bond) = bond {
+        let message = authorization_message(&state.mw_midstate, &batch);
+        batch.miner = Some(MinerAuth {
+            bond_id: bond.bond_id,
+            signature: bond.sign(&message),
+        });
+        check_miner_authorization(&next.bonds, &state.mw_midstate, &batch)?;
+    }
 
     let mut header = batch.header();
     header.height = height;
