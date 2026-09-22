@@ -42,6 +42,8 @@ pub fn router(node: NodeHandle) -> Router {
         .route("/state", get(state))
         .route("/blocks/{start}/{count}", get(blocks))
         .route("/bonds", get(bonds))
+        .route("/merge/job", post(merge_job))
+        .route("/merge/found", post(merge_found))
         .route("/miners/{start}/{count}", get(miners))
         .route("/headers/{start}/{count}", get(headers))
         .route("/utxo/{commitment}", get(utxo))
@@ -326,6 +328,90 @@ struct PayoutWeight {
     weight: u64,
 }
 
+/// Templates handed to a merged-mining pool, kept by mining hash until the
+/// pool asks for a fresh one. A pool refreshes its job whenever either chain's
+/// tip moves, so a handful is plenty (`docs/POOL_MERGED_MINING.md`).
+static MERGE_JOBS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<([u8; 32], crate::core::template::BlockTemplate)>>,
+> = std::sync::OnceLock::new();
+
+fn merge_jobs(
+) -> &'static std::sync::Mutex<std::collections::VecDeque<([u8; 32], crate::core::template::BlockTemplate)>>
+{
+    MERGE_JOBS.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+#[derive(Deserialize)]
+struct MergeFoundBody {
+    /// The mining hash `/merge/job` returned.
+    mining_hash: String,
+    /// The midstate batch template the pool mined on.
+    batch_template: Value,
+    /// Which coinbase output of that template carries the commitment.
+    commit_index: usize,
+    nonce: u64,
+    final_hash: String,
+}
+
+/// What a midstate pool must commit to in order to mine midwimble at the same
+/// time: the commitment to plant in a coinbase output's salt, and the target a
+/// share must beat to be a midwimble block.
+async fn merge_job(
+    AxState(node): AxState<NodeHandle>,
+    Json(body): Json<TemplateBody>,
+) -> ApiResult {
+    let (template, _) = build_mining_template(&node, body).await?;
+    let commitment = crate::core::auxpow::merge_commitment(&template.mining_hash);
+    let answer = json!({
+        "commitment": hex::encode(commitment),
+        "target": hex::encode(template.batch.target),
+        "mining_hash": hex::encode(template.mining_hash),
+        "height": template.height,
+    });
+    let mut jobs = merge_jobs().lock().map_err(|e| bad(e.to_string()))?;
+    jobs.push_back((template.mining_hash, template));
+    while jobs.len() > 16 {
+        jobs.pop_front();
+    }
+    Ok(Json(answer))
+}
+
+/// A pool's share cleared midwimble's target: rebuild the parent proof from
+/// the midstate template it mined, seal the block and apply it.
+async fn merge_found(
+    AxState(node): AxState<NodeHandle>,
+    Json(body): Json<MergeFoundBody>,
+) -> ApiResult {
+    let mining_hash = hex32_of(&body.mining_hash)?;
+    let final_hash = hex32_of(&body.final_hash)?;
+    let template = {
+        let jobs = merge_jobs().lock().map_err(|e| bad(e.to_string()))?;
+        jobs.iter()
+            .find(|(hash, _)| *hash == mining_hash)
+            .map(|(_, template)| template.clone())
+            .ok_or_else(|| bad("no merged-mining job with that mining hash; ask for a fresh one"))?
+    };
+    let parent = crate::core::auxpow::ParentTemplate::from_midstate_json(
+        &body.batch_template,
+        body.commit_index,
+    )
+    .map_err(bad)?;
+    let sealed = template.seal_aux(parent.proof(body.nonce, final_hash));
+    let merged = sealed.aux_pow.is_some();
+    let height = template.height;
+    node.submit_block(sealed).await.map_err(bad)?;
+    Ok(Json(
+        json!({ "accepted": true, "height": height, "merged_mined": merged }),
+    ))
+}
+
+fn hex32_of(s: &str) -> std::result::Result<[u8; 32], (StatusCode, Json<Value>)> {
+    hex::decode(s)
+        .map_err(bad)?
+        .try_into()
+        .map_err(|_| bad("expected 32 bytes of hex"))
+}
+
 #[derive(Deserialize)]
 struct TemplateBody {
     payouts: Vec<PayoutWeight>,
@@ -334,10 +420,18 @@ struct TemplateBody {
 }
 
 /// A block template for external miners (pools, merged miners, GPUs).
-async fn mining_template(
-    AxState(node): AxState<NodeHandle>,
-    Json(body): Json<TemplateBody>,
-) -> ApiResult {
+/// Builds a signed block template for an external miner: pools, merged
+/// miners and GPUs all come through here.
+async fn build_mining_template(
+    node: &NodeHandle,
+    body: TemplateBody,
+) -> std::result::Result<
+    (
+        crate::core::template::BlockTemplate,
+        Vec<(StealthAddress, crate::core::mw::PayoutReceipt)>,
+    ),
+    (StatusCode, Json<Value>),
+> {
     let payouts: Vec<(StealthAddress, u64)> = body
         .payouts
         .iter()
@@ -386,6 +480,14 @@ async fn mining_template(
     .await
     .map_err(bad)?
     .map_err(bad)?;
+    Ok((template, receipts))
+}
+
+async fn mining_template(
+    AxState(node): AxState<NodeHandle>,
+    Json(body): Json<TemplateBody>,
+) -> ApiResult {
+    let (template, receipts) = build_mining_template(&node, body).await?;
     let receipts: Vec<Value> = receipts
         .iter()
         .map(|(a, r)| {
