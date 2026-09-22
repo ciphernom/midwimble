@@ -47,6 +47,10 @@ enum Cmd {
         /// Mine, paying rewards to this address.
         #[arg(long)]
         mine_to: Option<String>,
+        /// Bond file to sign blocks with (see `midwimble bond`). Mining requires
+        /// one from block 1.
+        #[arg(long)]
+        mining_bond: Option<PathBuf>,
         /// Mining threads (0 = all cores).
         #[arg(long, default_value_t = 0)]
         threads: usize,
@@ -146,6 +150,12 @@ enum Cmd {
     },
     /// List GPUs and run the miner's shader self-test.
     GpuInfo,
+    /// Mining bonds: make a mining key, find the midstate address to lock MDS
+    /// at, then register the bond once a day of work is buried above it.
+    Bond {
+        #[command(subcommand)]
+        cmd: BondCmd,
+    },
     /// Print this build's launch and consensus parameters, including the
     /// genesis block id to compare against the launch announcement.
     Params,
@@ -321,6 +331,179 @@ fn ctrlc_like(f: impl FnOnce() + Send + 'static) {
     });
 }
 
+#[derive(Subcommand)]
+enum BondCmd {
+    /// Create a bond file holding a new mining key, and print the key.
+    New {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Print the midstate script and address that lock a bond to this key.
+    Address {
+        #[arg(long)]
+        file: PathBuf,
+        /// Your midstate public key (hex): the only key that can spend the bond.
+        #[arg(long)]
+        owner_pk: String,
+        /// Midstate height the bond stays locked until.
+        #[arg(long)]
+        until: u64,
+    },
+    /// Register a funded bond. The first run takes a proof against midstate's
+    /// tip; run it again once a day of midstate work is buried above it.
+    Register {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        owner_pk: String,
+        #[arg(long)]
+        until: u64,
+        /// The bond coin's value, in midstate base units.
+        #[arg(long)]
+        value: u64,
+        /// The bond coin's salt (hex), as your midstate wallet created it.
+        #[arg(long)]
+        salt: String,
+        /// Your midstate node's RPC address, e.g. 127.0.0.1:8545.
+        #[arg(long)]
+        midstate_rpc: String,
+        /// A midwimble node's RPC address, for its current target. Before
+        /// launch, the genesis target is used.
+        #[arg(long)]
+        midwimble_rpc: Option<String>,
+    },
+}
+
+fn bond_command(cmd: BondCmd) -> Result<()> {
+    use midwimble::core::auxpow::bytes32;
+    use midwimble::core::bond::*;
+    use midwimble::core::state::calculate_work;
+    use midwimble::core::types::GENESIS_TARGET;
+    let read = |p: &PathBuf| -> Result<BondFile> { Ok(serde_json::from_slice(&std::fs::read(p)?)?) };
+    let write = |p: &PathBuf, f: &BondFile| -> Result<()> {
+        std::fs::write(p, serde_json::to_vec_pretty(f)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    };
+    let key32 = |s: &str, what: &str| -> Result<[u8; 32]> {
+        hex::decode(s)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("{what} must be 32 bytes of hex"))
+    };
+    match cmd {
+        BondCmd::New { file } => {
+            if file.exists() {
+                anyhow::bail!("{} already exists", file.display());
+            }
+            let f = BondFile::generate();
+            write(&file, &f)?;
+            out!("mining key   {}", hex::encode(f.mining_key()?));
+            out!("Keep {} safe: it can mine as the bond. Next: `midwimble bond address`.", file.display());
+        }
+        BondCmd::Address { file, owner_pk, until } => {
+            let f = read(&file)?;
+            let script = BondScript {
+                mining_key: f.mining_key()?,
+                bonded_until: until,
+                owner_pk: key32(&owner_pk, "--owner-pk")?,
+            };
+            out!("script       {}", hex::encode(script.to_bytecode()));
+            out!("address      {}", hex::encode(script.address()));
+            out!(
+                "Lock one coin of at least {} gMDS there on midstate. It can mine while more than 30 days of the lock remain.",
+                MIN_MINING_BOND >> 30
+            );
+        }
+        BondCmd::Register { file, owner_pk, until, value, salt, midstate_rpc, midwimble_rpc } => {
+            let mut f = read(&file)?;
+            let coin = BondCoin {
+                script: BondScript {
+                    mining_key: f.mining_key()?,
+                    bonded_until: until,
+                    owner_pk: key32(&owner_pk, "--owner-pk")?,
+                },
+                value,
+                salt: key32(&salt, "--salt")?,
+            };
+            out!("bond coin    {}", hex::encode(coin.coin_id()));
+            let midstate = RpcClient::new(midstate_rpc);
+
+            // 1. The proof, taken once, against midstate's tip.
+            let proof = match &f.proof {
+                Some(p) if p.coin == coin => {
+                    out!("✓ proof already taken at midstate height {}", p.midstate_height);
+                    p.clone()
+                }
+                _ => {
+                    let v = midstate.get(&format!("/utxo_proof/{}", hex::encode(coin.coin_id())))?;
+                    let p = bond_proof_from_json(coin, &v)?;
+                    let bond = p.verify(&bytes32(&v["state_root"])?)?;
+                    out!("✓ four roots rebuild midstate's state root at height {}", p.midstate_height);
+                    out!("✓ SMT proof: the bond coin is unspent there ({} units, locked until {})", bond.value, bond.bonded_until);
+                    f.coin = Some(coin);
+                    f.proof = Some(p.clone());
+                    f.registration = None;
+                    write(&file, &f)?;
+                    p
+                }
+            };
+
+            // 2. A day of midwimble-equivalent work buried above it, plus a margin.
+            let target = match midwimble_rpc {
+                Some(addr) => bytes32(&RpcClient::new(addr).get("/state")?["target"])?,
+                None => GENESIS_TARGET,
+            };
+            let required = registration_work(&target);
+            let goal = required + required / 4;
+            let cap = (required / REGISTRATION_MIN_HEADERS).max(1);
+            let (mut links, mut first_prev, mut next) = (Vec::new(), None, proof.midstate_height);
+            let (mut credited, mut enough) = (0u128, false);
+            'fetch: loop {
+                let v = midstate.get(&format!("/headers/{next}/2000"))?;
+                let headers = v["headers"].as_array().cloned().unwrap_or_default();
+                for h in &headers {
+                    let (link, prev) = header_link_from_json(h)?;
+                    if first_prev.is_none() {
+                        first_prev = Some(prev);
+                    } else {
+                        credited = credited.saturating_add(calculate_work(&link.target).min(cap));
+                    }
+                    links.push(link);
+                    if credited >= goal {
+                        enough = true;
+                        break 'fetch;
+                    }
+                }
+                if headers.len() < 2000 || links.len() >= REGISTRATION_MAX_HEADERS {
+                    break;
+                }
+                next += headers.len() as u64;
+            }
+            out!("midstate work above the proof: {}% of what registration needs (with a 25% margin)", credited * 100 / goal.max(1));
+            if !enough {
+                out!("Not buried deep enough yet: run this again later, at most a day from the proof.");
+                return Ok(());
+            }
+            let registration = BondRegistration {
+                proof,
+                prev_header_hash: first_prev.expect("headers were fetched"),
+                headers: links,
+            };
+            let bond = registration.verify(&target)?;
+            out!("✓ {} midstate headers link up and every proof of work checks", registration.headers.len());
+            out!("✓ registration valid at midwimble's current target: bond {}", hex::encode(bond.id));
+            f.registration = Some(registration);
+            write(&file, &f)?;
+            out!("Ready: midwimble node --mining-bond {} --mine-to <address>", file.display());
+        }
+    }
+    Ok(())
+}
+
 /// `YYYY-MM-DD HH:MM UTC` for a Unix timestamp (Hinnant's civil-from-days,
 /// to avoid a date crate for one command).
 fn utc(ts: u64) -> String {
@@ -440,7 +623,7 @@ fn run(cli: Cli) -> Result<()> {
             listen,
             peers,
             rpc,
-            mine_to,
+            mine_to, mining_bond,
             threads,
             amino,
             public_address,
@@ -469,6 +652,16 @@ fn run(cli: Cli) -> Result<()> {
             let mut config = NodeConfig::new(data_dir, listen.parse()?);
             config.bootstrap = peers.iter().map(|p| p.parse()).collect::<Result<_, _>>()?;
             config.mine_to = mine_to.as_deref().map(StealthAddress::decode).transpose()?;
+            if let Some(path) = &mining_bond {
+                let file: midwimble::core::bond::BondFile = serde_json::from_slice(&std::fs::read(path)?)?;
+                let bond = file.miner_bond()?;
+                tracing::info!("Mining as bond {}", hex::encode(bond.bond_id));
+                config.mining_bond = Some(bond);
+            } else if config.mine_to.is_some()
+                && midwimble::core::bond::BONDED_MINING_FROM != u64::MAX
+            {
+                anyhow::bail!("mining requires a registered bond: pass --mining-bond (see `midwimble bond`)");
+            }
             config.mining_threads = threads;
             config.amino = amino;
             config.public_address = public_address.map(|a| a.parse()).transpose()?;
@@ -630,6 +823,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::GpuInfo => gpu_info(),
+        Cmd::Bond { cmd } => bond_command(cmd),
         Cmd::Params => {
             print_params();
             Ok(())

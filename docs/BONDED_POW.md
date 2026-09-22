@@ -227,22 +227,41 @@ midstate chain the launch was made against. Only MDS holders can mine at first,
 so the 30-day slow start doubles as the window to acquire MDS and register, and
 the launch script's default `--merge-share` is 0.25.
 
+## Running a bonded producer
+
+```sh
+midwimble bond new --file bond.json
+#   prints the mining key; the file holds its secret (mode 600)
+
+midwimble bond address --file bond.json --owner-pk <your midstate key> --until <midstate height>
+#   prints the bond script and the midstate address to lock the coin at
+
+#   ...lock one coin of at least 16 gMDS at that address with your midstate
+#   wallet, noting its value and salt...
+
+midwimble bond register --file bond.json --owner-pk <key> --until <height> \
+    --value <units> --salt <hex> --midstate-rpc 127.0.0.1:8545 [--midwimble-rpc <node>]
+#   first run: takes the proof against midstate's tip and checks it
+#   (four roots rebuild the header's state root; the SMT proof verifies)
+#   later run: once a day of work is buried above it (plus a 25% margin),
+#   fetches the headers, verifies every link and proof of work, and writes
+#   the finished registration into bond.json
+
+midwimble node --mining-bond bond.json --mine-to <payout address>
+```
+
+The node signs every template it builds, including those served by
+`/mining/template`. The pool and the merge miner take their templates from
+the node, so they need nothing extra: run them against a node started with
+`--mining-bond`. Until the bond is on chain, the node reserves room in its
+blocks for the registration and carries it in the first block it mines.
+
 ## Still to build
 
-Node plumbing:
-
-- a mining-bond setting for the node, which then signs every template it
-  builds (`template::build_template_bonded`). The pool and merge miner take
-  their templates from the node, so they need no signing code of their own.
-- switching test builds from "authorisation optional" to required once the
-  integration tests can mine bonded blocks.
-
-Tooling:
-
-- a wallet command that fetches `/utxo_proof` and `/headers` from a midstate
-  node and builds the registration.
-
-Tests:
-
-- full-chain tests, including a merged-mined block from a bonded miner;
-- a block from a bond that expired one second earlier, which must be rejected.
+- **Midstate wallet support.** A command that locks a single coin at a bond
+  address with a known salt, and one that spends it after the lock ends. Both
+  are wallet features, not consensus changes.
+- **Mandatory authorisation in test builds.** The chain, storage and
+  integration test harnesses still mine unsigned blocks. Once they mine bonded
+  blocks, `BONDED_MINING_FROM` becomes 1 in test builds too, and the "optional
+  but verified" mode goes away.

@@ -300,19 +300,27 @@ async fn mining_template(
         .load_timestamps(state.height, crate::core::types::DIFFICULTY_LOOKBACK)
         .map_err(bad)?;
     let pool = node.mempool().await.map_err(bad)?;
+    let bond = node.mining_bond();
     let (template, receipts) = tokio::task::spawn_blocking(move || {
         use crate::core::types::{KERNEL_WEIGHT, MAX_BLOCK_WEIGHT, OUTPUT_WEIGHT};
-        let budget = MAX_BLOCK_WEIGHT - (payouts.len() as u64) * OUTPUT_WEIGHT - KERNEL_WEIGHT;
+        let registration_weight = bond
+            .as_ref()
+            .filter(|b| !state.bonds.contains_key(&b.bond_id))
+            .and_then(|b| b.registration.as_ref())
+            .map_or(0, |r| r.weight());
+        let budget = (MAX_BLOCK_WEIGHT - (payouts.len() as u64) * OUTPUT_WEIGHT - KERNEL_WEIGHT)
+            .saturating_sub(registration_weight);
         let txs = crate::core::template::select_transactions(&pool, state.height, budget);
-        crate::core::template::build_template_with(&state, &timestamps, &txs, &payouts, extra, None)
+        crate::core::template::build_template_bonded(&state, &timestamps, &txs, &payouts, extra, None, bond.as_ref())
             .or_else(|_| {
-                crate::core::template::build_template_with(
+                crate::core::template::build_template_bonded(
                     &state,
                     &timestamps,
                     &[],
                     &payouts,
                     extra,
                     None,
+                    bond.as_ref(),
                 )
             })
             .map(|(t, r)| (t, r))
