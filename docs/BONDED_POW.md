@@ -233,11 +233,17 @@ the launch script's default `--merge-share` is 0.25.
 midwimble bond new --file bond.json
 #   prints the mining key; the file holds its secret (mode 600)
 
-midwimble bond address --file bond.json --owner-pk <your midstate key> --until <midstate height>
+midstate wallet generate-mss
+#   the owner key: prints the MSS key's address *and its public key*. The bond
+#   needs the public key. A bond locked to an address can never be spent, so
+#   midwimble refuses anything in midstate's 72-character address format.
+
+midwimble bond address --file bond.json --owner-pk <public key> --until <midstate height>
 #   prints the bond script and the midstate address to lock the coin at
 
-#   ...lock one coin of at least 16 gMDS at that address with your midstate
-#   wallet, noting its value and salt...
+midstate wallet send --to <bond address>:<value>
+#   value: one power of two, at least 2^34 units (16 gMDS). The wallet prints
+#   every output paid to others:  -> <address>:<value>  salt <hex>  coin <hex>
 
 midwimble bond register --file bond.json --owner-pk <key> --until <height> \
     --value <units> --salt <hex> --midstate-rpc 127.0.0.1:8545 [--midwimble-rpc <node>]
@@ -248,7 +254,17 @@ midwimble bond register --file bond.json --owner-pk <key> --until <height> \
 #   the finished registration into bond.json
 
 midwimble node --mining-bond bond.json --mine-to <payout address>
+
+# Once midstate reaches the lock height, spend the bond back to yourself:
+midstate wallet spend-script --coin <bond coin id> --bytecode <script from `bond address`> \
+    --inputs AUTO:<public key> --to <your address>:<value>
 ```
+
+**Before locking a real bond, rehearse the exit.** Lock a small coin to a bond
+script with the same owner key and a lock height a few blocks away, and spend
+it back with `spend-script` once it unlocks. It costs almost nothing, and it
+proves that key and wallet can open the lock you are about to put real money
+behind.
 
 The node signs every template it builds, including those served by
 `/mining/template`. The pool and the merge miner take their templates from
@@ -258,9 +274,9 @@ blocks for the registration and carries it in the first block it mines.
 
 ## Still to build
 
-- **Midstate wallet support.** A command that locks a single coin at a bond
-  address with a known salt, and one that spends it after the lock ends. Both
-  are wallet features, not consensus changes.
+- **One-step unbonding in the midstate wallet.** Spending a bond already
+  works through `spend-script`, but a dedicated command could fill in the
+  script and witness itself.
 - **Mandatory authorisation in test builds.** The chain, storage and
   integration test harnesses still mine unsigned blocks. Once they mine bonded
   blocks, `BONDED_MINING_FROM` becomes 1 in test builds too, and the "optional

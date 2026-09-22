@@ -389,10 +389,21 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
         }
         Ok(())
     };
+    // Exactly 32 bytes of hex. Midstate's wallet prints *addresses* in a
+    // 72-character checksummed form; refusing it stops the one mistake that
+    // cannot be undone: a bond whose owner slot holds an address instead of a
+    // public key can never be spent by anyone.
     let key32 = |s: &str, what: &str| -> Result<[u8; 32]> {
-        hex::decode(s)?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("{what} must be 32 bytes of hex"))
+        let bytes = hex::decode(s.trim())?;
+        match bytes.len() {
+            32 => Ok(bytes.try_into().expect("32 bytes")),
+            36 => anyhow::bail!(
+                "{what} looks like a midstate address (72 hex characters with a checksum). \
+                 A bond needs the owner's public key, not an address: a bond locked to an \
+                 address can never be spent"
+            ),
+            _ => anyhow::bail!("{what} must be 32 bytes of hex"),
+        }
     };
     match cmd {
         BondCmd::New { file } => {
