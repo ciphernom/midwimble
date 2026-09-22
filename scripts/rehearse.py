@@ -331,6 +331,7 @@ class Rehearsal:
         env = dict(os.environ, MIDWIMBLE_PASSWORD="rehearsal")
         wallet = self.dir / "payout.mww"
         if not wallet.exists():
+            print("  Creating a payout wallet: its post-quantum recovery key takes a minute or two.")
             run([self.bin, "wallet", "--wallet", wallet, "create"], env=env)
         found = re.findall(r"\bmw1[0-9a-z]{20,}", run([self.bin, "wallet", "--wallet", wallet, "address"], env=env))
         if not found:
@@ -366,8 +367,10 @@ class Rehearsal:
         print("  Once midstate passes it, spend it back exactly as in the exit drill:\n")
         print(f"    midstate wallet spend-script --coin {b['coin']} --bytecode {b['script']} \\")
         print(f"        --inputs AUTO:{self.owner_key()} --to <your address>:{MIN_MINING_BOND // 2}\n")
-        print(f"  The same bond can also mine on the real network after launch: re-register it")
-        print(f"  there with `midwimble bond register`, using {self.dir / 'bond.json'}'s secret.")
+        print("  This bond has the minimum term, so it could mine only for about a day after it")
+        print("  was locked; after that it simply waits out its lock. For the real launch, lock a")
+        print("  new bond shortly before launch day, with a term covering as long as you mean to")
+        print("  mine: a bond is eligible while more than 30 days of its lock remain.")
 
     def close(self) -> None:
         if self.procs and not self.a.keep_running:
