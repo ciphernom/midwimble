@@ -73,13 +73,14 @@ enum Cmd {
         #[arg(long)]
         prune: bool,
         /// Midstate blocks an anchor needs before it counts.
-        #[arg(long, default_value_t = 6)]
+        #[arg(long, default_value_t = 1_000)]
         anchor_depth: usize,
         /// Midwimble blocks after a checkpoint before it is finalized.
         #[arg(long, default_value_t = 100)]
         finality_depth: u64,
-        /// Minimum work per Midstate header in anchor evidence, as leading zero bits.
-        #[arg(long, default_value_t = 0)]
+        /// Minimum work per Midstate header in anchor evidence, as leading
+        /// zero bits. Zero accepts evidence built from trivial headers.
+        #[arg(long, default_value_t = 19)]
         anchor_min_work_bits: u32,
         /// Anchor records to follow (default: <data-dir>/anchors.jsonl).
         #[arg(long)]
@@ -109,7 +110,7 @@ enum Cmd {
         /// Record blocks anchored by merged mining here (same format as `anchor`).
         #[arg(long)]
         anchor_store: Option<PathBuf>,
-        #[arg(long, default_value_t = 6)]
+        #[arg(long, default_value_t = 1_000)]
         anchor_depth: usize,
     },
     /// Run a provably fair Stratum pool on top of a local node.
