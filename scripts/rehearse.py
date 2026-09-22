@@ -13,6 +13,8 @@ block producer does on launch day, checking every step:
                  work at the rehearsal difficulty (about 75 midstate blocks)
   6. Mine        a producer and a peer: block 1 registers the bond, every block
                  is signed, and the peer validates all of it
+  7. Merge-mine  the same bond, now earning its blocks from work done on
+                 midstate: one search mines both chains
 
 Steps that use your midstate wallet are printed for you to run. Progress is
 saved in the work directory, so stop and rerun at will: it resumes.
@@ -317,6 +319,13 @@ class Rehearsal:
         self.save()
 
     # ── 6. Bonded mining ────────────────────────────────────────────────────
+    def stop_node(self, name: str) -> None:
+        for proc in self.procs:
+            if proc.args[3].endswith(f"node-{name}"):
+                proc.terminate()
+                proc.wait(timeout=30)
+        self.procs = [p for p in self.procs if p.poll() is None]
+
     def start_node(self, name: str, extra: list) -> str:
         p2p, rpc = PORTS[name]
         log = open(self.dir / f"node-{name}.log", "a")
@@ -328,6 +337,9 @@ class Rehearsal:
 
     def mine(self) -> None:
         section("6. Bonded mining on the rehearsal network")
+        if self.s.get("mined"):
+            ok("bonded mining already shown; going straight to merged mining")
+            return
         env = dict(os.environ, MIDWIMBLE_PASSWORD="rehearsal")
         wallet = self.dir / "payout.mww"
         if not wallet.exists():
@@ -336,6 +348,8 @@ class Rehearsal:
         found = re.findall(r"\bmw1[0-9a-z]{20,}", run([self.bin, "wallet", "--wallet", wallet, "address"], env=env))
         if not found:
             die("could not read the payout address")
+        self.s["payout"] = found[-1]
+        self.save()
         producer = self.start_node("a", ["--mine-to", found[-1], "--mining-bond", self.dir / "bond.json",
                                          "--threads", self.a.threads])
         st = wait_until("the producer's RPC", lambda: try_get(producer, "/state"), 2, 120)
@@ -349,6 +363,8 @@ class Rehearsal:
         if len(registered) != 1:
             die(f"block 1 should register exactly one bond: {blocks[0]}")
         bond_id = registered[0]
+        self.s["bond_id"] = bond_id
+        self.save()
         ok(f"block 1 registers bond {bond_id[:16]}…, proven from real midstate data")
         if not all(b["bond_id"] == bond_id for b in blocks):
             die(f"not every block is signed by the bond: {blocks}")
@@ -360,6 +376,62 @@ class Rehearsal:
         if not any(x["bond_id"] == bond_id and x["eligible_now"] for x in bonds):
             die(f"the peer does not see the bond as eligible: {bonds}")
         ok("the peer, which mined nothing, validated all of it and holds the same bond set")
+
+        self.s["mined"] = True
+        self.save()
+
+    # ── 7. Merged mining ────────────────────────────────────────────────────
+    def merge_mine(self) -> None:
+        section("7. Merged mining: one search, both chains")
+        midstate_address = self.s.get("midstate_address")
+        if not midstate_address:
+            print("  Merged mining finds real midstate blocks, so midstate rewards need an")
+            print("  address of yours (`midstate wallet receive`).")
+            while True:
+                midstate_address = ask("  midstate address: ").strip().lower()
+                if re.fullmatch(r"[0-9a-f]{64}|[0-9a-f]{72}", midstate_address):
+                    break
+                print("  Expected 64 hex characters, or 72 with midstate's checksum.")
+            self.s["midstate_address"] = midstate_address
+            self.save()
+
+        # Take native mining away from the producer, so any block that appears
+        # now can only have come from work done on midstate.
+        self.stop_node("a")
+        producer = self.start_node("a", ["--mining-bond", self.dir / "bond.json"])
+        wait_until("the producer to restart without mining", lambda: try_get(producer, "/state"), 2, 120)
+        before = (try_get(producer, "/state") or {}).get("height", 0)
+        ok(f"producer restarted at height {before}, native mining off")
+
+        log = open(self.dir / "merge-mine.log", "a")
+        cmd = [str(self.bin), "merge-mine", "--midstate-rpc", self.ms, "--rpc", producer,
+               "--midstate-address", midstate_address, "--midwimble-address", self.s["payout"],
+               "--threads", str(self.a.threads),
+               "--coinbase-log", str(self.dir / "midstate_coinbase.jsonl")]
+        print(f"  $ {' '.join(cmd)}   (log: {log.name})")
+        self.procs.append(subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT))
+        print("  Any midstate block this finds is a real one, paid to that address. Its")
+        print(f"  coinbase salts go in {self.dir / 'midstate_coinbase.jsonl'}: keep that file.")
+
+        def merge_mined():
+            height = (try_get(producer, "/state") or {}).get("height", 0)
+            if height <= before:
+                return None
+            blocks = get_json(producer, f"/miners/{before}/{min(height - before, 64)}")["blocks"]
+            return next((b for b in blocks if b["merged"]), None)
+
+        found = wait_until("a block mined by work done on midstate", merge_mined, 10, 3600)
+        if found["bond_id"] != self.s["bond_id"]:
+            die(f"that block is signed by another bond: {found}")
+        ok(f"block {found['height']} came from a midstate search, signed by the bond")
+        peer = f"127.0.0.1:{PORTS['b'][1]}"
+        wait_until(
+            "the peer to accept it",
+            lambda: (try_get(peer, "/state") or {}).get("height", 0) > found["height"],
+            10,
+            900,
+        )
+        ok("the peer validated the merged proof of work too")
 
         b = self.s["bond"]
         section("Rehearsal complete")
@@ -405,6 +477,7 @@ def main() -> None:
         r.bond()
         r.register()
         r.mine()
+        r.merge_mine()
     finally:
         r.close()
 
