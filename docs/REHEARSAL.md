@@ -59,9 +59,13 @@ It needs:
    midwimble's blocks are paid for by midstate's hashrate.
 
    Midstate blocks found along the way are real ones, paid to the midstate
-   address you give. Their coinbase salts are written to
-   `midstate_coinbase.jsonl` in the work directory: keep that file, because
-   without it those coins cannot be spent.
+   address you give. Midstate outputs carry their salts on chain, so
+   `midstate wallet scan` imports them afterwards; `midstate_coinbase.jsonl`
+   in the work directory is a backup copy of those salts.
+
+   Merged mining through a pool is a different matter: the commitment goes in
+   a coinbase output's salt, so whoever builds the coinbase has to place it.
+   That is pool-side work, and it is what most hashrate will need at launch.
 
 The steps that need your midstate wallet are printed for you to run: sending to
 an address, and `spend-script`. `wallet send` lists each output it pays to
