@@ -339,7 +339,7 @@ class Rehearsal:
         producer = self.start_node("a", ["--mine-to", found[-1], "--mining-bond", self.dir / "bond.json",
                                          "--threads", self.a.threads])
         st = wait_until("the producer's RPC", lambda: try_get(producer, "/state"), 2, 120)
-        peer = self.start_node("b", ["--peers", f"/ip4/127.0.0.1/tcp/{PORTS['a'][0]}/p2p/{st['peer_id']}"])
+        peer = self.start_node("b", ["--peer", f"/ip4/127.0.0.1/tcp/{PORTS['a'][0]}/p2p/{st['peer_id']}"])
         height = lambda rpc: (try_get(rpc, "/state") or {}).get("height", 0)  # noqa: E731
         wait_until("the producer to mine four blocks", lambda: height(producer) > 4, 10, 3600)
         wait_until("the peer to sync them", lambda: height(peer) > 4, 10, 900)
