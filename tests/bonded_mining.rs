@@ -85,4 +85,26 @@ async fn a_bonded_producer_mines_and_a_peer_validates_every_block() {
     for block in &blocks {
         assert_eq!(block.miner.as_ref().expect("signed").bond_id, bond.bond_id);
     }
+
+    // The operator's view over RPC agrees, and it is what the rehearsal
+    // script checks against a real network: /bonds lists the bond as
+    // eligible, /miners shows who signed and who registered each block.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(midwimble::rpc::serve_on(peer.handle.clone(), listener));
+    let id = hex::encode(bond.bond_id);
+    let (bonds, miners) = tokio::task::spawn_blocking(move || {
+        let client = midwimble::rpc::RpcClient::new(addr);
+        (client.get("/bonds").unwrap(), client.get("/miners/1/3").unwrap())
+    })
+    .await
+    .unwrap();
+    assert!(bonds["bonds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["bond_id"] == id.as_str() && b["eligible_now"] == true));
+    let listed = miners["blocks"].as_array().unwrap();
+    assert_eq!(listed[0]["registrations"][0], id.as_str());
+    assert!(listed.iter().all(|b| b["bond_id"] == id.as_str()));
 }

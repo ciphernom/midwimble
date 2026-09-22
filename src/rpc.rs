@@ -41,6 +41,8 @@ pub fn router(node: NodeHandle) -> Router {
     Router::new()
         .route("/state", get(state))
         .route("/blocks/{start}/{count}", get(blocks))
+        .route("/bonds", get(bonds))
+        .route("/miners/{start}/{count}", get(miners))
         .route("/headers/{start}/{count}", get(headers))
         .route("/utxo/{commitment}", get(utxo))
         .route("/utxos", get(unspent_outputs))
@@ -83,6 +85,60 @@ fn next_halving(height: u64) -> Option<u64> {
     let interval = crate::core::types::HALVING_INTERVAL;
     let next = (height / interval + 1) * interval;
     (crate::core::types::block_reward(next) > 0).then_some(next)
+}
+
+/// The registered mining bonds, and whether each could authorise a block now.
+async fn bonds(AxState(node): AxState<NodeHandle>) -> Json<Value> {
+    let state = node.state();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut list: Vec<Value> = state
+        .bonds
+        .iter()
+        .map(|(id, e)| {
+            json!({
+                "bond_id": hex::encode(id),
+                "mining_key": hex::encode(e.mining_key),
+                "value": e.value,
+                "bonded_until": e.bonded_until,
+                "eligible_now": e.eligible_at(now),
+            })
+        })
+        .collect();
+    list.sort_by(|a, b| a["bond_id"].as_str().cmp(&b["bond_id"].as_str()));
+    let from = crate::core::bond::BONDED_MINING_FROM;
+    Json(json!({
+        "bonds": list,
+        "bonded_mining_from": if from == u64::MAX { Value::Null } else { json!(from) },
+    }))
+}
+
+/// Which bond signed each block, and which bonds each block registered.
+async fn miners(
+    AxState(node): AxState<NodeHandle>,
+    Path((start, count)): Path<(u64, u64)>,
+) -> ApiResult {
+    let batches = node
+        .storage()
+        .load_batches(start, count.min(256), BATCH_RESPONSE_SOFT_LIMIT)
+        .map_err(bad)?;
+    let blocks: Vec<Value> = batches
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            json!({
+                "height": start + i as u64,
+                "bond_id": b.miner.as_ref().map(|m| hex::encode(m.bond_id)),
+                "registrations": b
+                    .registrations
+                    .iter()
+                    .map(|r| hex::encode(r.bond_id()))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "start": start, "blocks": blocks })))
 }
 
 async fn state(AxState(node): AxState<NodeHandle>) -> Json<Value> {

@@ -27,6 +27,19 @@ code with a different magic (`--magic MIDWIMBLE_TESTNET_V1`). Announce the
 launch date and the Bitcoin height *N* whose hash the genesis will commit to,
 chosen to arrive an hour or so before mining is meant to open.
 
+**The week before.** Rehearse bonded mining with real midstate
+(`scripts/rehearse.py`, see `docs/REHEARSAL.md`). This proves the full chain
+against production midwimble: locking a bond, registering it, mining, and a
+peer validating. Anyone who will mine block 1 should run it, since block 1's
+producer must already hold a registered bond.
+
+Block-1 producers should take their bond proof early. A registration needs a
+day of work above its proof, measured against the launch target, which is
+roughly 450 midstate blocks at a 0.25 share. A proof taken days before launch
+therefore registers instantly on the day. Run `midwimble bond register` with
+the launch build: it measures against that build's genesis target, and a
+registration assembled with a pre-launch build will be refused.
+
 **The day before.** Make sure midstate's pool can merge-mine. Getting every
 midstate miner earning midwimble from block 1 matters more for a fair start
 than anything else on this page, and the 30-day slow start exists partly to buy
