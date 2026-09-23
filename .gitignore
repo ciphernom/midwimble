@@ -1,32 +1,29 @@
-# Rust build output
-target/
 
-# Local scratch / logs
-output.txt
-*.log
-
-# Secrets / environment
-.env
-.env.*
 !.env.example
-
+# Editor / OS junk
+# Local scratch / logs
+# MSS generation / checkpoint state
+# Runtime databases / state
+# Rust build output
+# Secrets / environment
 # Wallet / key material
-*.mww
 *.key
 *.keys
+*.log
+*.mww
 *.pem
-
-# Runtime databases / state
+*.pyc
 *.redb
-anchors.jsonl
-node/
-pool/
-
-# MSS generation / checkpoint state
-mss_h*.checkpoint
-
-# Editor / OS junk
-.DS_Store
-*.swp
 *.swo
+*.swp
 *~
+.DS_Store
+.env
+.env.*
+__pycache__/
+anchors.jsonl
+mss_h*.checkpoint
+node/
+output.txt
+pool/
+target/
