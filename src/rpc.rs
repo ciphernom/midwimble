@@ -114,7 +114,8 @@ async fn bonds(AxState(node): AxState<NodeHandle>) -> Json<Value> {
     }))
 }
 
-/// Which bond signed each block, and which bonds each block registered.
+/// Which bond signed each block, which bonds it registered, and whether its
+/// proof of work came from a midstate block (merged mining).
 async fn miners(
     AxState(node): AxState<NodeHandle>,
     Path((start, count)): Path<(u64, u64)>,
@@ -130,6 +131,7 @@ async fn miners(
             json!({
                 "height": start + i as u64,
                 "bond_id": b.miner.as_ref().map(|m| hex::encode(m.bond_id)),
+                "merged": b.aux_pow.is_some(),
                 "registrations": b
                     .registrations
                     .iter()

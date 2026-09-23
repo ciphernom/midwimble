@@ -44,13 +44,24 @@ It needs:
    then re-runs every five minutes until a day of work at the rehearsal
    difficulty is buried above it. The cap of 1/60 per header sets the
    requirement at about 75 midstate blocks.
-6. **Mining.** A producer and a peer start on the rehearsal network. The
-   script checks, through the peer's RPC:
+6. **Bonded mining.** A producer and a peer start on the rehearsal network.
+   The script checks, through the peer's RPC:
    - block 1 registers the bond;
    - every block is signed by it;
    - later blocks carry no registration;
    - the peer, which mined nothing, holds the same bond set, with the bond
      eligible.
+7. **Merged mining.** The producer restarts with native mining off, so any
+   block that appears afterwards can only have come from work done on
+   midstate. The script then runs `midwimble merge-mine` against both nodes
+   and waits for a block that `/miners` reports as merged, signed by the same
+   bond, and accepted by the peer. This is the security argument in practice:
+   midwimble's blocks are paid for by midstate's hashrate.
+
+   Midstate blocks found along the way are real ones, paid to the midstate
+   address you give. Their coinbase salts are written to
+   `midstate_coinbase.jsonl` in the work directory: keep that file, because
+   without it those coins cannot be spent.
 
 The steps that need your midstate wallet are printed for you to run: sending to
 an address, and `spend-script`. `wallet send` lists each output it pays to

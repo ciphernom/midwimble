@@ -281,8 +281,8 @@ verify. The vendored copy keys the file by a seed fingerprint.
   assumed; pruning stays off (`docs/ANCHORING.md`).
 - [x] `EXTENSION_ITERATIONS` stays 1,000,000: midstate compatibility, and so
   merged mining.
-- [ ] Rehearse merged mining against a real midstate node. The rehearsal
-  covers bonded mining only (`docs/REHEARSAL.md`).
+- [ ] Rehearse against a real midstate node: bonded mining and merged mining
+  (`scripts/rehearse.py`, `docs/REHEARSAL.md`).
 
 ## Known limitations
 
