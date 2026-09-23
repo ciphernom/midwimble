@@ -18,6 +18,8 @@ obviously broken or unfair launch.
 | `MIDSTATE_BLOCK_*` | Midstate's tip at release | The same proof on midstate's one-minute clock, and it pins the midstate chain bonded mining is judged against. |
 | `LAUNCH_GENESIS_TIMESTAMP` | When mining opens, shortly after that block | ASERT measures the whole schedule from this instant. |
 | `LAUNCH_GENESIS_TARGET` | Midstate's live target ÷ expected merged-mining share | The reference hashrate ASERT adjusts around. |
+| `LAUNCH_MIN_MINING_BOND` | 2^34 units (16 gMDS) | What a miner must lock on midstate. A testnet sets it to 2^24 (`--testnet`). |
+| `LAUNCH_MIN_REMAINING_BOND_LOCK` | 43,200 blocks (30 days) | The unbonding delay; two days on a testnet. |
 | `LAUNCH_PARAMETERS_SET` | `true` | Until it is, the node warns that it is a devnet build. |
 
 ## The sequence
@@ -142,7 +144,7 @@ start from, so the cap does not depend on trusting whoever served it.
 | Supply | 1,000,000.00000000, 8 decimals | reached exactly |
 | Slow start | 43,200 blocks (30 days) | linear ramp |
 | Halving | every 2,100,000 blocks | Bitcoin's era length |
-| Bonded mining | from block 1 | minimum bond 16 gMDS (2^34 units) |
+| Bonded mining | from block 1 | minimum bond 16 gMDS (2^34 units), a launch parameter |
 | Bond eligibility | more than 30 days of lock left | judged on midwimble's clock, 7-day margin |
 | Registration | a day of work above the proof | no header counts for more than 1/60 |
 | Anchor evidence | 1,000 midstate confirmations, 2^19 a header | about an hour of midstate's network to forge |

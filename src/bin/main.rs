@@ -546,7 +546,7 @@ fn print_params() {
         MAX_SUPPLY, MIDSTATE_BLOCK_HASH, MIDSTATE_BLOCK_HEIGHT, MIN_FEE_PER_WEIGHT, NETWORK_MAGIC,
         TARGET_BLOCK_TIME,
     };
-    use midwimble::core::bond::{BONDED_MINING_FROM, MIN_MINING_BOND};
+    use midwimble::core::bond::{BONDED_MINING_FROM, MIN_MINING_BOND, MIN_REMAINING_BOND_LOCK};
     let at = |height: u64| utc(GENESIS_TIMESTAMP + height * TARGET_BLOCK_TIME);
     let kind = match (LAUNCH_PARAMETERS_SET, cfg!(feature = "fast-mining")) {
         (_, true) => "FAST-MINING TEST BUILD (never run this on a real network)",
@@ -584,9 +584,15 @@ fn print_params() {
     if BONDED_MINING_FROM == u64::MAX {
         out!("bonded mining        optional in this test build (verified when present)");
     } else {
+        let bond = if MIN_MINING_BOND >= 1 << 30 {
+            format!("{} gMDS", MIN_MINING_BOND >> 30)
+        } else {
+            format!("2^{} units", MIN_MINING_BOND.trailing_zeros())
+        };
         out!(
-            "bonded mining        every block from height {BONDED_MINING_FROM}; bonds of at least {} gMDS",
-            MIN_MINING_BOND >> 30
+            "bonded mining        every block from height {BONDED_MINING_FROM}; bonds of at least \
+             {bond}, locked {} more days to mine",
+            MIN_REMAINING_BOND_LOCK / 1440
         );
     }
     out!("");

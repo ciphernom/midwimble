@@ -161,8 +161,8 @@ deterministic from midwimble's chain alone.
 
 | Constant | Value | Reason |
 |---|---|---|
-| `MIN_MINING_BOND` | 2^34 units (16 gMDS) | About 11 days of revenue for a miner with 0.1% of midstate's hashrate: real capital, within an enthusiast's reach. Must be a power of two. |
-| `MIN_REMAINING_BOND_LOCK` | 43,200 blocks (30 days) | The effective unbonding delay. |
+| `MIN_MINING_BOND` | 2^34 units (16 gMDS) | About 11 days of revenue for a miner with 0.1% of midstate's hashrate: real capital, within an enthusiast's reach. Must be a power of two. A launch parameter (`--min-bond`): a testnet uses 2^24, since nobody will lock real money to test someone else's chain, and the bonded path is exercised just as well by a trivial coin. |
+| `MIN_REMAINING_BOND_LOCK` | 43,200 blocks (30 days) | The effective unbonding delay. Also a launch parameter (`--bond-lock-days`); a testnet uses two days so testers' coins come back quickly. |
 | `CLOCK_MARGIN` | 10,080 blocks (7 days) | Covers midstate running ahead of its schedule. |
 | `REGISTRATION_WORK_BLOCKS` | 1,440 | A day, in blocks of the registering block's target. |
 | `REGISTRATION_MIN_HEADERS` | 60 | Caps any one header at 1/60 of the requirement. |

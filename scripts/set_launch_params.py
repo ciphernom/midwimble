@@ -136,6 +136,14 @@ const LAUNCH_GENESIS_TIMESTAMP: u64 = {p['genesis_time']:_}; // {utc(p['genesis_
 const LAUNCH_GENESIS_TARGET: [u8; 32] =
     hex32("{p['target']:064x}");
 
+/// Smallest bond that grants mining eligibility, in midstate base units.
+/// {p['bond_note']}
+pub const LAUNCH_MIN_MINING_BOND: u64 = {p['min_bond']:_};
+
+/// Midstate blocks a bond must still be locked for to be eligible: the
+/// unbonding delay, {p['lock_days']} day(s).
+pub const LAUNCH_MIN_REMAINING_BOND_LOCK: u64 = {p['lock_blocks']:_};
+
 /// Set by `scripts/set_launch_params.py`: these are real launch parameters.
 pub const LAUNCH_PARAMETERS_SET: bool = true;
 
@@ -162,9 +170,34 @@ def main() -> None:
                     help="share of midstate's hashrate expected to mine midwimble at launch "
                          "(default 0.25: bonded mining from block 1 means only MDS holders mine "
                          "at first)")
+    ap.add_argument("--min-bond", type=int, default=1 << 34,
+                    help="smallest mining bond, in midstate base units; a power of two "
+                         "(default 2^34 = 16 gMDS)")
+    ap.add_argument("--bond-lock-days", type=int, default=30,
+                    help="how long a bond must still be locked to mine (default 30)")
+    ap.add_argument("--testnet", action="store_true",
+                    help="testnet defaults: MIDWIMBLE_TESTNET_V1, a 2^24-unit bond and a "
+                         "two-day lock, so testers risk nothing")
     ap.add_argument("--types-rs", type=pathlib.Path, default=REPO / "src/core/types.rs")
     ap.add_argument("--dry-run", action="store_true", help="print the block instead of writing it")
     a = ap.parse_args()
+
+    # Testnet presets, applied only where the caller left the default.
+    if a.testnet:
+        if a.magic == "MIDWIMBLE_MAINNET_V1":
+            a.magic = "MIDWIMBLE_TESTNET_V1"
+        if a.min_bond == 1 << 34:
+            a.min_bond = 1 << 24
+        if a.bond_lock_days == 30:
+            a.bond_lock_days = 2
+    if a.min_bond & (a.min_bond - 1) or a.min_bond < (1 << 20):
+        die("--min-bond must be a power of two and at least 2^20 units: a bond is one "
+            "midstate coin, and coin values are powers of two")
+    if a.bond_lock_days < 1:
+        die("--bond-lock-days must be at least 1")
+    if not a.testnet and (a.min_bond < (1 << 30) or a.bond_lock_days < 7):
+        warn(f"a {a.min_bond} unit bond locked for {a.bond_lock_days} day(s) is testnet-sized; "
+             "mining a real network would be nearly free to enter")
 
     magic = a.magic
     if not re.fullmatch(r"[A-Z0-9_]{4,32}", magic):
@@ -224,9 +257,13 @@ def main() -> None:
     if ms_hash == "0" * 64:
         die("the midstate anchor hash is all zeros")
 
+    bond_note = (f"2^{a.min_bond.bit_length() - 1} units"
+                 + (f" ({a.min_bond >> 30} gMDS)" if a.min_bond >= (1 << 30) else ""))
     params = dict(magic=magic, btc_hash=btc_hash, btc_height=a.bitcoin_height, btc_time=btc_time,
                   genesis_time=genesis, target=target, target_note=note,
-                  ms_hash=ms_hash, ms_height=ms_height)
+                  ms_hash=ms_hash, ms_height=ms_height, min_bond=a.min_bond,
+                  lock_days=a.bond_lock_days, lock_blocks=a.bond_lock_days * 1440,
+                  bond_note=bond_note)
     block = render(params)
 
     src = a.types_rs.read_text()
@@ -247,6 +284,7 @@ def main() -> None:
     print(f"network magic      {magic}")
     print(f"bitcoin anchor     {a.bitcoin_height}  {btc_hash}  ({utc(btc_time)})")
     print(f"midstate anchor    {ms_height}  {ms_hash}")
+    print(f"mining bond        {bond_note}, locked {a.bond_lock_days} more day(s) to mine")
     print(f"mining opens       {utc(genesis)}")
     print(f"slow start ends    ~{utc(genesis + SLOW_START_BLOCKS * BLOCK_TIME)}")
     print(f"genesis target     {leading_zero_bits(target)} leading zero bits, "
