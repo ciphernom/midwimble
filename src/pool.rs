@@ -1083,9 +1083,12 @@ mod tests {
 
     #[test]
     fn audit_catches_a_lying_pool() {
+        use crate::core::bond::{
+            est_midstate_height, BondEntry, MinerBond, MIN_MINING_BOND, MIN_REMAINING_BOND_LOCK,
+        };
         use crate::core::state::apply_batch;
-        use crate::core::template::build_template_with;
-        use crate::core::types::State;
+        use crate::core::template::build_template_bonded;
+        use crate::core::types::{hash, State};
         let me = WalletKeys::random().address();
         let other = WalletKeys::random().address();
         let pool = WalletKeys::random().address();
@@ -1093,11 +1096,33 @@ mod tests {
         apply_batch(&mut state, Batch::genesis(), &[]).unwrap();
         let ts = vec![Batch::genesis().timestamp];
 
+        // Production builds require every block to be authorised by a bond
+        // (`core::bond::BONDED_MINING_FROM`). Registering one here would mean
+        // mining real midstate headers, so the bond is put straight into the
+        // state instead: a template needs nothing else.
+        let bond = MinerBond {
+            secret: curve25519_dalek::scalar::Scalar::from_bytes_mod_order(hash(b"pool audit")),
+            bond_id: hash(b"pool audit bond"),
+            registration: None,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        state.bonds.insert(
+            bond.bond_id,
+            BondEntry {
+                mining_key: bond.mining_key(),
+                value: MIN_MINING_BOND,
+                bonded_until: est_midstate_height(now) + MIN_REMAINING_BOND_LOCK + 1_440,
+            },
+        );
+
         let scores = vec![(addr_key(&me), 5), (addr_key(&other), 3)];
         let tree = ShareMerkleTree::build(scores.clone());
         let payouts = [(pool, 1), (me, 5), (other, 3)];
         let (tpl, receipts) =
-            build_template_with(&state, &ts, &[], &payouts, tree.root, None).unwrap();
+            build_template_bonded(&state, &ts, &[], &payouts, tree.root, None, Some(&bond))
+                .unwrap();
         let template_hex = hex::encode(bincode::serialize(&tpl.batch).unwrap());
         let my_receipts: Vec<Value> = receipts
             .iter()
