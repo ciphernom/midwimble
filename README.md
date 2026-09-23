@@ -223,6 +223,7 @@ midwimble wallet --wallet w.mww send --to <address> --amount 0.25   # amounts in
 midwimble bond new --file bond.json              # mining requires a bond: docs/BONDED_POW.md
 midwimble node --mining-bond bond.json --mine-to <address>
 python3 scripts/rehearse.py --midstate-rpc 127.0.0.1:8545   # full rehearsal: docs/REHEARSAL.md
+python3 scripts/join_testnet.py [--mine]                    # join the testnet: docs/TESTNET.md
 
 # merged mining against a midstate node
 midwimble merge-mine --midstate-rpc 127.0.0.1:8545 --midstate-address <hex> \
@@ -283,8 +284,8 @@ verify. The vendored copy keys the file by a seed fingerprint.
   merged mining.
 - [ ] Rehearse against a real midstate node: bonded mining and merged mining
   (`scripts/rehearse.py`, `docs/REHEARSAL.md`).
-- [ ] Run a public testnet from frozen code (`--testnet` in
-  `scripts/set_launch_params.py` sets a magic, a 2^24 bond and a two-day lock).
+- [ ] Run the public testnet (`docs/TESTNET.md`): publish `scripts/testnet.json`,
+  run a seed, and get a midstate pool merge-mining it.
 
 ## Known limitations
 

@@ -1,0 +1,31 @@
+{
+  "_comment": [
+    "The midwimble testnet's parameters. scripts/join_testnet.py builds from",
+    "exactly these values and refuses to run unless the binary it produces",
+    "prints genesis_block below, so every joiner is provably on one chain.",
+    "",
+    "Filled in on testnet launch day by whoever launches it: run",
+    "set_launch_params.py --testnet with the day's anchors, then copy the",
+    "values it wrote (and the genesis block id `midwimble params` prints)",
+    "in here and publish it."
+  ],
+  "network": "MIDWIMBLE_TESTNET_V1",
+  "launched": null,
+
+  "bitcoin_height": null,
+  "bitcoin_hash": null,
+  "bitcoin_time": null,
+
+  "midstate_height": null,
+  "midstate_hash": null,
+
+  "genesis_time": null,
+  "genesis_target": null,
+  "genesis_block": null,
+
+  "min_bond": 16777216,
+  "bond_lock_days": 2,
+
+  "seeds": [],
+  "faucet": null
+}
