@@ -137,12 +137,31 @@ const LAUNCH_GENESIS_TIMESTAMP: u64 = 1_789_430_400; // 2026-09-15 00:00:00 UTC 
 const LAUNCH_GENESIS_TARGET: [u8; 32] =
     hex32("0011ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
+/// Smallest bond that grants mining eligibility, in midstate base units.
+/// Midstate coins are powers of two, so this is one too: 2^34 = 16 gMDS on
+/// mainnet. A testnet sets it low (`--min-bond`), because nobody will lock
+/// real money to test someone else's chain, and the bonded path is exercised
+/// just as well by a trivial coin.
+pub const LAUNCH_MIN_MINING_BOND: u64 = 1 << 34;
+
+/// Midstate blocks a bond must still be locked for to be eligible: the
+/// unbonding delay, 30 days on mainnet (`--bond-lock-days`). A testnet sets
+/// it to a day or two so testers' coins come back quickly.
+pub const LAUNCH_MIN_REMAINING_BOND_LOCK: u64 = 30 * 24 * 60;
+
 /// False while the parameters above are placeholders. The node says so at
 /// startup and `midwimble params` prints it, so a release built without
 /// running the launch script cannot be mistaken for the real network.
 pub const LAUNCH_PARAMETERS_SET: bool = false;
 
 // @launch-params:end
+
+/// A bond is one midstate coin, and midstate coin values are powers of two.
+const _: () = assert!(LAUNCH_MIN_MINING_BOND.count_ones() == 1);
+/// Small enough to be free is not a bond at all, even on a testnet.
+const _: () = assert!(LAUNCH_MIN_MINING_BOND >= 1 << 20);
+/// The unbonding delay has to outlast a reorg of either chain.
+const _: () = assert!(LAUNCH_MIN_REMAINING_BOND_LOCK >= 24 * 60);
 
 /// Genesis cannot predate the Bitcoin block it commits to.
 const _: () = assert!(LAUNCH_GENESIS_TIMESTAMP >= BITCOIN_BLOCK_TIME);

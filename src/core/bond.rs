@@ -36,16 +36,17 @@ const OP_CHECKTIMEVERIFY: u8 = 0x33;
 const MIDSTATE_V2_ACTIVATION_HEIGHT: u64 = 100_000;
 const MIDSTATE_V4_ACTIVATION_HEIGHT: u64 = 163_675;
 
-/// Smallest bond that grants eligibility, in midstate base units. Midstate
-/// coins are powers of two, so this is one too: 2^34 units = 16 gMDS.
-/// **Proposed, not yet a consensus constant.**
-pub const MIN_MINING_BOND: u64 = 1 << 34;
+/// Smallest bond that grants eligibility, in midstate base units: 2^34
+/// (16 gMDS) on mainnet. A launch parameter, so a testnet can set it low
+/// enough that testers risk nothing (`types::LAUNCH_MIN_MINING_BOND`).
+pub const MIN_MINING_BOND: u64 = super::types::LAUNCH_MIN_MINING_BOND;
 
-/// How many midstate blocks a bond must stay locked beyond the snapshot it is
-/// judged at (30 days). This *is* the unbonding delay: a bond stops counting
-/// this long before its owner can spend it, so neither chain has to track an
-/// unbonding state. **Proposed, not yet a consensus constant.**
-pub const MIN_REMAINING_BOND_LOCK: u64 = 30 * 24 * 60;
+/// How many midstate blocks a bond must stay locked beyond the height it is
+/// judged at (30 days on mainnet). This *is* the unbonding delay: a bond
+/// stops counting this long before its owner can spend it, so neither chain
+/// has to track an unbonding state. Also a launch parameter, so a testnet's
+/// bonds free up in a day or two.
+pub const MIN_REMAINING_BOND_LOCK: u64 = super::types::LAUNCH_MIN_REMAINING_BOND_LOCK;
 
 /// The locking script of a mining bond:
 ///
@@ -913,6 +914,39 @@ mod tests {
         let mut ancient = proof;
         ancient.midstate_height = 99_999;
         assert!(ancient.verify(&root).is_err());
+    }
+
+    /// The bond size and lock are launch parameters now, so a build can be
+    /// given bad ones. These are the properties every build must keep, and
+    /// the reason `types.rs` refuses the worst of them at compile time.
+    #[test]
+    fn bond_parameters_stay_usable() {
+        assert_eq!(
+            MIN_MINING_BOND.count_ones(),
+            1,
+            "a bond is one midstate coin, and coin values are powers of two"
+        );
+        assert!(MIN_MINING_BOND >= 1 << 20, "a bond has to cost something");
+        assert!(
+            MIN_REMAINING_BOND_LOCK >= 24 * 60,
+            "the unbonding delay must outlast a reorg"
+        );
+        // Eligibility follows whatever this build was given, both ways.
+        let t = 1_800_000_000;
+        let bond = Bond {
+            id: [0; 32],
+            mining_key: [0x11; 32],
+            value: MIN_MINING_BOND,
+            bonded_until: est_midstate_height(t) + MIN_REMAINING_BOND_LOCK,
+            proven_at: 300_000,
+        };
+        assert!(bond.eligible_at(t));
+        assert!(!bond.eligible_at(t + 60), "the lock runs down");
+        assert!(!Bond {
+            value: MIN_MINING_BOND / 2,
+            ..bond
+        }
+        .eligible_at(t));
     }
 
     #[test]
