@@ -135,6 +135,21 @@ Any node can check any claimed supply against the schedule
 (`types::issued_before`). Checkpoint-synced nodes do this for the snapshot they
 start from, so the cap does not depend on trusting whoever served it.
 
+## Settled parameters
+
+| | | |
+|---|---|---|
+| Supply | 1,000,000.00000000, 8 decimals | reached exactly |
+| Slow start | 43,200 blocks (30 days) | linear ramp |
+| Halving | every 2,100,000 blocks | Bitcoin's era length |
+| Bonded mining | from block 1 | minimum bond 16 gMDS (2^34 units) |
+| Bond eligibility | more than 30 days of lock left | judged on midwimble's clock, 7-day margin |
+| Registration | a day of work above the proof | no header counts for more than 1/60 |
+| Anchor evidence | 1,000 midstate confirmations, 2^19 a header | about an hour of midstate's network to forge |
+| Finality | 100 blocks after an anchored checkpoint | fixed for everyone |
+| Anchoring | roughly every 10,000 blocks | archival nodes, pruning off |
+| Relay fee floor | 100 units per weight | local policy |
+
 ## Still to decide before launch
 
 These are carried over from the README and are not settled by this document:

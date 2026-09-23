@@ -271,13 +271,18 @@ verify. The vendored copy keys the file by a seed fingerprint.
   - the ownership scheme (owner sum, kernel AND-proof, transcript binding);
   - the merged-mining proof;
   - the recovery commitments.
-- [ ] Set a real minimum work for anchor verification. The CLI defaults to 0.
-- [ ] Decide the anchoring cadence and depth, and the social process for
-  choosing a recovery checkpoint (`docs/ANCHORING.md` §7).
-- [ ] Decide the finality depth and how many archive nodes keep full history,
-  since pruned nodes cannot serve it (`docs/PRUNING.md`).
-- [ ] Re-evaluate `EXTENSION_ITERATIONS`. A header check costs one full
-  attempt.
+- [x] Anchor evidence: 1,000 midstate confirmations, each header worth at
+  least 2^19 attempts (`finality.rs`). Forging costs about an hour of
+  midstate's whole network, with room for its difficulty to fall eightfold.
+- [x] Finality depth: 100 midwimble blocks, fixed. It is a reorg floor, so it
+  must be identical everywhere; `core/finality.rs`'s estimator advises wallets
+  instead.
+- [x] Anchoring cadence: about every 10,000 blocks (a week). Archival nodes
+  assumed; pruning stays off (`docs/ANCHORING.md`).
+- [x] `EXTENSION_ITERATIONS` stays 1,000,000: midstate compatibility, and so
+  merged mining.
+- [ ] Rehearse merged mining against a real midstate node. The rehearsal
+  covers bonded mining only (`docs/REHEARSAL.md`).
 
 ## Known limitations
 

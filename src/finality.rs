@@ -23,11 +23,25 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct FinalityConfig {
-    /// Midstate blocks (the anchor block included) required.
+    /// Midstate blocks (the anchor block included) required: 1,000, the life
+    /// of a midstate commitment, about 17 hours. Forging an anchor means
+    /// mining that many headers privately.
     pub anchor_depth: usize,
     /// Midwimble blocks required after the checkpoint.
+    ///
+    /// This is a reorg floor, not advice, so it must be the same for
+    /// everyone: nodes that finalise at different depths disagree about which
+    /// reorgs are legal. `core/finality.rs`'s estimator works from each node's
+    /// own observations and is deliberately not used here; it is for telling a
+    /// wallet how many confirmations to wait for.
     pub finality_depth: u64,
-    /// Minimum work per Midstate header in anchor evidence.
+    /// Minimum work per midstate header in anchor evidence, as a target
+    /// threshold. Default 2^19 attempts a header: with 1,000 headers, forging
+    /// evidence costs on the order of an hour of midstate's whole network,
+    /// while leaving room for midstate's difficulty to fall eightfold. A
+    /// tighter floor near today's difficulty would start rejecting honest
+    /// anchors after a halving; the durable fix is to count cumulative work
+    /// against midwimble's own target, as bond registrations do.
     pub min_work: u128,
     /// Finalized checkpoints whose past state stays derivable (undo window).
     pub retained_checkpoints: usize,
@@ -38,9 +52,9 @@ pub struct FinalityConfig {
 impl Default for FinalityConfig {
     fn default() -> Self {
         Self {
-            anchor_depth: 6,
+            anchor_depth: 1_000,
             finality_depth: 100,
-            min_work: 0,
+            min_work: 1 << 19,
             retained_checkpoints: 4,
             prune: false,
         }
