@@ -386,7 +386,9 @@ class Rehearsal:
         midstate_address = self.s.get("midstate_address")
         if not midstate_address:
             print("  Merged mining finds real midstate blocks, so midstate rewards need an")
-            print("  address of yours (`midstate wallet receive`).")
+            print("  address your own wallet holds (`midstate wallet receive`). Midstate")
+            print("  outputs carry their salts on chain, so `midstate wallet scan` picks up")
+            print("  anything this finds; no importing by hand.")
             while True:
                 midstate_address = ask("  midstate address: ").strip().lower()
                 if re.fullmatch(r"[0-9a-f]{64}|[0-9a-f]{72}", midstate_address):
@@ -410,8 +412,9 @@ class Rehearsal:
                "--coinbase-log", str(self.dir / "midstate_coinbase.jsonl")]
         print(f"  $ {' '.join(cmd)}   (log: {log.name})")
         self.procs.append(subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT))
-        print("  Any midstate block this finds is a real one, paid to that address. Its")
-        print(f"  coinbase salts go in {self.dir / 'midstate_coinbase.jsonl'}: keep that file.")
+        print("  Any midstate block this finds is a real one, paid to that address; run")
+        print("  `midstate wallet scan` afterwards to pick it up. A copy of the coinbase")
+        print(f"  salts is kept in {self.dir / 'midstate_coinbase.jsonl'} as a backup.")
 
         def merge_mined():
             height = (try_get(producer, "/state") or {}).get("height", 0)
