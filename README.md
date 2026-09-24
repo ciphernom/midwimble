@@ -283,6 +283,8 @@ verify. The vendored copy keys the file by a seed fingerprint.
   merged mining.
 - [ ] Rehearse against a real midstate node: bonded mining and merged mining
   (`scripts/rehearse.py`, `docs/REHEARSAL.md`).
+- [ ] Run a public testnet from frozen code (`--testnet` in
+  `scripts/set_launch_params.py` sets a magic, a 2^24 bond and a two-day lock).
 
 ## Known limitations
 

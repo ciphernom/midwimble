@@ -78,6 +78,14 @@ Everything else — share accounting, payouts, the provably-fair score tree —
 stays as it is. A pool that doesn't configure a midwimble node behaves exactly
 as before.
 
+Both endpoints are exercised end to end by `tests/pool_merge.rs`, against a
+stand-in midstate node: a pool asks for a commitment, plants it, searches once,
+and hands back a nonce that becomes a merge-mined midwimble block signed by the
+operator's bond. The test also checks the two refusals that matter — a mining
+hash the node never issued, and a commitment claimed in the wrong coinbase
+output — because the node rebuilds the proof itself rather than trusting the
+pool.
+
 ## Failure behaviour
 
 - **The midwimble node is unreachable:** the pool builds jobs without a
