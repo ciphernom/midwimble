@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<!-- Served at / by every midwimble node. Self-contained: no fonts, scripts or
+     images from anywhere else, so it works on a machine with no internet. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>midwimble</title>
+<style>
+  /* Midwimble's own palette and type, from docs/site.css. */
+  :root {
+    --bg: #07070a; --panel: #0e0d14; --text: #f4f3f7; --muted: #9c98aa;
+    --green: #00ff41; --purple: #8b5cf6; --lilac: #a78bfa;
+    --line: rgba(167, 139, 250, .18); --max: 1180px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 500 13px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    padding: 40px 20px 28px; text-align: center;
+    border-bottom: 1px solid var(--line);
+  }
+  header img { width: 76px; height: 76px; border-radius: 50%; display: block; margin: 0 auto 16px; }
+  h1 {
+    margin: 0; font-size: 20px; letter-spacing: .18em; text-transform: uppercase;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif; font-weight: 600;
+  }
+  .sub { color: var(--muted); font-size: 11px; letter-spacing: .1em; margin-top: 8px; }
+  main { padding: 28px 20px; display: grid; gap: 22px; max-width: var(--max); margin: 0 auto; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; }
+  h2 {
+    margin: 0; padding: 14px 20px; font: 700 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: .18em; text-transform: uppercase; color: var(--lilac);
+    border-bottom: 1px solid var(--line);
+  }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+  .cell { padding: 16px 20px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .cell .k {
+    color: var(--muted); font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: .14em; text-transform: uppercase;
+  }
+  .cell .v { font-size: 20px; margin-top: 4px; word-break: break-all; letter-spacing: -.02em; }
+  .cell .v.small { font-size: 14px; letter-spacing: 0; }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left; padding: 10px 20px; color: var(--muted);
+    font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: .14em; text-transform: uppercase; border-bottom: 1px solid var(--line);
+  }
+  td { padding: 9px 20px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: rgba(167, 139, 250, .05); }
+  .mono-dim { color: var(--muted); }
+  .tag {
+    display: inline-block; padding: 2px 9px; border-radius: 999px;
+    font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .08em;
+    border: 1px solid var(--line);
+  }
+  .tag.merged { color: var(--lilac); border-color: rgba(167, 139, 250, .45); }
+  .tag.native { color: var(--muted); }
+  .tag.reg { color: var(--green); border-color: rgba(0, 255, 65, .35); }
+  .yes { color: var(--green); }
+  .no { color: var(--lilac); }
+  .bar { height: 4px; background: rgba(167, 139, 250, .12); border-radius: 999px; overflow: hidden; margin-top: 10px; }
+  .bar span { display: block; height: 100%; background: linear-gradient(90deg, var(--purple), var(--green)); }
+  footer { padding: 0 20px 36px; color: var(--muted); font-size: 11px; text-align: center; letter-spacing: .06em; }
+  a { color: var(--lilac); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .err { color: var(--muted); padding: 16px 20px; }
+</style>
+</head>
+<body>
+<header>
+  <img src="/logo.svg" alt="Midwimble">
+  <h1>Midwimble</h1>
+  <div class="sub" id="banner">connecting…</div>
+</header>
+
+<main>
+  <section>
+    <h2>Chain</h2>
+    <div class="grid" id="chain"></div>
+  </section>
+
+  <section>
+    <h2>Blocks</h2>
+    <div id="blocks"></div>
+  </section>
+
+  <section>
+    <h2>Mining bonds</h2>
+    <div id="bonds"></div>
+  </section>
+</main>
+
+<footer>
+  Served by this node. Refreshes every 5 seconds.
+  Raw data: <a href="/state">/state</a>, <a href="/bonds">/bonds</a>, /miners/{start}/{count}.
+</footer>
+
+<script>
+const COIN = 100000000;
+const short = h => h ? h.slice(0, 10) + "…" : "—";
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+};
+
+function coins(units) {
+  const whole = Math.floor(units / COIN);
+  const frac = String(units % COIN).padStart(8, "0");
+  return whole.toLocaleString() + "." + frac;
+}
+
+function zeroBits(targetHex) {
+  let bits = 0;
+  for (const ch of targetHex) {
+    const v = parseInt(ch, 16);
+    if (v === 0) { bits += 4; continue; }
+    bits += Math.clz32(v) - 28;
+    break;
+  }
+  return bits;
+}
+
+function ago(timestamp) {
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - timestamp);
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  return Math.floor(s / 3600) + "h ago";
+}
+
+function cell(parent, key, value, small) {
+  const c = el("div", "cell");
+  c.appendChild(el("div", "k", key));
+  c.appendChild(el("div", "v" + (small ? " small" : ""), value));
+  parent.appendChild(c);
+  return c;
+}
+
+async function get(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(path + " → " + r.status);
+  return r.json();
+}
+
+function renderChain(s) {
+  const box = document.getElementById("chain");
+  box.textContent = "";
+  cell(box, "height", s.height.toLocaleString());
+  cell(box, "tip", short(s.tip), true).title = s.tip;
+  cell(box, "last block", ago(s.timestamp));
+  const supply = cell(box, "supply", coins(s.supply));
+  const bar = el("div", "bar");
+  const fill = el("span");
+  fill.style.width = Math.max(0.4, (s.supply / s.max_supply) * 100) + "%";
+  bar.appendChild(fill);
+  supply.appendChild(bar);
+  cell(box, "block reward", coins(s.block_reward));
+  cell(box, "era", String(s.era));
+  cell(box, "next halving",
+       s.next_halving_height ? s.next_halving_height.toLocaleString() : "none left");
+  cell(box, "difficulty", zeroBits(s.target) + " zero bits");
+  cell(box, "mempool", s.mempool_count + " tx, " + s.mempool_weight + " weight", true);
+  cell(box, "outputs / kernels", s.utxos.toLocaleString() + " / " + s.kernels.toLocaleString(), true);
+  cell(box, "peers", String(s.peers.length));
+  cell(box, "this node",
+       (s.mining ? "mining" : "not mining") + (s.syncing ? ", syncing" : ""), true);
+}
+
+function renderBlocks(blocks, bonds) {
+  const box = document.getElementById("blocks");
+  box.textContent = "";
+  if (!blocks.length) {
+    box.appendChild(el("div", "err", "no blocks yet"));
+    return;
+  }
+  const table = el("table");
+  const head = el("tr");
+  ["height", "mined by", "work", "registers"].forEach(h => head.appendChild(el("th", null, h)));
+  table.appendChild(head);
+  for (const b of blocks.slice().reverse()) {
+    const row = el("tr");
+    row.appendChild(el("td", null, b.height.toLocaleString()));
+    const who = el("td");
+    if (b.bond_id) {
+      const known = bonds.find(x => x.bond_id === b.bond_id);
+      who.appendChild(el("span", "mono-dim", short(b.bond_id)));
+      who.title = b.bond_id + (known ? "\nmining key " + known.mining_key : "");
+    } else {
+      who.appendChild(el("span", "mono-dim", "unsigned"));
+    }
+    row.appendChild(who);
+    const work = el("td");
+    work.appendChild(el("span", b.merged ? "tag merged" : "tag native",
+                        b.merged ? "merge-mined" : "native"));
+    row.appendChild(work);
+    const reg = el("td");
+    if (b.registrations.length) {
+      reg.appendChild(el("span", "tag reg", "bond " + short(b.registrations[0])));
+    } else {
+      reg.appendChild(el("span", "mono-dim", "—"));
+    }
+    row.appendChild(reg);
+    table.appendChild(row);
+  }
+  box.appendChild(table);
+}
+
+function renderBonds(data) {
+  const box = document.getElementById("bonds");
+  box.textContent = "";
+  const bonds = data.bonds || [];
+  if (!bonds.length) {
+    box.appendChild(el("div", "err",
+      "no bonds registered yet" +
+      (data.bonded_mining_from !== null
+        ? " (required from height " + data.bonded_mining_from + ")" : "")));
+    return;
+  }
+  const table = el("table");
+  const head = el("tr");
+  ["bond", "mining key", "locked", "until", "eligible"].forEach(h => head.appendChild(el("th", null, h)));
+  table.appendChild(head);
+  for (const b of bonds) {
+    const row = el("tr");
+    const id = el("td", null, short(b.bond_id));
+    id.title = b.bond_id;
+    row.appendChild(id);
+    const key = el("td", "mono-dim", short(b.mining_key));
+    key.title = b.mining_key;
+    row.appendChild(key);
+    row.appendChild(el("td", null, (b.value / (1 << 30)).toFixed(4) + " gMDS"));
+    row.appendChild(el("td", "mono-dim", "midstate " + b.bonded_until.toLocaleString()));
+    row.appendChild(el("td", b.eligible_now ? "yes" : "no", b.eligible_now ? "yes" : "lock too short"));
+    table.appendChild(row);
+  }
+  box.appendChild(table);
+}
+
+async function refresh() {
+  const banner = document.getElementById("banner");
+  try {
+    const state = await get("/state");
+    const bonds = await get("/bonds");
+    const start = Math.max(1, state.height - 25);
+    const count = Math.max(0, state.height - start);
+    const miners = count ? await get("/miners/" + start + "/" + count) : { blocks: [] };
+    renderChain(state);
+    renderBlocks(miners.blocks, bonds.bonds || []);
+    renderBonds(bonds);
+    banner.textContent = state.peer_id ? "NODE " + short(state.peer_id) : "";
+    banner.className = "sub";
+  } catch (e) {
+    banner.textContent = "cannot reach this node: " + e.message;
+    banner.className = "sub no";
+  }
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
