@@ -1,268 +1,472 @@
 <!DOCTYPE html>
 <!-- Served at / by every midwimble node. Self-contained: no fonts, scripts or
-     images from anywhere else, so it works on a machine with no internet. -->
+     images from anywhere else, so it works on a machine with no internet.
+     Chain data is untrusted: everything is rendered as text, never as HTML. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>midwimble</title>
+<meta name="color-scheme" content="dark">
+<title>midwimble explorer</title>
 <style>
-  /* Midwimble's own palette and type, from docs/site.css. */
   :root {
-    --bg: #07070a; --panel: #0e0d14; --text: #f4f3f7; --muted: #9c98aa;
-    --green: #00ff41; --purple: #8b5cf6; --lilac: #a78bfa;
+    --bg: #07070a; --panel: #0e0d14; --panel2: #13111c; --text: #f4f3f7; --muted: #9c98aa;
+    --green: #00ff41; --purple: #8b5cf6; --lilac: #a78bfa; --amber: #f5c451;
     --line: rgba(167, 139, 250, .18); --max: 1180px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
   }
   * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font: 500 13px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 500 13px/1.7 var(--mono); }
+  a { color: var(--lilac); text-decoration: none; }
+  a:hover { text-decoration: underline; }
   header {
-    padding: 40px 20px 28px; text-align: center;
-    border-bottom: 1px solid var(--line);
+    border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2;
+    background: rgba(7, 7, 10, .92); backdrop-filter: blur(8px);
   }
-  header img { width: 76px; height: 76px; border-radius: 50%; display: block; margin: 0 auto 16px; }
-  h1 {
-    margin: 0; font-size: 20px; letter-spacing: .18em; text-transform: uppercase;
-    font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif; font-weight: 600;
+  .bar-top { max-width: var(--max); margin: 0 auto; padding: 12px 20px; display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
+  .brand { display: flex; align-items: center; gap: 10px; color: var(--text); }
+  .brand:hover { text-decoration: none; }
+  .brand img { width: 30px; height: 30px; border-radius: 50%; }
+  .brand b { font: 600 14px var(--sans); letter-spacing: .18em; text-transform: uppercase; }
+  nav { display: flex; gap: 14px; font-size: 12px; letter-spacing: .08em; }
+  form { flex: 1; display: flex; min-width: 240px; }
+  form input {
+    flex: 1; background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    border-radius: 10px 0 0 10px; padding: 8px 12px; font: 500 12px var(--mono); outline: none;
   }
-  .sub { color: var(--muted); font-size: 11px; letter-spacing: .1em; margin-top: 8px; }
-  main { padding: 28px 20px; display: grid; gap: 22px; max-width: var(--max); margin: 0 auto; }
+  form input:focus { border-color: var(--lilac); }
+  form button {
+    background: var(--purple); color: #fff; border: 0; border-radius: 0 10px 10px 0;
+    padding: 0 14px; font: 600 12px var(--mono); cursor: pointer;
+  }
+  #flash { max-width: var(--max); margin: 0 auto; padding: 0 20px; color: var(--amber); font-size: 12px; }
+  main { padding: 24px 20px 10px; display: grid; gap: 20px; max-width: var(--max); margin: 0 auto; }
   section { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; }
   h2 {
-    margin: 0; padding: 14px 20px; font: 700 11px ui-monospace, SFMono-Regular, Menlo, monospace;
-    letter-spacing: .18em; text-transform: uppercase; color: var(--lilac);
-    border-bottom: 1px solid var(--line);
+    margin: 0; padding: 13px 20px; font: 700 11px var(--mono); letter-spacing: .18em;
+    text-transform: uppercase; color: var(--lilac); border-bottom: 1px solid var(--line);
+    display: flex; justify-content: space-between; gap: 12px; align-items: center;
   }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
-  .cell { padding: 16px 20px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-  .cell .k {
-    color: var(--muted); font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace;
-    letter-spacing: .14em; text-transform: uppercase;
-  }
-  .cell .v { font-size: 20px; margin-top: 4px; word-break: break-all; letter-spacing: -.02em; }
-  .cell .v.small { font-size: 14px; letter-spacing: 0; }
+  h2 .aside { color: var(--muted); letter-spacing: .06em; text-transform: none; font-weight: 500; }
+  .title { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  .title h1 { margin: 0; font: 600 22px var(--sans); letter-spacing: .02em; }
+  .title .pager { margin-left: auto; display: flex; gap: 10px; }
+  .btn { border: 1px solid var(--line); border-radius: 999px; padding: 3px 12px; font-size: 12px; }
+  .btn.off { color: var(--muted); opacity: .45; pointer-events: none; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+  .cell { padding: 14px 20px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .k { color: var(--muted); font: 600 11px var(--mono); letter-spacing: .14em; text-transform: uppercase; }
+  .cell .v { font-size: 18px; margin-top: 2px; word-break: break-all; letter-spacing: -.02em; }
+  .cell .v.small { font-size: 13px; letter-spacing: 0; }
+  .meter { height: 4px; background: rgba(167, 139, 250, .12); border-radius: 999px; overflow: hidden; margin-top: 8px; }
+  .meter span { display: block; height: 100%; background: linear-gradient(90deg, var(--purple), var(--green)); }
+  .meter.hot span { background: linear-gradient(90deg, var(--purple), var(--amber)); }
+  dl { margin: 0; display: grid; grid-template-columns: minmax(150px, 220px) 1fr; }
+  dt, dd { margin: 0; padding: 9px 20px; border-bottom: 1px solid var(--line); }
+  dt { color: var(--muted); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; padding-top: 11px; }
+  dd { word-break: break-all; }
+  dl > :nth-last-child(-n+2) { border-bottom: 0; }
+  .hash { user-select: all; }
+  .scroll { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; }
   th {
-    text-align: left; padding: 10px 20px; color: var(--muted);
-    font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace;
-    letter-spacing: .14em; text-transform: uppercase; border-bottom: 1px solid var(--line);
+    text-align: left; padding: 9px 20px; color: var(--muted); font: 600 11px var(--mono);
+    letter-spacing: .14em; text-transform: uppercase; border-bottom: 1px solid var(--line); white-space: nowrap;
   }
-  td { padding: 9px 20px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  td { padding: 8px 20px; border-bottom: 1px solid var(--line); white-space: nowrap; }
   tr:last-child td { border-bottom: 0; }
   tbody tr:hover { background: rgba(167, 139, 250, .05); }
-  .mono-dim { color: var(--muted); }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .dim { color: var(--muted); }
   .tag {
-    display: inline-block; padding: 2px 9px; border-radius: 999px;
-    font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .08em;
-    border: 1px solid var(--line);
+    display: inline-block; padding: 1px 9px; border-radius: 999px; font: 600 11px var(--mono);
+    letter-spacing: .06em; border: 1px solid var(--line); margin-right: 4px;
   }
   .tag.merged { color: var(--lilac); border-color: rgba(167, 139, 250, .45); }
   .tag.native { color: var(--muted); }
-  .tag.reg { color: var(--green); border-color: rgba(0, 255, 65, .35); }
-  .yes { color: var(--green); }
-  .no { color: var(--lilac); }
-  .bar { height: 4px; background: rgba(167, 139, 250, .12); border-radius: 999px; overflow: hidden; margin-top: 10px; }
-  .bar span { display: block; height: 100%; background: linear-gradient(90deg, var(--purple), var(--green)); }
-  footer { padding: 0 20px 36px; color: var(--muted); font-size: 11px; text-align: center; letter-spacing: .06em; }
-  a { color: var(--lilac); text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  .err { color: var(--muted); padding: 16px 20px; }
+  .tag.ok { color: var(--green); border-color: rgba(0, 255, 65, .35); }
+  .tag.warn { color: var(--amber); border-color: rgba(245, 196, 81, .4); }
+  .empty, .note { color: var(--muted); padding: 14px 20px; }
+  .note { font-size: 12px; border-top: 1px solid var(--line); }
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .chart { padding: 12px 20px 14px; border-right: 1px solid var(--line); }
+  .chart svg { width: 100%; height: 120px; display: block; margin-top: 6px; }
+  .flow { display: flex; align-items: stretch; gap: 0; flex-wrap: wrap; padding: 18px 20px; }
+  .flow .step { flex: 1; min-width: 200px; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; background: var(--panel2); }
+  .flow .arrow { align-self: center; padding: 0 12px; color: var(--muted); font-size: 18px; }
+  footer { padding: 18px 20px 34px; color: var(--muted); font-size: 11px; text-align: center; letter-spacing: .05em; }
+  @media (max-width: 640px) { dl { grid-template-columns: 1fr; } dt { border-bottom: 0; padding-bottom: 0; } }
 </style>
 </head>
 <body>
 <header>
-  <img src="/logo.svg" alt="Midwimble">
-  <h1>Midwimble</h1>
-  <div class="sub" id="banner">connecting…</div>
+  <div class="bar-top">
+    <a class="brand" href="#/"><img src="/logo.svg" alt=""><b>Midwimble</b></a>
+    <nav><a href="#/">overview</a><a href="#/blocks">blocks</a><a href="#/bonds">bonds</a></nav>
+    <form id="search" autocomplete="off">
+      <input id="q" placeholder="height, block hash, output commitment, kernel or bond id" spellcheck="false">
+      <button>find</button>
+    </form>
+  </div>
+  <div id="flash"></div>
 </header>
-
-<main>
-  <section>
-    <h2>Chain</h2>
-    <div class="grid" id="chain"></div>
-  </section>
-
-  <section>
-    <h2>Blocks</h2>
-    <div id="blocks"></div>
-  </section>
-
-  <section>
-    <h2>Mining bonds</h2>
-    <div id="bonds"></div>
-  </section>
-</main>
-
+<main id="view"><div class="empty">loading…</div></main>
 <footer>
-  Served by this node. Refreshes every 5 seconds.
-  Raw data: <a href="/state">/state</a>, <a href="/bonds">/bonds</a>, /miners/{start}/{count}.
+  Served by this node from its own copy of the chain. JSON: <a href="/state">/state</a>,
+  /explorer/{blocks, block/…, output/…, kernel/…, bonds, bond/…, search/…}.
 </footer>
-
 <script>
-const COIN = 100000000;
-const short = h => h ? h.slice(0, 10) + "…" : "—";
-const el = (tag, cls, text) => {
-  const n = document.createElement(tag);
-  if (cls) n.className = cls;
-  if (text !== undefined) n.textContent = text;
-  return n;
-};
+"use strict";
+const COIN = 1e8;
+const view = document.getElementById("view");
 
+// ---------- small helpers: every value goes in as text --------------------
+function h(tag, attrs, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === "class") n.className = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v);
+  }
+  for (const kid of kids.flat(Infinity)) {
+    if (kid == null || kid === false) continue;
+    n.appendChild(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  }
+  return n;
+}
+const short = (x, n = 10) => x ? x.slice(0, n) + "…" : "—";
+const num = x => Number(x).toLocaleString();
 function coins(units) {
-  const whole = Math.floor(units / COIN);
-  const frac = String(units % COIN).padStart(8, "0");
+  const whole = Math.floor(units / COIN), frac = String(units % COIN).padStart(8, "0");
   return whole.toLocaleString() + "." + frac;
 }
-
-function zeroBits(targetHex) {
-  let bits = 0;
-  for (const ch of targetHex) {
-    const v = parseInt(ch, 16);
-    if (v === 0) { bits += 4; continue; }
-    bits += Math.clz32(v) - 28;
-    break;
-  }
-  return bits;
+function dur(s) {
+  if (s == null) return "—";
+  const a = Math.abs(s), sign = s < 0 ? "-" : "";
+  if (a < 120) return sign + a + "s";
+  if (a < 7200) return sign + Math.round(a / 60) + "m";
+  if (a < 172800) return sign + (a / 3600).toFixed(1) + "h";
+  return sign + (a / 86400).toFixed(1) + "d";
 }
-
-function ago(timestamp) {
-  const s = Math.max(0, Math.floor(Date.now() / 1000) - timestamp);
-  if (s < 60) return s + "s ago";
-  if (s < 3600) return Math.floor(s / 60) + "m ago";
-  return Math.floor(s / 3600) + "h ago";
+const ago = ts => dur(Math.max(0, Math.floor(Date.now() / 1000) - ts)) + " ago";
+const utc = ts => new Date(ts * 1000).toISOString().replace("T", " ").replace(".000Z", " UTC");
+function rate(perSec) {
+  const units = ["", "k", "M", "G", "T"];
+  let i = 0;
+  while (perSec >= 1000 && i < units.length - 1) { perSec /= 1000; i++; }
+  return perSec.toFixed(perSec < 10 ? 2 : 1) + " " + units[i] + "attempts/s";
 }
-
-function cell(parent, key, value, small) {
-  const c = el("div", "cell");
-  c.appendChild(el("div", "k", key));
-  c.appendChild(el("div", "v" + (small ? " small" : ""), value));
-  parent.appendChild(c);
-  return c;
+const link = (kind, id, text) => h("a", { href: "#/" + kind + "/" + id, title: String(id) }, text ?? short(String(id)));
+const full = x => h("span", { class: "hash" }, x);
+const tag = (cls, text) => h("span", { class: "tag " + cls }, text);
+const section = (title, aside, ...body) => h("section", null, h("h2", null, title, aside ? h("span", { class: "aside" }, aside) : null), ...body);
+function cell(k, v, small) { return h("div", { class: "cell" }, h("div", { class: "k" }, k), h("div", { class: "v" + (small ? " small" : "") }, v)); }
+function meter(fraction, hot) {
+  const span = h("span");
+  span.style.width = Math.min(100, Math.max(0.6, fraction * 100)) + "%";
+  return h("div", { class: "meter" + (hot ? " hot" : "") }, span);
 }
+const dl = rows => h("dl", null, rows.filter(Boolean).map(([k, v]) => [h("dt", null, k), h("dd", null, v)]));
+const table = (heads, rows, numeric = []) => h("div", { class: "scroll" }, h("table", null,
+  h("thead", null, h("tr", null, heads.map((x, i) => h("th", { class: numeric.includes(i) ? "num" : null }, x)))),
+  h("tbody", null, rows.map(r => h("tr", null, r.map((c, i) => h("td", { class: numeric.includes(i) ? "num" : null }, c)))))));
 
 async function get(path) {
   const r = await fetch(path);
-  if (!r.ok) throw new Error(path + " → " + r.status);
-  return r.json();
+  let body = null;
+  try { body = await r.json(); } catch (_) {}
+  if (!r.ok) throw new Error((body && body.error) || (path + " → " + r.status));
+  return body;
+}
+function flash(text) {
+  const f = document.getElementById("flash");
+  f.textContent = text;
+  clearTimeout(flash.t);
+  flash.t = setTimeout(() => (f.textContent = ""), 4000);
 }
 
-function renderChain(s) {
-  const box = document.getElementById("chain");
-  box.textContent = "";
-  cell(box, "height", s.height.toLocaleString());
-  cell(box, "tip", short(s.tip), true).title = s.tip;
-  cell(box, "last block", ago(s.timestamp));
-  const supply = cell(box, "supply", coins(s.supply));
-  const bar = el("div", "bar");
-  const fill = el("span");
-  fill.style.width = Math.max(0.4, (s.supply / s.max_supply) * 100) + "%";
-  bar.appendChild(fill);
-  supply.appendChild(bar);
-  cell(box, "block reward", coins(s.block_reward));
-  cell(box, "era", String(s.era));
-  cell(box, "next halving",
-       s.next_halving_height ? s.next_halving_height.toLocaleString() : "none left");
-  cell(box, "difficulty", zeroBits(s.target) + " zero bits");
-  cell(box, "mempool", s.mempool_count + " tx, " + s.mempool_weight + " weight", true);
-  cell(box, "outputs / kernels", s.utxos.toLocaleString() + " / " + s.kernels.toLocaleString(), true);
-  cell(box, "peers", String(s.peers.length));
-  cell(box, "this node",
-       (s.mining ? "mining" : "not mining") + (s.syncing ? ", syncing" : ""), true);
+// ---------- charts --------------------------------------------------------
+const SVG = "http://www.w3.org/2000/svg";
+function svg(tagName, attrs, ...kids) {
+  const n = document.createElementNS(SVG, tagName);
+  for (const [k, v] of Object.entries(attrs || {})) n.setAttribute(k, v);
+  kids.forEach(k => n.appendChild(k));
+  return n;
+}
+function intervalChart(values, target) {
+  const W = 600, H = 120, max = Math.max(target * 3, ...values);
+  const bw = W / Math.max(values.length, 1);
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none" });
+  values.forEach((v, i) => {
+    const bh = Math.max(1, (Math.min(v, max) / max) * (H - 4));
+    const r = svg("rect", { x: i * bw + 1, y: H - bh, width: Math.max(1, bw - 2), height: bh,
+      fill: v > target * 2.5 ? "#f5c451" : "#8b5cf6", opacity: .85 });
+    r.appendChild(svg("title")).textContent = v + "s";
+    s.appendChild(r);
+  });
+  const y = H - (target / max) * (H - 4);
+  s.appendChild(svg("line", { x1: 0, x2: W, y1: y, y2: y, stroke: "#00ff41", "stroke-dasharray": "4 4", "stroke-width": 1 }));
+  return s;
+}
+function lineChart(values) {
+  const W = 600, H = 120, lo = Math.min(...values), hi = Math.max(...values), span = (hi - lo) || 1;
+  const pts = values.map((v, i) => `${(i / Math.max(values.length - 1, 1)) * W},${H - 6 - ((v - lo) / span) * (H - 12)}`);
+  return svg("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none" },
+    svg("polyline", { points: pts.join(" "), fill: "none", stroke: "#a78bfa", "stroke-width": 2, "vector-effect": "non-scaling-stroke" }));
 }
 
-function renderBlocks(blocks, bonds) {
-  const box = document.getElementById("blocks");
-  box.textContent = "";
-  if (!blocks.length) {
-    box.appendChild(el("div", "err", "no blocks yet"));
-    return;
-  }
-  const table = el("table");
-  const head = el("tr");
-  ["height", "mined by", "work", "registers"].forEach(h => head.appendChild(el("th", null, h)));
-  table.appendChild(head);
-  for (const b of blocks.slice().reverse()) {
-    const row = el("tr");
-    row.appendChild(el("td", null, b.height.toLocaleString()));
-    const who = el("td");
-    if (b.bond_id) {
-      const known = bonds.find(x => x.bond_id === b.bond_id);
-      who.appendChild(el("span", "mono-dim", short(b.bond_id)));
-      who.title = b.bond_id + (known ? "\nmining key " + known.mining_key : "");
-    } else {
-      who.appendChild(el("span", "mono-dim", "unsigned"));
-    }
-    row.appendChild(who);
-    const work = el("td");
-    work.appendChild(el("span", b.merged ? "tag merged" : "tag native",
-                        b.merged ? "merge-mined" : "native"));
-    row.appendChild(work);
-    const reg = el("td");
-    if (b.registrations.length) {
-      reg.appendChild(el("span", "tag reg", "bond " + short(b.registrations[0])));
-    } else {
-      reg.appendChild(el("span", "mono-dim", "—"));
-    }
-    row.appendChild(reg);
-    table.appendChild(row);
-  }
-  box.appendChild(table);
+// ---------- shared block table --------------------------------------------
+function blockRows(blocks) {
+  return blocks.map(b => [
+    link("block", b.height, num(b.height)),
+    h("span", { class: "dim", title: utc(b.timestamp) }, ago(b.timestamp)),
+    dur(b.interval),
+    `${b.inputs} / ${b.outputs} / ${b.kernels}`,
+    b.fees ? coins(b.fees) : h("span", { class: "dim" }, "0"),
+    num(b.size),
+    b.miner ? link("bond", b.miner) : h("span", { class: "dim" }, "unsigned"),
+    [tag(b.merged ? "merged" : "native", b.merged ? "merge-mined" : "native"),
+     b.registrations ? tag("ok", "+" + b.registrations + " bond") : null],
+  ]);
+}
+const BLOCK_HEADS = ["height", "age", "interval", "in / out / kern", "fees", "bytes", "signed by", "work"];
+const blockTable = blocks => blocks.length ? table(BLOCK_HEADS, blockRows(blocks), [4, 5]) : h("div", { class: "empty" }, "no blocks yet");
+
+// ---------- pages ----------------------------------------------------------
+async function overview() {
+  const [s, recent, bonds] = await Promise.all([get("/state"), get("/explorer/blocks?count=100"), get("/explorer/bonds")]);
+  const blocks = recent.blocks;
+  const intervals = blocks.map(b => b.interval).filter(x => x != null).reverse();
+  const avg = intervals.length ? intervals.reduce((a, b) => a + b, 0) / intervals.length : null;
+  const bits = blocks.length ? blocks[0].difficulty_bits : 0;
+  const hashrate = avg ? Math.pow(2, bits) / Math.max(avg, 1) : null;
+  const supplyCell = cell("supply", coins(s.supply));
+  supplyCell.appendChild(meter(s.supply / s.max_supply));
+  const stats = h("div", { class: "grid" },
+    cell("height", num(s.height)),
+    cell("last block", ago(s.timestamp)),
+    supplyCell,
+    cell("block reward", coins(s.block_reward)),
+    cell("era · next halving", `${s.era} · ${s.next_halving_height ? num(s.next_halving_height) : "none"}`, true),
+    cell("difficulty", bits.toFixed(2) + " bits"),
+    cell("network rate", hashrate ? rate(hashrate) : "—", true),
+    cell("avg block time", avg ? dur(Math.round(avg)) + " (last " + intervals.length + ")" : "—", true),
+    cell("mempool", s.mempool_count + " tx · " + num(s.mempool_weight) + " wt", true),
+    cell("utxos / kernels", num(s.utxos) + " / " + num(s.kernels), true),
+    cell("peers", String(s.peers.length)),
+    cell("this node", (s.mining ? "mining" : "not mining") + (s.syncing ? ", syncing" : ""), true));
+  const charts = h("div", { class: "charts" },
+    h("div", { class: "chart" }, h("div", { class: "k" }, "block interval · last " + intervals.length + " · dashed = 60s"), intervalChart(intervals, 60)),
+    h("div", { class: "chart" }, h("div", { class: "k" }, "difficulty (bits) · last " + blocks.length), lineChart(blocks.map(b => b.difficulty_bits).reverse())));
+  view.replaceChildren(
+    section("Chain", "refreshes every 10s", stats, charts),
+    section("Latest blocks", h("a", { href: "#/blocks" }, "all blocks →"), blockTable(blocks.slice(0, 15))),
+    section("Mining bonds", h("a", { href: "#/bonds" }, "details →"), bondTable(bonds)));
+  schedule(overview, 10000);
 }
 
-function renderBonds(data) {
-  const box = document.getElementById("bonds");
-  box.textContent = "";
-  const bonds = data.bonds || [];
-  if (!bonds.length) {
-    box.appendChild(el("div", "err",
-      "no bonds registered yet" +
-      (data.bonded_mining_from !== null
-        ? " (required from height " + data.bonded_mining_from + ")" : "")));
-    return;
-  }
-  const table = el("table");
-  const head = el("tr");
-  ["bond", "mining key", "locked", "until", "eligible"].forEach(h => head.appendChild(el("th", null, h)));
-  table.appendChild(head);
-  for (const b of bonds) {
-    const row = el("tr");
-    const id = el("td", null, short(b.bond_id));
-    id.title = b.bond_id;
-    row.appendChild(id);
-    const key = el("td", "mono-dim", short(b.mining_key));
-    key.title = b.mining_key;
-    row.appendChild(key);
-    row.appendChild(el("td", null, (b.value / (1 << 30)).toFixed(4) + " gMDS"));
-    row.appendChild(el("td", "mono-dim", "midstate " + b.bonded_until.toLocaleString()));
-    row.appendChild(el("td", b.eligible_now ? "yes" : "no", b.eligible_now ? "yes" : "lock too short"));
-    table.appendChild(row);
-  }
-  box.appendChild(table);
+async function blocksPage(m) {
+  const before = m[1] ? Number(m[1]) : undefined;
+  const q = "/explorer/blocks?count=50" + (before != null ? "&before=" + before : "");
+  const r = await get(q);
+  const blocks = r.blocks;
+  const top = blocks.length ? blocks[0].height + 1 : 0, bottom = blocks.length ? blocks[blocks.length - 1].height : 0;
+  const newer = top < r.tip ? h("a", { class: "btn", href: top + 50 >= r.tip ? "#/blocks" : "#/blocks/" + (top + 50) }, "← newer") : h("span", { class: "btn off" }, "← newer");
+  const older = bottom > 0 ? h("a", { class: "btn", href: "#/blocks/" + bottom }, "older →") : h("span", { class: "btn off" }, "older →");
+  view.replaceChildren(
+    h("div", { class: "title" }, h("h1", null, "Blocks"), h("span", { class: "dim" }, blocks.length ? `${num(bottom)} – ${num(top - 1)} of ${num(r.tip)}` : ""), h("div", { class: "pager" }, newer, older)),
+    section("Blocks", null, blockTable(blocks)));
+  if (before == null) schedule(() => blocksPage(m), 10000);
 }
 
-async function refresh() {
-  const banner = document.getElementById("banner");
+function outputRows(outputs) {
+  return outputs.map(o => [
+    link("output", o.commitment, short(o.commitment, 16)),
+    o.unspent ? tag("ok", "unspent") : o.spent_height != null ? h("span", null, "spent in ", link("block", o.spent_height, num(o.spent_height))) : tag("native", "spent"),
+    h("span", { class: "dim", title: o.owner_key }, short(o.owner_key)),
+    o.payload_bytes + " B",
+  ]);
+}
+
+async function blockPage(m) {
+  const b = await get("/explorer/block/" + m[1]);
+  const prev = b.height > 0 ? h("a", { class: "btn", href: "#/block/" + (b.height - 1) }, "← " + num(b.height - 1)) : h("span", { class: "btn off" }, "←");
+  const next = b.next_hash ? h("a", { class: "btn", href: "#/block/" + (b.height + 1) }, num(b.height + 1) + " →") : h("span", { class: "btn off" }, "tip");
+  const cb = b.coinbase;
+  const parts = [
+    h("div", { class: "title" }, h("h1", null, "Block " + num(b.height)), h("span", { class: "dim" }, utc(b.timestamp) + " · " + ago(b.timestamp)), h("div", { class: "pager" }, prev, next)),
+    section("Header", b.confirmations + " confirmation" + (b.confirmations === 1 ? "" : "s"), dl([
+      ["hash", full(b.hash)],
+      ["previous", b.height > 0 ? link("block", b.height - 1, b.prev_hash) : full(b.prev_hash)],
+      ["next", b.next_hash ? link("block", b.height + 1, b.next_hash) : h("span", { class: "dim" }, "none yet")],
+      ["time", utc(b.timestamp) + (b.interval != null ? "  (+" + dur(b.interval) + " after previous)" : "")],
+      ["difficulty", b.difficulty_bits.toFixed(2) + " bits · " + num(b.work) + " expected attempts"],
+      ["nonce", num(b.nonce)],
+      ["size", num(b.size) + " bytes"],
+      ["state root", full(b.state_root)],
+      ["previous midstate", full(b.prev_midstate)],
+    ])),
+    section("Proof of work & signer", null, dl([
+      ["work", b.merged ? tag("merged", "merge-mined with midstate") : tag("native", "native")],
+      b.merged && ["midstate block", full(b.merged.midstate_block)],
+      b.merged && ["midstate time", utc(b.merged.midstate_timestamp)],
+      b.merged && ["commit", full(b.merged.commit_address) ],
+      ["signed by", b.miner ? link("bond", b.miner.bond_id, b.miner.bond_id) : h("span", { class: "dim" }, "unsigned")],
+      ...b.registrations.map(r => ["registers bond", h("span", null, link("bond", r.bond_id, short(r.bond_id, 16)),
+        h("span", { class: "dim" }, ` · ${coins(r.value)} MDS · locked to midstate ${num(r.bonded_until)} · ${r.headers} headers`))]),
+    ])),
+  ];
+  if (cb) {
+    parts.push(section("Coinbase", coins(b.reward + b.fees) + " = reward " + coins(b.reward) + " + fees " + coins(b.fees),
+      table(["output", "status", "owner key", "payload"], outputRows(cb.outputs)),
+      dl([
+        ["kernel", link("kernel", cb.kernel.excess, cb.kernel.excess)],
+        ["range proof", num(cb.range_proof_bytes) + " bytes for " + cb.outputs.length + " output" + (cb.outputs.length === 1 ? "" : "s")],
+        ["extra", cb.extra_text ? h("span", null, cb.extra_text, h("span", { class: "dim" }, "  (" + short(cb.extra, 16) + ")")) : full(cb.extra)],
+      ])));
+  }
+  parts.push(section("Inputs", b.inputs.length + " spent",
+    b.inputs.length ? table(["commitment", "created in", "owner key"], b.inputs.map(i => [
+      link("output", i.commitment, short(i.commitment, 16)),
+      i.created_height != null ? link("block", i.created_height, num(i.created_height)) : h("span", { class: "dim" }, "unknown"),
+      h("span", { class: "dim", title: i.owner_key }, short(i.owner_key)),
+    ])) : h("div", { class: "empty" }, "none")));
+  parts.push(section("Outputs", b.outputs.length + " created · " + b.output_groups.length + " range proof" + (b.output_groups.length === 1 ? "" : "s"),
+    b.outputs.length ? table(["commitment", "status", "owner key", "payload"], outputRows(b.outputs)) : h("div", { class: "empty" }, "none")));
+  parts.push(section("Kernels", b.kernels.length + " · fees " + coins(b.fees),
+    b.kernels.length ? table(["excess", "fee", "min height", "features"], b.kernels.map(k => [
+      link("kernel", k.excess, short(k.excess, 16)), coins(k.fee), k.min_height ? num(k.min_height) : h("span", { class: "dim" }, "—"),
+      typeof k.features === "string" ? k.features : JSON.stringify(k.features),
+    ]), [1]) : h("div", { class: "empty" }, "none"),
+    h("div", { class: "note" }, "This block's transactions are aggregated into one body: its inputs and outputs balance as a whole, and which input paid which output is not recorded anywhere. Offsets: kernel ", short(b.kernel_offset, 16), ", owner ", short(b.owner_offset, 16), ".")));
+  view.replaceChildren(...parts);
+}
+
+async function outputPage(m) {
+  const o = await get("/explorer/output/" + m[1]);
+  const immature = o.coinbase && o.unspent && o.matures_at > o.tip;
+  const status = o.unspent ? (immature ? tag("warn", "immature coinbase") : tag("ok", "unspent")) : tag("native", "spent");
+  view.replaceChildren(
+    h("div", { class: "title" }, h("h1", null, (o.coinbase ? "Coinbase output " : "Output ") + short(o.commitment, 12)), status),
+    section("Life", null, h("div", { class: "flow" },
+      h("div", { class: "step" }, h("div", { class: "k" }, "created"), link("block", o.created_height, "block " + num(o.created_height)),
+        h("div", { class: "dim" }, o.coinbase ? "as a coinbase output" : "by that block's transactions")),
+      h("div", { class: "arrow" }, "→"),
+      h("div", { class: "step" }, h("div", { class: "k" }, o.unspent ? "unspent" : "spent"),
+        o.unspent ? h("span", null, o.coinbase ? (immature ? "matures at block " + num(o.matures_at) : "mature since block " + num(o.matures_at)) : "in the UTXO set")
+                  : o.spent_height != null ? link("block", o.spent_height, "block " + num(o.spent_height)) : h("span", { class: "dim" }, "spent (block not indexed)"),
+        h("div", { class: "dim" }, o.unspent ? (o.tip - o.created_height) + " blocks old" : o.spent_height != null ? "after " + num(o.spent_height - o.created_height) + " blocks" : "")))),
+    section("Output", null, dl([
+      ["commitment", full(o.commitment)],
+      ["owner key", full(o.owner_key)],
+      ["ephemeral key", full(o.ephemeral_key)],
+      ["view tag", String(o.view_tag)],
+      ["recovery commitment", full(o.recovery_commitment)],
+      ["encrypted payload", o.payload_bytes + " bytes"],
+      ["created in", link("block", o.created_height, o.created_hash)],
+      o.spent_hash && ["spent in", link("block", o.spent_height, o.spent_hash)],
+    ]), h("div", { class: "note" }, "The amount is hidden in the commitment; only the recipient's keys can open the payload. A spent output can be followed to the block that spent it, but not to the outputs that block created: aggregation removes that link.")));
+}
+
+async function kernelPage(m) {
+  const k = await get("/explorer/kernel/" + m[1]);
+  view.replaceChildren(
+    h("div", { class: "title" }, h("h1", null, (k.coinbase ? "Coinbase kernel " : "Kernel ") + short(k.excess, 12))),
+    section("Kernel", null, dl([
+      ["block", link("block", k.height, "block " + num(k.height) + " · " + short(k.hash, 16))],
+      ["fee", coins(k.fee)],
+      ["features", typeof k.features === "string" ? k.features : JSON.stringify(k.features)],
+      ["min height", k.min_height ? num(k.min_height) : "—"],
+      ["excess", full(k.excess)],
+      ["owner excess", full(k.owner_excess)],
+    ]), h("div", { class: "note" }, "A kernel is what remains of a transaction once its block aggregates it: it proves the transaction balanced and pays the fee, without saying which inputs or outputs were its own.")));
+}
+
+function bondTable(r) {
+  const w = r.window;
+  if (!r.bonds.length) return h("div", { class: "empty" }, "no bonds registered");
+  return h("div", null, table(["bond", "value (MDS)", "locked to", "eligible", "window · cap " + num(w.cap) + " of " + num(w.size), "blocks signed"],
+    r.bonds.map(b => {
+      const share = b.window_signed / Math.max(w.cap, 1);
+      return [
+        link("bond", b.bond_id, short(b.bond_id, 14)),
+        b.value != null ? coins(b.value) : "—",
+        b.bonded_until != null ? num(b.bonded_until) : "—",
+        b.eligible_now ? h("span", { style: "color: var(--green)" }, "yes") : h("span", { style: "color: var(--amber)" }, "no"),
+        h("div", { style: "min-width: 170px" }, num(b.window_signed) + " / " + num(w.cap) + (share >= 1 ? "  over cap" : ""), meter(share, share >= 1)),
+        num(b.blocks_signed),
+      ];
+    }), [5]),
+    h("div", { class: "note" }, "Fork choice counts a bond's blocks at full weight up to its cap over the last " + num(w.size) + " blocks; past the cap they stay valid and pay, but add 1/1024 of their work. The cap is an equal share among eligible bonds, never below 1/20."));
+}
+
+async function bondsPage() {
+  const r = await get("/explorer/bonds");
+  view.replaceChildren(h("div", { class: "title" }, h("h1", null, "Mining bonds"), h("span", { class: "dim" }, r.bonds.length + " registered · window " + num(r.window.filled) + " / " + num(r.window.size) + " blocks")),
+    section("Bonds", null, bondTable(r)));
+}
+
+async function bondPage(m) {
+  const b = await get("/explorer/bond/" + m[1]);
+  const share = b.window_signed / Math.max(b.window.cap, 1);
+  view.replaceChildren(
+    h("div", { class: "title" }, h("h1", null, "Bond " + short(b.bond_id, 12)), b.eligible_now ? tag("ok", "eligible") : tag("warn", b.value == null ? "not registered" : "not eligible")),
+    section("Quota", "fork-choice window", h("div", { class: "grid" },
+      (() => { const c = cell("signed in window", num(b.window_signed) + " / " + num(b.window.cap)); c.appendChild(meter(share, share >= 1)); return c; })(),
+      cell("window", num(b.window.filled) + " of " + num(b.window.size) + " blocks", true),
+      cell("blocks signed", num(b.blocks_signed)),
+      cell("last signed", b.last_signed != null ? link("block", b.last_signed, num(b.last_signed)) : "—", true))),
+    section("Bond", null, dl([
+      ["bond id (midstate coin)", full(b.bond_id)],
+      ["mining key", b.mining_key ? full(b.mining_key) : "—"],
+      ["value", b.value != null ? coins(b.value) + " MDS" : "—"],
+      ["locked until", b.bonded_until != null ? "midstate height " + num(b.bonded_until) : "—"],
+      ["registered in", b.registered_height != null ? link("block", b.registered_height, "block " + num(b.registered_height)) : "—"],
+    ])),
+    section("Recent blocks", b.recent_blocks.length ? "newest " + b.recent_blocks.length : null,
+      b.recent_blocks.length ? h("div", { class: "empty" }, b.recent_blocks.map((x, i) => [i ? " · " : null, link("block", x, num(x))])) : h("div", { class: "empty" }, "none yet")));
+}
+
+// ---------- routing, refresh, search ---------------------------------------
+let timer = null, generation = 0;
+function schedule(fn, ms) {
+  const mine = generation;
+  clearTimeout(timer);
+  timer = setTimeout(() => { if (mine === generation) fn().catch(() => {}); }, ms);
+}
+const routes = [
+  [/^#?\/?$/, overview],
+  [/^#\/blocks(?:\/(\d+))?$/, blocksPage],
+  [/^#\/block\/(\d+|[0-9a-fA-F]{64})$/, blockPage],
+  [/^#\/output\/([0-9a-fA-F]{64})$/, outputPage],
+  [/^#\/kernel\/([0-9a-fA-F]{64})$/, kernelPage],
+  [/^#\/bonds$/, bondsPage],
+  [/^#\/bond\/([0-9a-fA-F]{64})$/, bondPage],
+];
+async function route() {
+  generation++;
+  clearTimeout(timer);
+  const hash = location.hash || "#/";
+  const found = routes.find(([re]) => re.test(hash));
+  window.scrollTo(0, 0);
+  if (!found) { view.replaceChildren(section("Not found", null, h("div", { class: "empty" }, "No page at " + hash + "."))); return; }
+  try { await found[1](hash.match(found[0])); }
+  catch (e) { view.replaceChildren(section("Nothing here", null, h("div", { class: "empty" }, e.message))); }
+}
+document.getElementById("search").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const q = document.getElementById("q").value.trim();
+  if (!q) return;
   try {
-    const state = await get("/state");
-    const bonds = await get("/bonds");
-    const start = Math.max(1, state.height - 25);
-    const count = Math.max(0, state.height - start);
-    const miners = count ? await get("/miners/" + start + "/" + count) : { blocks: [] };
-    renderChain(state);
-    renderBlocks(miners.blocks, bonds.bonds || []);
-    renderBonds(bonds);
-    banner.textContent = state.peer_id ? "NODE " + short(state.peer_id) : "";
-    banner.className = "sub";
-  } catch (e) {
-    banner.textContent = "cannot reach this node: " + e.message;
-    banner.className = "sub no";
-  }
-}
-
-refresh();
-setInterval(refresh, 5000);
+    const r = await get("/explorer/search/" + encodeURIComponent(q));
+    document.getElementById("q").value = "";
+    location.hash = "#/" + r.kind + "/" + r.id;
+  } catch (e) { flash(e.message); }
+});
+window.addEventListener("hashchange", route);
+route();
 </script>
 </body>
 </html>

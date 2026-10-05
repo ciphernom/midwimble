@@ -26,6 +26,8 @@ pub mod pool;
 #[cfg(feature = "node")]
 pub mod rpc;
 #[cfg(feature = "node")]
+pub mod explorer;
+#[cfg(feature = "node")]
 pub mod storage;
 #[cfg(feature = "node")]
 pub mod sync;
