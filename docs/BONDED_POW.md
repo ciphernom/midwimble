@@ -294,8 +294,10 @@ that stay valid and pay, but add only 1/1024 of their work. So:
   of its blocks to count in full: 6 bonds at 30%.
 
 While the network has fewer than 20 eligible bonds, they share the window
-equally, and a lone producer is uncapped. The window is not part of the state
-root: nodes rebuild it from their stored blocks.
+equally, and a lone producer is uncapped. The window is the last 1,440 blocks,
+the new one included. It is not part of the state root: nodes rebuild it from
+their stored blocks. Cumulative work, which checkpoints and anchors measure, is
+unchanged; fork choice compares it less the work the cap withheld.
 
 A registration must lock at least `MIN_MINING_BOND`, and no further than a year
 (`MAX_BOND_HORIZON`) past the block's estimated midstate height, so a forged

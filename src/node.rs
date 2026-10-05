@@ -2288,7 +2288,7 @@ impl Node {
                 }
             } else {
                 b.staged.extend(applied);
-                let heavier = new_state.depth > self.state.depth
+                let heavier = new_state.weight() > self.state.weight()
                     && choose_best_state(&self.state, &new_state).mw_midstate
                         == new_state.mw_midstate;
                 if heavier {

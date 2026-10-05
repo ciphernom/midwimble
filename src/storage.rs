@@ -50,6 +50,12 @@ const GROUPS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("output_group
 const MEMBERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("group_members");
 const UNDO: TableDefinition<u64, &[u8]> = TableDefinition::new("undo");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+/// Each block's signer (bond id; empty if unsigned). Never pruned: the
+/// fork-choice window needs signers after their bodies are gone.
+const SIGNERS: TableDefinition<u64, &[u8]> = TableDefinition::new("signers");
+/// Work the per-bond cap has withheld, as of each block. A missing entry is
+/// 0: no block stored before the cap existed was capped.
+const CAPPED: TableDefinition<u64, &[u8]> = TableDefinition::new("capped");
 const SYNC_HEADERS: TableDefinition<u64, &[u8]> = TableDefinition::new("sync_headers");
 const PEERS: TableDefinition<&str, &[u8]> = TableDefinition::new("peers");
 
@@ -196,6 +202,20 @@ fn enc<T: Serialize>(v: &T) -> Result<Vec<u8>> {
     Ok(bincode::serialize(v)?)
 }
 
+fn signer_to_log(signer: Option<[u8; 32]>) -> Vec<u8> {
+    signer.map_or_else(Vec::new, |id| id.to_vec())
+}
+
+fn signer_from_log(bytes: &[u8]) -> Option<[u8; 32]> {
+    bytes.try_into().ok()
+}
+
+/// The signer of a stored block body (for blocks stored before the signer log).
+fn signer_of_block(bytes: &[u8]) -> Result<Option<[u8; 32]>> {
+    let batch: Batch = bincode::deserialize(bytes)?;
+    Ok(batch.miner.map(|m| m.bond_id))
+}
+
 fn load_header_range(
     db: &Database,
     def: TableDefinition<u64, &[u8]>,
@@ -229,6 +249,8 @@ impl Storage {
             txn.open_table(META)?;
             txn.open_table(SYNC_HEADERS)?;
             txn.open_table(PEERS)?;
+            txn.open_table(SIGNERS)?;
+            txn.open_table(CAPPED)?;
         }
         txn.commit()?;
         Ok(Self { db: Arc::new(db) })
@@ -390,6 +412,7 @@ impl Storage {
             bonds: meta.bonds.clone(),
             recent_signers: Default::default(),
             signer_counts: Default::default(),
+            capped: 0,
             utxos,
             utxo_set: UtxoAccumulator::from_canonical_coins(leaves, true),
             kernels: UtxoAccumulator::from_canonical_coins(kernel_ids, true),
@@ -413,6 +436,7 @@ impl Storage {
         state
             .chain_mmr
             .append(&tip_header.extension.final_hash, true);
+        state.capped = self.capped_before(state.height)?;
         self.rebuild_signer_window(&mut state)?;
         Ok(Some(state))
     }
@@ -461,6 +485,7 @@ impl Storage {
             state.bonds = p.bonds;
         }
         state.chain_mmr = current.chain_mmr.truncated(height);
+        state.capped = self.capped_before(height)?;
         self.rebuild_signer_window(&mut state)?;
         Ok(state)
     }
@@ -471,12 +496,34 @@ impl Storage {
     fn rebuild_signer_window(&self, state: &mut State) -> Result<()> {
         let end = state.height;
         let start = end.saturating_sub(crate::core::bond::CAP_WINDOW as u64);
+        let txn = self.db.begin_read()?;
+        let log = txn.open_table(SIGNERS)?;
+        let blocks = txn.open_table(BATCHES)?;
         let mut signers = Vec::with_capacity((end - start) as usize);
         for h in start..end {
-            signers.push(self.load_batch(h)?.and_then(|b| b.miner.map(|m| m.bond_id)));
+            signers.push(match log.get(h)? {
+                Some(v) => signer_from_log(v.value()),
+                None => match blocks.get(h)? {
+                    Some(v) => signer_of_block(v.value())?,
+                    None => None,
+                },
+            });
         }
         crate::core::bond::rebuild_signer_window(state, signers);
         Ok(())
+    }
+
+    /// Work the per-bond cap withheld from blocks `0..height`.
+    fn capped_before(&self, height: u64) -> Result<u128> {
+        let Some(last) = height.checked_sub(1) else {
+            return Ok(0);
+        };
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(CAPPED)?;
+        Ok(match table.get(last)? {
+            Some(v) => bincode::deserialize(v.value())?,
+            None => 0,
+        })
     }
 
     /// Replaces every block at or above `first_height` with `batches`, whose
@@ -513,6 +560,8 @@ impl Storage {
             let mut members = txn.open_table(MEMBERS)?;
             let mut undo_table = txn.open_table(UNDO)?;
             let mut meta_table = txn.open_table(META)?;
+            let mut signer_log = txn.open_table(SIGNERS)?;
+            let mut capped_table = txn.open_table(CAPPED)?;
 
             let stored: Option<StateMeta> = match meta_table.get("state_meta")? {
                 Some(v) => Some(bincode::deserialize(v.value())?),
@@ -558,8 +607,33 @@ impl Storage {
                 }
                 blocks.remove(h)?;
                 headers.remove(h)?;
+                signer_log.remove(h)?;
+                capped_table.remove(h)?;
                 meta = undo.prev;
             }
+
+            // The fork-choice window below the first new block, rebuilt as the
+            // node rebuilds its own, so each block is weighed as the node did.
+            let mut recent: im::Vector<Option<[u8; 32]>> = im::Vector::new();
+            let mut counts: im::HashMap<[u8; 32], u32> = im::HashMap::new();
+            let window_start = first_height.saturating_sub(crate::core::bond::CAP_WINDOW as u64);
+            for h in window_start..first_height {
+                let signer = match signer_log.get(h)? {
+                    Some(v) => signer_from_log(v.value()),
+                    None => match blocks.get(h)? {
+                        Some(v) => signer_of_block(v.value())?,
+                        None => None,
+                    },
+                };
+                crate::core::bond::credit_in_window(&mut recent, &mut counts, &meta.bonds, signer, 0, 0);
+            }
+            let mut capped: u128 = match first_height.checked_sub(1) {
+                Some(last) => match capped_table.get(last)? {
+                    Some(v) => bincode::deserialize(v.value())?,
+                    None => 0,
+                },
+                None => 0,
+            };
 
             // 2. Apply the new blocks' diffs.
             for (i, batch) in batches.iter().enumerate() {
@@ -656,6 +730,19 @@ impl Storage {
                 }
 
                 let next = meta.advance(batch)?;
+                let signer = batch.miner.as_ref().map(|auth| auth.bond_id);
+                let work = calculate_work(&batch.target);
+                let credited = crate::core::bond::credit_in_window(
+                    &mut recent,
+                    &mut counts,
+                    &next.bonds,
+                    signer,
+                    work,
+                    batch.timestamp,
+                );
+                capped = capped.saturating_add(work - credited);
+                signer_log.insert(height, signer_to_log(signer).as_slice())?;
+                capped_table.insert(height, enc(&capped)?.as_slice())?;
                 let undo = BlockUndo {
                     spent,
                     created,
@@ -677,6 +764,9 @@ impl Storage {
             // 3. The result must be exactly the caller's state.
             if meta != StateMeta::of(state) {
                 bail!("commit_chain: stored diffs disagree with the supplied state");
+            }
+            if capped != state.capped {
+                bail!("commit_chain: replayed fork-choice weight disagrees with the supplied state");
             }
             meta_table.insert("state_meta", enc(&meta)?.as_slice())?;
 
@@ -1018,6 +1108,115 @@ mod tests {
     use crate::core::state::apply_batch;
     use crate::core::template::build_template;
     use crate::core::types::COINBASE_MATURITY;
+
+    /// A producer signing with its own devnet bond, registered in its first block.
+    fn devnet_bond(seed: &[u8], target: &[u8; 32]) -> crate::core::bond::MinerBond {
+        use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
+        let secret = Scalar::from_bytes_mod_order(crate::core::types::hash(seed));
+        let mining_key = RistrettoPoint::mul_base(&secret).compress().to_bytes();
+        let until = crate::core::bond::est_midstate_height(crate::core::types::GENESIS_TIMESTAMP)
+            + crate::core::bond::MAX_BOND_HORIZON / 2;
+        let registration = crate::core::bond::devnet_registration(
+            mining_key,
+            until,
+            crate::core::types::hash(seed),
+            target,
+        );
+        crate::core::bond::MinerBond {
+            secret,
+            bond_id: registration.bond_id(),
+            registration: Some(registration),
+            co_bonds: Vec::new(),
+        }
+    }
+
+    /// Mines a block signed by `bond` and commits it, as the node does.
+    fn mine_signed(
+        storage: &Storage,
+        state: &mut State,
+        ts: &mut Vec<u64>,
+        to: &StealthAddress,
+        bond: &crate::core::bond::MinerBond,
+    ) {
+        let (template, _) = crate::core::template::build_template_bonded(
+            state,
+            ts,
+            &[],
+            &[(to.clone(), 1)],
+            [0; 32],
+            // On schedule, so difficulty holds at the genesis target and a
+            // block's work is large enough for the cap to withhold most of it.
+            Some(crate::core::types::GENESIS_TIMESTAMP + 60 * state.height),
+            Some(bond),
+        )
+        .unwrap();
+        let b = template.mine_blocking();
+        apply_batch(state, &b, ts).unwrap();
+        ts.push(b.timestamp);
+        storage.commit_chain(state.height - 1, std::slice::from_ref(&b), state).unwrap();
+    }
+
+    fn fresh(dir: &std::path::Path) -> (Storage, State, Vec<u64>) {
+        let storage = Storage::open(dir).unwrap();
+        let mut state = State::genesis();
+        apply_batch(&mut state, Batch::genesis(), &[]).unwrap();
+        storage.commit_chain(0, std::slice::from_ref(Batch::genesis()), &state).unwrap();
+        (storage, state, vec![Batch::genesis().timestamp])
+    }
+
+    /// The testnet's failure: a lone producer, one full window after a restart,
+    /// had its next block refused by storage. It must mine straight through.
+    #[test]
+    fn a_lone_bond_mines_past_a_full_window_and_through_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut state, mut ts) = fresh(dir.path());
+        let to = WalletKeys::random().address();
+        let bond = devnet_bond(b"lone", &state.target);
+        for _ in 0..2 * crate::core::bond::CAP_WINDOW {
+            mine_signed(&storage, &mut state, &mut ts, &to, &bond);
+        }
+        assert_eq!(state.capped, 0, "a lone producer is never capped");
+        drop(storage);
+
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut loaded = storage.load_state().unwrap().unwrap();
+        assert_eq!((loaded.depth, loaded.capped), (state.depth, state.capped));
+        assert_eq!(loaded.signer_counts, state.signer_counts);
+        for _ in 0..3 {
+            mine_signed(&storage, &mut loaded, &mut ts, &to, &bond);
+        }
+        assert_eq!(loaded.capped, 0);
+    }
+
+    /// Two bonds, one far over its cap: storage replays the same weight the
+    /// node computed, and a restart or a rewind restores it.
+    #[test]
+    fn storage_weighs_over_cap_blocks_exactly_as_the_node_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut state, mut ts) = fresh(dir.path());
+        let to = WalletKeys::random().address();
+        let a = devnet_bond(b"bond a", &state.target);
+        let b = devnet_bond(b"bond b", &state.target);
+        mine_signed(&storage, &mut state, &mut ts, &to, &a);
+        mine_signed(&storage, &mut state, &mut ts, &to, &b);
+        let mut history = Vec::new();
+        for _ in 0..crate::core::bond::CAP_WINDOW {
+            mine_signed(&storage, &mut state, &mut ts, &to, &a);
+            history.push((state.height, state.capped));
+        }
+        assert!(state.capped > 0, "bond a went over its cap");
+        assert!(state.weight() < state.depth);
+        drop(storage);
+
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut loaded = storage.load_state().unwrap().unwrap();
+        assert_eq!((loaded.depth, loaded.capped), (state.depth, state.capped));
+        for &(height, capped) in &history {
+            assert_eq!(storage.state_at(&loaded, height).unwrap().capped, capped, "height {height}");
+        }
+        mine_signed(&storage, &mut loaded, &mut ts, &to, &b);
+        mine_signed(&storage, &mut loaded, &mut ts, &to, &a);
+    }
 
     fn mine(
         state: &mut State,
