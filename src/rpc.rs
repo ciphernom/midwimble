@@ -39,6 +39,8 @@ fn bad(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
 
 pub fn router(node: NodeHandle) -> Router {
     Router::new()
+        .route("/", get(explorer))
+        .route("/logo.svg", get(logo))
         .route("/state", get(state))
         .route("/blocks/{start}/{count}", get(blocks))
         .route("/bonds", get(bonds))
@@ -143,6 +145,20 @@ async fn miners(
         })
         .collect();
     Ok(Json(json!({ "start": start, "blocks": blocks })))
+}
+
+/// This node's own block explorer: one self-contained page, served from the
+/// binary, reading the endpoints below. No fonts, scripts or images come from
+/// anywhere else, so it works on a machine with no internet at all.
+async fn logo() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "image/svg+xml")],
+        include_str!("../docs/assets/midwimble-logo.svg"),
+    )
+}
+
+async fn explorer() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("explorer.html"))
 }
 
 async fn state(AxState(node): AxState<NodeHandle>) -> Json<Value> {
