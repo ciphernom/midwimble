@@ -10,22 +10,19 @@
     "in here and publish it."
   ],
   "network": "MIDWIMBLE_TESTNET_V1",
-  "launched": null,
-
-  "bitcoin_height": null,
-  "bitcoin_hash": null,
-  "bitcoin_time": null,
-
-  "midstate_height": null,
-  "midstate_hash": null,
-
-  "genesis_time": null,
-  "genesis_target": null,
-  "genesis_block": null,
-
+  "launched": "2026-10-05",
+  "bitcoin_height": 970015,
+  "bitcoin_hash": "0000000000000000000040c857e566e33db423ecc6ccc06d0ea0ae9bc332e7ab",
+  "bitcoin_time": 1791201787,
+  "midstate_height": 317982,
+  "midstate_hash": "0000030d24c024652a5498ad326ee14f4999c08989a638235938a2909730548c",
+  "genesis_time": 1791202464,
+  "genesis_target": "000131f49bffffffffffffffffffffffffffffffffffffffffffffffffffff9c",
+  "genesis_block": "29c2742de1c3d8c9826d7a2501bf56c69546abfb8608d1c19384851a18db35d9",
   "min_bond": 16777216,
   "bond_lock_days": 2,
-
-  "seeds": [],
+  "seeds": [
+    "/ip4/134.199.148.215/tcp/9433/p2p/12D3KooWCvjd2SBokjWMH712NXNFWHKr7kJAeBsUQ447LHk7wrzu"
+  ],
   "faucet": null
 }
