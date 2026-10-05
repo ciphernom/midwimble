@@ -575,6 +575,14 @@ pub struct State {
     /// Registered mining bonds, by bond id (`core/bond.rs`).
     #[serde(default)]
     pub bonds: im::HashMap<[u8; 32], BondEntry>,
+    /// Signers of the last `bond::CAP_WINDOW` blocks, oldest first (`None`
+    /// for an unsigned block), and how many of them each bond signed. Not in
+    /// the state root: it only weights fork choice (`bond::credit_work`), and
+    /// storage rebuilds it from the stored blocks.
+    #[serde(skip)]
+    pub recent_signers: im::Vector<Option<[u8; 32]>>,
+    #[serde(skip)]
+    pub signer_counts: im::HashMap<[u8; 32], u32>,
 }
 
 impl State {
@@ -594,6 +602,8 @@ impl State {
         Self {
             mw_midstate: initial,
             bonds: im::HashMap::new(),
+            recent_signers: Default::default(),
+            signer_counts: Default::default(),
             utxos: im::HashMap::new(),
             utxo_set: UtxoAccumulator::new(),
             kernels: UtxoAccumulator::new(),
