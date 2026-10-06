@@ -561,8 +561,12 @@ pub struct State {
     pub total_kernel_offset: Scalar32,
     /// Coins minted so far.
     pub supply: u64,
-    /// Cumulative proof-of-work.
+    /// Cumulative proof-of-work: what checkpoints and anchors measure.
     pub depth: u128,
+    /// The part of `depth` fork choice leaves out: the work the per-bond cap
+    /// withheld from over-cap blocks (`bond::credit_work`). See [`State::weight`].
+    #[serde(default)]
+    pub capped: u128,
     /// Target the next block must meet.
     pub target: [u8; 32],
     pub height: u64,
@@ -586,6 +590,12 @@ pub struct State {
 }
 
 impl State {
+    /// What fork choice compares: cumulative work, less what the per-bond
+    /// cap withheld.
+    pub fn weight(&self) -> u128 {
+        self.depth.saturating_sub(self.capped)
+    }
+
     /// The state before genesis is applied.
     pub fn genesis() -> Self {
         let anchor = network_anchor();
@@ -604,6 +614,7 @@ impl State {
             bonds: im::HashMap::new(),
             recent_signers: Default::default(),
             signer_counts: Default::default(),
+            capped: 0,
             utxos: im::HashMap::new(),
             utxo_set: UtxoAccumulator::new(),
             kernels: UtxoAccumulator::new(),

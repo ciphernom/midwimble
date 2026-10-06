@@ -532,7 +532,8 @@ fn apply_batch_internal(
     let signer = batch.miner.as_ref().map(|auth| auth.bond_id);
     let work = calculate_work(&batch.target);
     let credited = super::bond::credit_work(&mut next, signer, work, batch.timestamp);
-    next.depth = next.depth.saturating_add(credited);
+    next.depth = next.depth.saturating_add(work);
+    next.capped = next.capped.saturating_add(work - credited);
     next.height = height + 1;
     next.timestamp = batch.timestamp;
     next.target = calculate_target(next.height, next.timestamp);
@@ -542,7 +543,7 @@ fn apply_batch_internal(
 
 /// Fork choice: most cumulative work, then the lower midstate (midstate).
 pub fn choose_best_state<'a>(a: &'a State, b: &'a State) -> &'a State {
-    match a.depth.cmp(&b.depth) {
+    match a.weight().cmp(&b.weight()) {
         std::cmp::Ordering::Greater => a,
         std::cmp::Ordering::Less => b,
         std::cmp::Ordering::Equal => {

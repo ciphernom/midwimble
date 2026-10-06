@@ -797,10 +797,17 @@ pub fn bond_proof_from_json(coin: BondCoin, v: &serde_json::Value) -> Result<Bon
 /// only `1 / OVER_CAP_WORK_DIVISOR` of their work, so a chain outweighs another
 /// only with enough bonds behind its hashrate: a pool's capacity scales with
 /// the bonds co-signed to its mining key.
+#[cfg(not(feature = "fast-mining"))]
 pub const CAP_WINDOW: usize = 24 * 60;
+/// Test and devnet builds use a small window, so the cap is reachable.
+#[cfg(feature = "fast-mining")]
+pub const CAP_WINDOW: usize = 16;
 /// With at least this many eligible bonds, each may sign `1 / CAP_K` of the
 /// window at full weight; with fewer, they share it equally.
+#[cfg(not(feature = "fast-mining"))]
 pub const CAP_K: usize = 20;
+#[cfg(feature = "fast-mining")]
+pub const CAP_K: usize = 4;
 pub const OVER_CAP_WORK_DIVISOR: u128 = 1024;
 /// How far past the block's estimated midstate height a registration may lock
 /// its coin, so a forged registration expires instead of holding a quota slot
@@ -817,41 +824,61 @@ pub fn signer_cap(bonds: &im::HashMap<[u8; 32], BondEntry>, block_timestamp: u64
 }
 
 /// Records a block's signer in the fork-choice window and returns the work the
-/// block adds to its chain's weight: all of it within the bond's cap, a sliver
-/// beyond (never zero, so a longer chain is always heavier).
+/// block adds to its chain's weight: all of it while the bond has signed at
+/// most `signer_cap` of the last `CAP_WINDOW` blocks, this one included, and a
+/// sliver beyond that (never zero, so a longer chain is always a heavier one).
 pub fn credit_work(
     state: &mut super::types::State,
     signer: Option<[u8; 32]>,
     work: u128,
     block_timestamp: u64,
 ) -> u128 {
-    let credited = match signer {
-        Some(id)
-            if state.signer_counts.get(&id).copied().unwrap_or(0) as usize
-                >= signer_cap(&state.bonds, block_timestamp) =>
-        {
-            (work / OVER_CAP_WORK_DIVISOR).max(1)
-        }
-        _ => work,
-    };
-    state.recent_signers.push_back(signer);
+    credit_in_window(
+        &mut state.recent_signers,
+        &mut state.signer_counts,
+        &state.bonds,
+        signer,
+        work,
+        block_timestamp,
+    )
+}
+
+/// [`credit_work`] on a bare window. Storage replays blocks onto its own
+/// records and must weigh each one exactly as the node did.
+pub fn credit_in_window(
+    recent: &mut im::Vector<Option<[u8; 32]>>,
+    counts: &mut im::HashMap<[u8; 32], u32>,
+    bonds: &im::HashMap<[u8; 32], BondEntry>,
+    signer: Option<[u8; 32]>,
+    work: u128,
+    block_timestamp: u64,
+) -> u128 {
+    recent.push_back(signer);
     if let Some(id) = signer {
-        let count = state.signer_counts.get(&id).copied().unwrap_or(0);
-        state.signer_counts.insert(id, count + 1);
+        let count = counts.get(&id).copied().unwrap_or(0);
+        counts.insert(id, count + 1);
     }
-    while state.recent_signers.len() > CAP_WINDOW {
-        if let Some(Some(old)) = state.recent_signers.pop_front() {
-            match state.signer_counts.get(&old).copied() {
+    while recent.len() > CAP_WINDOW {
+        if let Some(Some(old)) = recent.pop_front() {
+            match counts.get(&old).copied() {
                 Some(count) if count > 1 => {
-                    state.signer_counts.insert(old, count - 1);
+                    counts.insert(old, count - 1);
                 }
                 _ => {
-                    state.signer_counts.remove(&old);
+                    counts.remove(&old);
                 }
             }
         }
     }
-    credited
+    match signer {
+        Some(id)
+            if counts.get(&id).copied().unwrap_or(0) as usize
+                > signer_cap(bonds, block_timestamp) =>
+        {
+            (work / OVER_CAP_WORK_DIVISOR).max(1)
+        }
+        _ => work,
+    }
 }
 
 /// Rebuilds the window from the signers of the blocks before `state`, oldest
@@ -929,6 +956,24 @@ mod cap_tests {
         few.insert([2; 32], BondEntry { bonded_until: 0, ..eligible_bond() });
         few.insert([3; 32], BondEntry { value: MIN_MINING_BOND / 2, ..eligible_bond() });
         assert_eq!(signer_cap(&few, 0), CAP_WINDOW);
+    }
+
+    /// A lone producer's window is all its own blocks, and that is its cap:
+    /// it must never be weighed down by itself (the bug that stopped the
+    /// testnet's only miner one window after a restart).
+    #[test]
+    fn a_lone_producer_is_never_capped() {
+        let mut state = super::super::types::State::genesis();
+        state.bonds.insert([1; 32], eligible_bond());
+        let work = 1u128 << 40;
+        for _ in 0..3 * CAP_WINDOW {
+            assert_eq!(credit_work(&mut state, Some([1; 32]), work, 0), work);
+        }
+        assert_eq!(state.signer_counts[&[1; 32]] as usize, CAP_WINDOW);
+        // A window rebuilt full of its blocks (a restart) still credits in full.
+        let signers = vec![Some([1u8; 32]); CAP_WINDOW];
+        rebuild_signer_window(&mut state, signers);
+        assert_eq!(credit_work(&mut state, Some([1; 32]), work, 0), work);
     }
 
     #[test]

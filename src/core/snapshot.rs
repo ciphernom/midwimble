@@ -231,6 +231,7 @@ impl Snapshot {
             bonds: self.bonds.iter().copied().collect(),
             recent_signers: Default::default(),
             signer_counts: Default::default(),
+            capped: 0,
             mw_midstate: tip.post_tx_midstate,
             utxos,
             utxo_set,
