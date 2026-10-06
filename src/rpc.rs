@@ -58,6 +58,14 @@ pub fn router(node: NodeHandle) -> Router {
         .route("/finality", get(finality))
         .route("/mining/template", post(mining_template))
         .route("/mining/submit", post(mining_submit))
+        .route("/explorer/blocks", get(crate::explorer::blocks))
+        .route("/explorer/block/{id}", get(crate::explorer::block))
+        .route("/explorer/output/{commitment}", get(crate::explorer::output))
+        .route("/explorer/kernel/{excess}", get(crate::explorer::kernel))
+        .route("/explorer/bonds", get(crate::explorer::bonds))
+        .route("/explorer/bond/{id}", get(crate::explorer::bond))
+        .route("/explorer/search/{q}", get(crate::explorer::search))
+        .layer(axum::Extension(crate::explorer::SharedIndex::default()))
         .with_state(node)
 }
 

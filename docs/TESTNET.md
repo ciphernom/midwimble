@@ -64,6 +64,27 @@ midwimble node --data-dir ~/midwimble-testnet --listen /ip4/0.0.0.0/tcp/9433 \
 
 The testnet's seed runs on the same host as midstate's bootstrap node.
 
+## The explorer
+
+Every node serves a block explorer at its RPC address: open
+`http://127.0.0.1:9434/` on the machine running it. It follows an output from
+the block that created it to the block that spent it, and shows each bond's
+share of the fork-choice window. Its data is plain JSON under `/explorer/`.
+
+To publish a seed's explorer, forward only `GET` requests for `/`,
+`/logo.svg`, `/state` and `/explorer/`. The RPC port also accepts transactions
+and mining requests, which should stay local. With nginx:
+
+```nginx
+location ~ ^/(explorer/.*|state|logo\.svg)?$ {
+    limit_except GET { deny all; }
+    proxy_pass http://127.0.0.1:9434;
+}
+```
+
+The first explorer request after a node starts reads every stored block to
+build its index; after that, each request reads only the blocks that are new.
+
 ## Launching it (for whoever starts the testnet)
 
 ```sh
