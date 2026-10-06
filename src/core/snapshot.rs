@@ -229,6 +229,8 @@ impl Snapshot {
         let tip = self.headers.last().expect("checked");
         let state = State {
             bonds: self.bonds.iter().copied().collect(),
+            recent_signers: Default::default(),
+            signer_counts: Default::default(),
             mw_midstate: tip.post_tx_midstate,
             utxos,
             utxo_set,

@@ -1101,6 +1101,7 @@ mod tests {
         // mining real midstate headers, so the bond is put straight into the
         // state instead: a template needs nothing else.
         let bond = MinerBond {
+            co_bonds: Vec::new(),
             secret: curve25519_dalek::scalar::Scalar::from_bytes_mod_order(hash(b"pool audit")),
             bond_id: hash(b"pool audit bond"),
             registration: None,

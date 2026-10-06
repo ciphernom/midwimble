@@ -388,6 +388,8 @@ impl Storage {
         let mut state = State {
             mw_midstate: meta.mw_midstate,
             bonds: meta.bonds.clone(),
+            recent_signers: Default::default(),
+            signer_counts: Default::default(),
             utxos,
             utxo_set: UtxoAccumulator::from_canonical_coins(leaves, true),
             kernels: UtxoAccumulator::from_canonical_coins(kernel_ids, true),
@@ -411,6 +413,7 @@ impl Storage {
         state
             .chain_mmr
             .append(&tip_header.extension.final_hash, true);
+        self.rebuild_signer_window(&mut state)?;
         Ok(Some(state))
     }
 
@@ -455,9 +458,25 @@ impl Storage {
             state.height = p.height;
             state.timestamp = p.timestamp;
             state.header_hash = p.header_hash;
+            state.bonds = p.bonds;
         }
         state.chain_mmr = current.chain_mmr.truncated(height);
+        self.rebuild_signer_window(&mut state)?;
         Ok(state)
+    }
+
+    /// Refills the fork-choice window (`bond::credit_work`) from the signers
+    /// of the stored blocks just below `state`. A pruned block counts as
+    /// unsigned, which can only loosen this node's weighting, never validity.
+    fn rebuild_signer_window(&self, state: &mut State) -> Result<()> {
+        let end = state.height;
+        let start = end.saturating_sub(crate::core::bond::CAP_WINDOW as u64);
+        let mut signers = Vec::with_capacity((end - start) as usize);
+        for h in start..end {
+            signers.push(self.load_batch(h)?.and_then(|b| b.miner.map(|m| m.bond_id)));
+        }
+        crate::core::bond::rebuild_signer_window(state, signers);
+        Ok(())
     }
 
     /// Replaces every block at or above `first_height` with `batches`, whose

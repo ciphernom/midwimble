@@ -51,6 +51,11 @@ enum Cmd {
         /// one from block 1.
         #[arg(long)]
         mining_bond: Option<PathBuf>,
+        /// A registered co-bond file (`midwimble bond new --mining-pubkey`):
+        /// a bond someone else locked naming this node's mining key. Repeat
+        /// for each. Needs --mining-bond.
+        #[arg(long = "co-bond")]
+        co_bonds: Vec<PathBuf>,
         /// Mining threads (0 = all cores).
         #[arg(long, default_value_t = 0)]
         threads: usize,
@@ -338,6 +343,11 @@ enum BondCmd {
     New {
         #[arg(long)]
         file: PathBuf,
+        /// Make a co-bond file instead: no secret, only a pool's mining key
+        /// (hex, from the pool operator). Lock and register the bond as usual
+        /// and keep your owner key; the pool signs blocks with the bond.
+        #[arg(long)]
+        mining_pubkey: Option<String>,
     },
     /// Print the midstate script and address that lock a bond to this key.
     Address {
@@ -407,14 +417,23 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
         }
     };
     match cmd {
-        BondCmd::New { file } => {
+        BondCmd::New { file, mining_pubkey } => {
             if file.exists() {
                 anyhow::bail!("{} already exists", file.display());
             }
-            let f = BondFile::generate();
+            let f = match &mining_pubkey {
+                Some(key) => BondFile::co_bond(key32(key, "--mining-pubkey")?),
+                None => BondFile::generate(),
+            };
+            let key = f.mining_key()?;
             write(&file, &f)?;
-            out!("mining key   {}", hex::encode(f.mining_key()?));
-            out!("Keep {} safe: it can mine as the bond. Next: `midwimble bond address`.", file.display());
+            out!("mining key   {}", hex::encode(key));
+            if mining_pubkey.is_some() {
+                out!("Co-bond file: it holds no secret. Next: `midwimble bond address`, lock the coin, \
+                      `midwimble bond register`, then give {} to the pool.", file.display());
+            } else {
+                out!("Keep {} safe: it can mine as the bond. Next: `midwimble bond address`.", file.display());
+            }
         }
         BondCmd::Address { file, owner_pk, until } => {
             let f = read(&file)?;
@@ -641,7 +660,7 @@ fn run(cli: Cli) -> Result<()> {
             listen,
             peers,
             rpc,
-            mine_to, mining_bond,
+            mine_to, mining_bond, co_bonds,
             threads,
             amino,
             public_address,
@@ -672,9 +691,27 @@ fn run(cli: Cli) -> Result<()> {
             config.mine_to = mine_to.as_deref().map(StealthAddress::decode).transpose()?;
             if let Some(path) = &mining_bond {
                 let file: midwimble::core::bond::BondFile = serde_json::from_slice(&std::fs::read(path)?)?;
-                let bond = file.miner_bond()?;
+                let mut bond = file.miner_bond()?;
                 tracing::info!("Mining as bond {}", hex::encode(bond.bond_id));
+                for path in &co_bonds {
+                    let co: midwimble::core::bond::BondFile =
+                        serde_json::from_slice(&std::fs::read(path)?)?;
+                    if co.mining_key()? != bond.mining_key() {
+                        anyhow::bail!("{} names a different mining key than --mining-bond", path.display());
+                    }
+                    let entry = co.co_bond_entry()?;
+                    // A bad registration would make this node's blocks invalid:
+                    // check every header's work now, once, rather than lose a block.
+                    if let Some(r) = &entry.registration {
+                        r.verify(&midwimble::core::types::GENESIS_TARGET)
+                            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+                    }
+                    tracing::info!("Co-bond {}", hex::encode(entry.bond_id));
+                    bond.co_bonds.push(entry);
+                }
                 config.mining_bond = Some(bond);
+            } else if !co_bonds.is_empty() {
+                anyhow::bail!("--co-bond needs --mining-bond: the co-bonds sign with its mining key");
             } else if config.mine_to.is_some()
                 && midwimble::core::bond::BONDED_MINING_FROM != u64::MAX
             {

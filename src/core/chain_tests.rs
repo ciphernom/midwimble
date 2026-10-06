@@ -586,7 +586,12 @@ use super::state::apply_registrations;
 use super::template::{build_template_bonded, BlockTemplate};
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 
-const LOCKED_LONG: u64 = 10_000_000;
+/// A lock comfortably inside `MAX_BOND_HORIZON` and well past the minimum
+/// remaining lock, wherever the clock is.
+fn locked_long() -> u64 {
+    super::bond::est_midstate_height(super::state::current_timestamp())
+        + super::bond::MAX_BOND_HORIZON / 2
+}
 
 /// A block producer with a fresh bond locked until `bonded_until`.
 fn bonded_miner(chain: &TestChain, seed: &[u8], bonded_until: u64) -> MinerBond {
@@ -595,6 +600,7 @@ fn bonded_miner(chain: &TestChain, seed: &[u8], bonded_until: u64) -> MinerBond 
     let registration =
         devnet_registration(mining_key, bonded_until, hash(seed), &chain.state.target);
     MinerBond {
+        co_bonds: Vec::new(),
         secret,
         bond_id: registration.bond_id(),
         registration: Some(registration),
@@ -632,7 +638,7 @@ impl TestChain {
 fn a_bonded_miner_registers_in_its_first_block_and_mines_on() {
     let mut chain = TestChain::new();
     let payout = TestWallet::new().address();
-    let bond = bonded_miner(&chain, b"bonded miner", LOCKED_LONG);
+    let bond = bonded_miner(&chain, b"bonded miner", locked_long());
 
     // The first block carries its own registration and is signed by the bond
     // it registers: this is how block 1 of the real chain gets mined.
@@ -653,7 +659,7 @@ fn a_bonded_miner_registers_in_its_first_block_and_mines_on() {
 fn a_forged_signature_is_rejected_even_with_valid_work() {
     let mut chain = TestChain::new();
     let payout = TestWallet::new().address();
-    let bond = bonded_miner(&chain, b"honest", LOCKED_LONG);
+    let bond = bonded_miner(&chain, b"honest", locked_long());
     chain.apply(chain.make_bonded_block(&bond, &payout).unwrap()).unwrap();
 
     // Someone who knows the bond id but not its mining key signs a block as
@@ -677,8 +683,9 @@ fn unregistered_and_short_locked_bonds_cannot_mine() {
     let payout = TestWallet::new().address();
     // A bond the chain has never seen, with no registration to carry.
     let unregistered = MinerBond {
+        co_bonds: Vec::new(),
         registration: None,
-        ..bonded_miner(&chain, b"unregistered", LOCKED_LONG)
+        ..bonded_miner(&chain, b"unregistered", locked_long())
     };
     assert!(chain.make_bonded_block(&unregistered, &payout).is_err());
     // A bond whose lock runs out within the month: it would register, but
@@ -696,7 +703,7 @@ fn unregistered_and_short_locked_bonds_cannot_mine() {
 fn the_signature_binds_the_whole_block() {
     let mut chain = TestChain::new();
     let payout = TestWallet::new().address();
-    let bond = bonded_miner(&chain, b"binder", LOCKED_LONG);
+    let bond = bonded_miner(&chain, b"binder", locked_long());
     chain.apply(chain.make_bonded_block(&bond, &payout).unwrap()).unwrap();
     let signed = chain.bonded_template(&bond, &payout).unwrap().batch;
     let prev = chain.state.mw_midstate;
@@ -720,7 +727,7 @@ fn the_signature_binds_the_whole_block() {
 fn registrations_are_verified_and_limited() {
     let chain = TestChain::new();
     let payout = TestWallet::new().address();
-    let bond = bonded_miner(&chain, b"verified", LOCKED_LONG);
+    let bond = bonded_miner(&chain, b"verified", locked_long());
     let block = chain.make_bonded_block(&bond, &payout).unwrap();
     let height = chain.state.height;
     validate_block_contents(&block, height, false).unwrap();
@@ -738,7 +745,7 @@ fn registrations_are_verified_and_limited() {
 fn a_bond_registers_once() {
     let mut chain = TestChain::new();
     let payout = TestWallet::new().address();
-    let bond = bonded_miner(&chain, b"twice", LOCKED_LONG);
+    let bond = bonded_miner(&chain, b"twice", locked_long());
     let first = chain.make_bonded_block(&bond, &payout).unwrap();
     let registration = first.registrations[0].clone();
     chain.apply(first).unwrap();

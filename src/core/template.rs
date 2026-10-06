@@ -203,7 +203,9 @@ pub fn build_template_bonded(
             "bonded mining is required from height {BONDED_MINING_FROM}: configure a mining bond"
         );
     }
-    let registrations: Vec<BondRegistration> = match bond {
+    let timestamp = timestamp
+        .unwrap_or_else(|| current_timestamp().max(min_next_timestamp(previous_timestamps)));
+    let mut registrations: Vec<BondRegistration> = match bond {
         Some(b) if !state.bonds.contains_key(&b.bond_id) => match &b.registration {
             Some(registration) => {
                 // The full check (every header's proof of work) runs when the
@@ -225,6 +227,32 @@ pub fn build_template_bonded(
         },
         _ => Vec::new(),
     };
+    // Co-bonds' registrations ride along too, one a block, once the
+    // producer's own bond is on chain. One the chain would refuse is skipped
+    // rather than allowed to stop this producer mining.
+    if registrations.is_empty() {
+        if let Some(b) = bond {
+            let pending = b
+                .co_bonds
+                .iter()
+                .filter(|c| !state.bonds.contains_key(&c.bond_id))
+                .filter_map(|c| c.registration.as_ref())
+                .find(|r| {
+                    let above = r.headers.get(1..).unwrap_or(&[]);
+                    crate::core::bond::precheck_registrations(
+                        &state.bonds,
+                        std::slice::from_ref(*r),
+                        timestamp,
+                    )
+                    .is_ok()
+                        && crate::core::bond::credited_work(above, &state.target)
+                            >= crate::core::bond::registration_work(&state.target)
+                });
+            if let Some(r) = pending {
+                registrations.push(r.clone());
+            }
+        }
+    }
     let body = Transaction::aggregate(txs)?;
     let fees = body.fee()?;
     let amount = block_reward(height)
@@ -242,11 +270,10 @@ pub fn build_template_bonded(
         (Some(cb), receipts)
     };
 
+    crate::core::bond::precheck_registrations(&state.bonds, &registrations, timestamp)?;
     let mut next = apply_body(state, &body, coinbase.as_ref())?;
     super::state::apply_registrations(&mut next, &registrations)?;
     let state_root = next.state_root();
-    let timestamp = timestamp
-        .unwrap_or_else(|| current_timestamp().max(min_next_timestamp(previous_timestamps)));
 
     let mut batch = Batch {
         prev_midstate: state.mw_midstate,
@@ -270,7 +297,7 @@ pub fn build_template_bonded(
     if let Some(bond) = bond {
         let message = authorization_message(&state.mw_midstate, &batch);
         batch.miner = Some(MinerAuth {
-            bond_id: bond.bond_id,
+            bond_id: bond.choose_signer(&next.bonds, &state.signer_counts, timestamp),
             signature: bond.sign(&message),
         });
         check_miner_authorization(&next.bonds, &state.mw_midstate, &batch)?;

@@ -464,29 +464,10 @@ fn apply_batch_internal(
         validate_timestamp(batch.timestamp, previous_timestamps, current_timestamp())?;
     }
 
-    // 3. Contents: structure, balances, proofs and signatures.
-    validate_block_contents(batch, height, skip_crypto)?;
-
-    // 4. State transition and root.
-    let mut next = apply_body(state, &batch.body, batch.coinbase.as_ref())?;
-    apply_registrations(&mut next, &batch.registrations)?;
-    let expected_root = next.state_root();
-    if batch.state_root != expected_root {
-        bail!(
-            "State root mismatch: expected {}, got {}",
-            hex::encode(expected_root),
-            hex::encode(batch.state_root)
-        );
-    }
-
-    // 5. Proof of work against the header this block actually produces.
-    // 4b. Bonded mining. From BONDED_MINING_FROM every mined block must be
-    //     authorised by an eligible bond; before that an authorisation is
-    //     optional, but checked in full whenever a block carries one.
-    if !is_genesis && (height >= super::bond::BONDED_MINING_FROM || batch.miner.is_some()) {
-        super::bond::check_miner_authorization(&next.bonds, &state.mw_midstate, batch)?;
-    }
-
+    // 3. Proof of work, before anything expensive. The mining hash commits to
+    //    every byte of the block (body, registrations and signature are folded
+    //    into the midstate), so a block costs its sender real work before it
+    //    can cost this node any.
     let post_tx_midstate = super::types::fold_block(&state.mw_midstate, batch);
     let candidate_header = BatchHeader {
         height,
@@ -520,11 +501,38 @@ fn apply_batch_internal(
         }
     }
 
+    // 4. Cheap stateful registration checks, then contents: structure,
+    //    balances, proofs, signatures and registration headers.
+    super::bond::precheck_registrations(&state.bonds, &batch.registrations, batch.timestamp)?;
+    validate_block_contents(batch, height, skip_crypto)?;
+
+    // 4b. State transition and root.
+    let mut next = apply_body(state, &batch.body, batch.coinbase.as_ref())?;
+    apply_registrations(&mut next, &batch.registrations)?;
+    let expected_root = next.state_root();
+    if batch.state_root != expected_root {
+        bail!(
+            "State root mismatch: expected {}, got {}",
+            hex::encode(expected_root),
+            hex::encode(batch.state_root)
+        );
+    }
+
+    // 5. Bonded mining. From BONDED_MINING_FROM every mined block must be
+    //     authorised by an eligible bond; before that an authorisation is
+    //     optional, but checked in full whenever a block carries one.
+    if !is_genesis && (height >= super::bond::BONDED_MINING_FROM || batch.miner.is_some()) {
+        super::bond::check_miner_authorization(&next.bonds, &state.mw_midstate, batch)?;
+    }
+
     // 6. Finalize.
     next.mw_midstate = post_tx_midstate;
     next.header_hash = batch.extension.final_hash;
     next.chain_mmr.append(&batch.extension.final_hash, true);
-    next.depth = next.depth.saturating_add(calculate_work(&batch.target));
+    let signer = batch.miner.as_ref().map(|auth| auth.bond_id);
+    let work = calculate_work(&batch.target);
+    let credited = super::bond::credit_work(&mut next, signer, work, batch.timestamp);
+    next.depth = next.depth.saturating_add(credited);
     next.height = height + 1;
     next.timestamp = batch.timestamp;
     next.target = calculate_target(next.height, next.timestamp);

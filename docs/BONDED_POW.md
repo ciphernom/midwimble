@@ -272,8 +272,66 @@ the node, so they need nothing extra: run them against a node started with
 `--mining-bond`. Until the bond is on chain, the node reserves room in its
 blocks for the registration and carries it in the first block it mines.
 
+## Co-bonding and the per-bond cap
+
+A pool's block capacity scales with the bonds behind it. Anyone can lock a
+bond naming the pool's mining key: they keep the owner key, so only they can
+ever spend the coin, and the pool signs blocks with the bond.
+
+**The cap is a fork-choice rule, not a validity rule.** Over any 1,440 blocks
+(`CAP_WINDOW`), a bond adds full work to its chain's weight for at most
+`ceil(1440 / min(eligible bonds, 20))` of them (`CAP_K = 20`). Blocks beyond
+that stay valid and pay, but add only 1/1024 of their work. So:
+
+- the chain never stalls: a lone producer can always extend it, and a longer
+  chain is always a heavier one;
+- to outweigh the honest chain, an attacker needs more bonds than the honest
+  network has, each with the hashrate to fill its quota;
+- the cap counts *registered, eligible* bonds, not recent signers. On an
+  attacker's private chain the attacker is the only signer, so a cap measured
+  by signers would lift exactly where it is needed;
+- a pool with a share `s` of the hashrate needs about `20 × s` bonds for all
+  of its blocks to count in full: 6 bonds at 30%.
+
+While the network has fewer than 20 eligible bonds, they share the window
+equally, and a lone producer is uncapped. The window is not part of the state
+root: nodes rebuild it from their stored blocks.
+
+A registration must lock at least `MIN_MINING_BOND`, and no further than a year
+(`MAX_BOND_HORIZON`) past the block's estimated midstate height, so a forged
+registration expires instead of holding a quota slot forever.
+
+**Co-bonding, as a miner:**
+
+```sh
+midwimble bond new --file cobond.json --mining-pubkey <the pool's mining key>
+#   a co-bond file: no secret, only the pool's key
+
+midwimble bond address --file cobond.json --owner-pk <your public key> --until <height>
+midstate wallet send --to <bond address>:<value>
+midwimble bond register --file cobond.json --owner-pk <key> --until <height> \
+    --value <units> --salt <hex> --midstate-rpc 127.0.0.1:8545 --midwimble-rpc <node>
+#   then give cobond.json to the pool operator: it holds nothing secret
+```
+
+Unbonding is the same `spend-script` as for any bond, with your own key.
+
+**As the pool operator:**
+
+```sh
+midwimble node --mining-bond bond.json --co-bond alice.json --co-bond bob.json ...
+```
+
+The node checks every co-bond registration's work at startup, carries the
+registrations in its blocks one a block, and signs each block with whichever
+bond, its own or a co-bond, has the most quota left.
+
 ## Still to build
 
+- **Paying co-bond contributors.** The node signs with co-bonds, but the
+  pool does not yet record whose bond signed each block or pay its owner.
+  A per-block rent to the signing bond's owner, or a share split by bond
+  value, is pool policy still to decide and build.
 - **One-step unbonding in the midstate wallet.** Spending a bond already
   works through `spend-script`, but a dedicated command could fill in the
   script and witness itself.

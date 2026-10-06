@@ -8,10 +8,10 @@
 //! bond by the exact script template below and proves that it exists with an
 //! SMT inclusion proof against a midstate header.
 //!
-//! This is the verification half only; nothing here is wired into block
-//! validation yet. Which midstate header a proof must verify against (each
-//! epoch's snapshot, agreed inside midwimble's own chain) arrives with the
-//! header change described in the design document.
+//! A registered bond authorises the blocks its key signs
+//! (`check_miner_authorization`, from `BONDED_MINING_FROM`), and fork choice
+//! caps how much work any one bond's blocks add (`credit_work`), so a
+//! producer's capacity scales with the bonds behind it, co-bonds included.
 
 use super::anchor::{header_pow_ok, HeaderLink};
 use super::auxpow::midstate_coin_id;
@@ -522,6 +522,18 @@ pub struct MinerBond {
     /// The bond's registration, carried in this producer's blocks until the
     /// chain has it.
     pub registration: Option<BondRegistration>,
+    /// Bonds others locked naming this producer's mining key. Blocks are
+    /// signed with whichever bond has the most fork-choice quota left.
+    pub co_bonds: Vec<CoBond>,
+}
+
+/// A bond someone else locked naming this producer's mining key. They keep
+/// the coin, which only their owner key can spend; the producer signs with it.
+#[derive(Clone, Debug)]
+pub struct CoBond {
+    pub bond_id: [u8; 32],
+    /// Carried in this producer's blocks, one a block, until the chain has it.
+    pub registration: Option<BondRegistration>,
 }
 
 impl std::fmt::Debug for MinerBond {
@@ -535,6 +547,27 @@ impl std::fmt::Debug for MinerBond {
 }
 
 impl MinerBond {
+    /// The bond to sign the next block with: of this producer's own bond and
+    /// its co-bonds, the registered, eligible one with the most fork-choice
+    /// quota left (`signer_cap`), the producer's own on ties.
+    pub fn choose_signer(
+        &self,
+        bonds: &im::HashMap<[u8; 32], BondEntry>,
+        counts: &im::HashMap<[u8; 32], u32>,
+        block_timestamp: u64,
+    ) -> [u8; 32] {
+        let key = self.mining_key();
+        std::iter::once(self.bond_id)
+            .chain(self.co_bonds.iter().map(|c| c.bond_id))
+            .filter(|id| {
+                bonds
+                    .get(id)
+                    .is_some_and(|e| e.mining_key == key && e.eligible_at(block_timestamp))
+            })
+            .min_by_key(|id| counts.get(id).copied().unwrap_or(0))
+            .unwrap_or(self.bond_id)
+    }
+
     pub fn mining_key(&self) -> [u8; 32] {
         RistrettoPoint::mul_base(&self.secret).compress().to_bytes()
     }
@@ -632,8 +665,13 @@ pub fn devnet_registration(
 /// bond (though never spend it; that takes the owner's midstate key).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BondFile {
-    /// Mining secret, hex.
+    /// Mining secret, hex. Empty in a co-bond file.
+    #[serde(default)]
     pub secret: String,
+    /// A co-bond file's mining key, hex: the key of the producer (pool) the
+    /// bond is locked to. The file holds no secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mining_pubkey: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coin: Option<BondCoin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -659,15 +697,44 @@ impl BondFile {
     }
 
     pub fn mining_key(&self) -> Result<[u8; 32]> {
+        if let Some(key) = &self.mining_pubkey {
+            let bytes: [u8; 32] = hex::decode(key)?
+                .try_into()
+                .map_err(|_| anyhow!("mining_pubkey must be 32 bytes"))?;
+            if curve25519_dalek::ristretto::CompressedRistretto(bytes).decompress().is_none() {
+                bail!("mining_pubkey is not a valid mining key");
+            }
+            return Ok(bytes);
+        }
         Ok(RistrettoPoint::mul_base(&self.secret()?).compress().to_bytes())
+    }
+
+    /// A co-bond file: the bond will name `mining_key`, someone else's.
+    pub fn co_bond(mining_key: [u8; 32]) -> Self {
+        Self { mining_pubkey: Some(hex::encode(mining_key)), ..Self::default() }
+    }
+
+    /// What a producer adds with `--co-bond`. Needs a finished registration.
+    pub fn co_bond_entry(&self) -> Result<CoBond> {
+        let registration = self.registration.clone().ok_or_else(|| {
+            anyhow!("this co-bond is not registered yet: finish `midwimble bond register` first")
+        })?;
+        if registration.proof.coin.script.mining_key != self.mining_key()? {
+            bail!("this file's mining key is not the registered bond's");
+        }
+        Ok(CoBond { bond_id: registration.bond_id(), registration: Some(registration) })
     }
 
     /// What the node mines with. Needs a finished registration.
     pub fn miner_bond(&self) -> Result<MinerBond> {
+        if self.mining_pubkey.is_some() {
+            bail!("this is a co-bond file: its producer adds it with --co-bond, alongside their own --mining-bond");
+        }
         let registration = self.registration.clone().ok_or_else(|| {
             anyhow!("this bond is not registered yet: finish `midwimble bond register` first")
         })?;
         let bond = MinerBond {
+            co_bonds: Vec::new(),
             secret: self.secret()?,
             bond_id: registration.bond_id(),
             registration: Some(registration),
@@ -721,6 +788,217 @@ pub fn bond_proof_from_json(coin: BondCoin, v: &serde_json::Value) -> Result<Bon
         roots,
         smt: serde_json::from_value(v["proof"].clone())?,
     })
+}
+
+// --- Fork-choice cap (co-bonded mining) -------------------------------------
+
+/// Over any `CAP_WINDOW` blocks, one bond adds full work to fork choice for at
+/// most `signer_cap` of them. Blocks beyond that stay valid and pay, but add
+/// only `1 / OVER_CAP_WORK_DIVISOR` of their work, so a chain outweighs another
+/// only with enough bonds behind its hashrate: a pool's capacity scales with
+/// the bonds co-signed to its mining key.
+pub const CAP_WINDOW: usize = 24 * 60;
+/// With at least this many eligible bonds, each may sign `1 / CAP_K` of the
+/// window at full weight; with fewer, they share it equally.
+pub const CAP_K: usize = 20;
+pub const OVER_CAP_WORK_DIVISOR: u128 = 1024;
+/// How far past the block's estimated midstate height a registration may lock
+/// its coin, so a forged registration expires instead of holding a quota slot
+/// forever.
+pub const MAX_BOND_HORIZON: u64 = 365 * 24 * 60;
+
+/// Full-weight blocks one bond may sign per `CAP_WINDOW`: an equal share among
+/// the bonds eligible at `block_timestamp`, never below `1 / CAP_K`. Counting
+/// registered bonds rather than recent signers keeps an attacker's private
+/// chain, where only the attacker signs, under the same cap.
+pub fn signer_cap(bonds: &im::HashMap<[u8; 32], BondEntry>, block_timestamp: u64) -> usize {
+    let eligible = bonds.values().filter(|e| e.eligible_at(block_timestamp)).count();
+    CAP_WINDOW.div_ceil(eligible.clamp(1, CAP_K))
+}
+
+/// Records a block's signer in the fork-choice window and returns the work the
+/// block adds to its chain's weight: all of it within the bond's cap, a sliver
+/// beyond (never zero, so a longer chain is always heavier).
+pub fn credit_work(
+    state: &mut super::types::State,
+    signer: Option<[u8; 32]>,
+    work: u128,
+    block_timestamp: u64,
+) -> u128 {
+    let credited = match signer {
+        Some(id)
+            if state.signer_counts.get(&id).copied().unwrap_or(0) as usize
+                >= signer_cap(&state.bonds, block_timestamp) =>
+        {
+            (work / OVER_CAP_WORK_DIVISOR).max(1)
+        }
+        _ => work,
+    };
+    state.recent_signers.push_back(signer);
+    if let Some(id) = signer {
+        let count = state.signer_counts.get(&id).copied().unwrap_or(0);
+        state.signer_counts.insert(id, count + 1);
+    }
+    while state.recent_signers.len() > CAP_WINDOW {
+        if let Some(Some(old)) = state.recent_signers.pop_front() {
+            match state.signer_counts.get(&old).copied() {
+                Some(count) if count > 1 => {
+                    state.signer_counts.insert(old, count - 1);
+                }
+                _ => {
+                    state.signer_counts.remove(&old);
+                }
+            }
+        }
+    }
+    credited
+}
+
+/// Rebuilds the window from the signers of the blocks before `state`, oldest
+/// first (storage does this after loading or rewinding).
+pub fn rebuild_signer_window(
+    state: &mut super::types::State,
+    signers: impl IntoIterator<Item = Option<[u8; 32]>>,
+) {
+    state.recent_signers = im::Vector::new();
+    state.signer_counts = im::HashMap::new();
+    for signer in signers {
+        credit_work(state, signer, 0, 0);
+    }
+}
+
+/// The cheap, stateful checks on a block's registrations, run before any
+/// header's proof of work: not already registered, at least the minimum bond,
+/// and locked no further out than `MAX_BOND_HORIZON`.
+pub fn precheck_registrations(
+    bonds: &im::HashMap<[u8; 32], BondEntry>,
+    registrations: &[BondRegistration],
+    block_timestamp: u64,
+) -> Result<()> {
+    let horizon = est_midstate_height(block_timestamp).saturating_add(MAX_BOND_HORIZON);
+    for registration in registrations {
+        let id = registration.bond_id();
+        if bonds.contains_key(&id) {
+            bail!("bond {} is already registered", hex::encode(id));
+        }
+        let entry = registration.entry();
+        if entry.value < MIN_MINING_BOND {
+            bail!(
+                "bond {} locks {} units; a mining bond is at least {}",
+                hex::encode(id),
+                entry.value,
+                MIN_MINING_BOND
+            );
+        }
+        if entry.bonded_until > horizon {
+            bail!(
+                "bond {} is locked until midstate height {}; a registration may lock at most to {}",
+                hex::encode(id),
+                entry.bonded_until,
+                horizon
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    fn eligible_bond() -> BondEntry {
+        BondEntry { mining_key: [0u8; 32], value: MIN_MINING_BOND, bonded_until: u64::MAX }
+    }
+
+    #[test]
+    fn cap_is_an_equal_share_never_below_one_kth() {
+        let mut bonds = im::HashMap::new();
+        assert_eq!(signer_cap(&bonds, 0), CAP_WINDOW, "a lone producer is uncapped");
+        for i in 0..3u8 {
+            bonds.insert([i; 32], eligible_bond());
+        }
+        assert_eq!(signer_cap(&bonds, 0), CAP_WINDOW.div_ceil(3));
+        for i in 3..(CAP_K as u8 + 10) {
+            bonds.insert([i; 32], eligible_bond());
+        }
+        assert_eq!(signer_cap(&bonds, 0), CAP_WINDOW.div_ceil(CAP_K));
+
+        // Expired and undersized bonds do not dilute the cap.
+        let mut few = im::HashMap::new();
+        few.insert([1; 32], eligible_bond());
+        few.insert([2; 32], BondEntry { bonded_until: 0, ..eligible_bond() });
+        few.insert([3; 32], BondEntry { value: MIN_MINING_BOND / 2, ..eligible_bond() });
+        assert_eq!(signer_cap(&few, 0), CAP_WINDOW);
+    }
+
+    #[test]
+    fn a_bond_past_its_cap_adds_a_sliver_until_its_blocks_age_out() {
+        let mut state = super::super::types::State::genesis();
+        state.bonds.insert([1; 32], eligible_bond());
+        state.bonds.insert([2; 32], eligible_bond());
+        let cap = signer_cap(&state.bonds, 0);
+        assert_eq!(cap, CAP_WINDOW / 2);
+        let work = 1u128 << 40;
+
+        for _ in 0..cap {
+            assert_eq!(credit_work(&mut state, Some([1; 32]), work, 0), work);
+        }
+        assert_eq!(credit_work(&mut state, Some([1; 32]), work, 0), work / OVER_CAP_WORK_DIVISOR);
+
+        // Bond 2 fills the rest of the window.
+        for _ in 0..CAP_WINDOW - cap - 1 {
+            assert_eq!(credit_work(&mut state, Some([2; 32]), work, 0), work);
+        }
+        assert_eq!(state.recent_signers.len(), CAP_WINDOW);
+        assert_eq!(state.signer_counts[&[1; 32]] as usize, cap + 1);
+
+        // Two more blocks evict two of bond 1's: it is back under its cap.
+        credit_work(&mut state, None, work, 0);
+        credit_work(&mut state, None, work, 0);
+        assert_eq!(state.signer_counts[&[1; 32]] as usize, cap - 1);
+        assert_eq!(credit_work(&mut state, Some([1; 32]), work, 0), work);
+        assert!(!state.signer_counts.contains_key(&[0; 32]), "unsigned blocks count for nobody");
+
+        // Rebuilding from the same signers reproduces the window exactly.
+        let signers: Vec<_> = state.recent_signers.iter().copied().collect();
+        let mut rebuilt = super::super::types::State::genesis();
+        rebuilt.bonds = state.bonds.clone();
+        rebuild_signer_window(&mut rebuilt, signers);
+        assert_eq!(rebuilt.recent_signers, state.recent_signers);
+        assert_eq!(rebuilt.signer_counts, state.signer_counts);
+    }
+
+    #[test]
+    fn a_producer_signs_with_the_bond_that_has_the_most_quota_left() {
+        let mut producer = MinerBond {
+            secret: Scalar::from_bytes_mod_order([7u8; 32]),
+            bond_id: [1; 32],
+            registration: None,
+            co_bonds: vec![
+                CoBond { bond_id: [2; 32], registration: None },
+                CoBond { bond_id: [3; 32], registration: None },
+            ],
+        };
+        let mine = BondEntry { mining_key: producer.mining_key(), ..eligible_bond() };
+        let mut bonds = im::HashMap::new();
+        bonds.insert([1; 32], mine);
+        bonds.insert([2; 32], mine);
+        // Registered, but naming someone else's key: never this producer's to sign.
+        bonds.insert([3; 32], BondEntry { mining_key: [9; 32], ..eligible_bond() });
+
+        let mut counts = im::HashMap::new();
+        assert_eq!(producer.choose_signer(&bonds, &counts, 0), [1; 32], "own bond on ties");
+        counts.insert([1; 32], 5);
+        counts.insert([2; 32], 2);
+        assert_eq!(producer.choose_signer(&bonds, &counts, 0), [2; 32]);
+        counts.insert([2; 32], 9);
+        assert_eq!(producer.choose_signer(&bonds, &counts, 0), [1; 32]);
+
+        // An unregistered co-bond is skipped, however much quota it has.
+        producer.co_bonds.push(CoBond { bond_id: [4; 32], registration: None });
+        counts.insert([1; 32], 100);
+        assert_eq!(producer.choose_signer(&bonds, &counts, 0), [2; 32]);
+    }
 }
 
 #[cfg(test)]
