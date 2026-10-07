@@ -11,14 +11,23 @@ miners the fractured wallet that importing mined coinbases produces.
 ## Who holds what
 
 - **The pool operator** runs a midwimble node with a mining bond
-  (`docs/BONDED_POW.md`). One bond covers the whole pool: bond value is a gate,
-  never a weight, so a pool's bond buys it no more midwimble than any other
-  producer's.
-- **Miners** keep mining midstate shares exactly as now. A miner who registers
-  a midwimble address with the pool is paid directly in the midwimble
-  coinbase, provably, the same way midwimble's own pool pays.
-- **Nobody needs a second bond.** The pool produces the blocks, so the pool
-  holds the only bond.
+  (`docs/BONDED_POW.md`). One bond lets a pool mine, but the per-bond cap
+  decides how many of its blocks count in full. Once 20 or more bonds are
+  active, each bond counts at full weight for at most 1/20 of the last 1,440
+  blocks, so a pool with a share `s` of the hashrate needs about `20 × s`
+  bonds: 6 at 30%. While fewer bonds are active, they share the window
+  equally. Blocks past the cap stay valid and still pay, but add almost no
+  weight, so they lose any fork race against a block from a bond under its
+  quota.
+- **Co-bonders** supply the extra bonds. A co-bonder locks their own MDS in a
+  bond naming the pool's mining key and keeps the owner key, so only they can
+  ever spend it. The operator adds each one with `--co-bond <file>`, and the
+  node signs every block with whichever bond has the most quota left
+  (`docs/BONDED_POW.md`, "Co-bonding and the per-bond cap").
+- **Miners** keep mining midstate shares exactly as now, and never need a
+  bond. A miner who registers a midwimble address with the pool is paid
+  directly in the midwimble coinbase, provably, the same way midwimble's own
+  pool pays.
 
 ## Why it works
 
@@ -46,8 +55,9 @@ Two endpoints on the midwimble node, and no new process:
 ```
 
 The node builds a midwimble template paying those addresses in those
-proportions, signs it with its bond, caches it, and returns the commitment to
-plant plus the target a share must beat to be a midwimble block.
+proportions, signs it with the bond that has the most quota left, caches it,
+and returns the commitment to plant plus the target a share must beat to be a
+midwimble block.
 
 **`POST /merge/found`** — the pool found one.
 
@@ -91,8 +101,11 @@ pool.
 - **The midwimble node is unreachable:** the pool builds jobs without a
   commitment and mines midstate alone. Merged mining is an extra, never a
   dependency.
-- **The bond lapses or the node has none:** `/merge/job` fails, and the same
-  thing happens. The pool keeps mining midstate.
+- **Every bond lapses, or the node has none:** `/merge/job` fails, and the
+  same thing happens. The pool keeps mining midstate.
+- **The pool is short of bonds:** nothing fails. Its blocks past the cap are
+  still valid and still pay, but add almost no weight, so they lose fork races.
+  Add bonds or co-bonds.
 - **A midwimble block is rejected:** the midstate block, if the share cleared
   midstate's target too, is unaffected. The two submissions are independent.
 - **Refreshing jobs:** a commitment names one midwimble block, so a job's
@@ -107,3 +120,13 @@ outputs, so miners are paid directly by the block, with the same receipts and
 audit midwimble's own pool provides (`pool::audit_job`). A pool that would
 rather pay from its own wallet can send a single payout to itself instead; the
 provable path is the default worth keeping.
+
+## Paying for bonds
+
+A pool's bonds are capital locked so that its miners' blocks count in full.
+How they are paid for is pool policy, not consensus: for example, a bond fee
+taken from each midwimble coinbase and paid to the owner of the bond that
+signed the block, whether that is the operator or a co-bonder. Paid in the
+coinbase, it is as provable as the miners' payouts. None of this is built yet:
+`/merge/job` does not report which bond will sign, and a co-bond file carries
+no payout address.
