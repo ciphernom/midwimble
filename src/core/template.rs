@@ -124,11 +124,10 @@ pub fn build_template(
     .0)
 }
 
-/// Splits `total` proportionally by weight, discarding zero-value outputs.
-/// No per-address minimum is given: otherwise a miner can multiply its
-/// minimum allocations simply by splitting the same work across addresses.
-/// Integer remainder goes to the largest weight (first on ties), rather
-/// than automatically going to the first entry (usually the pool operator).
+/// Splits `total` in proportion to weight, without per-address minimums.
+/// Floors each exact entitlement, then assigns the remaining base units to
+/// the largest fractional entitlements. Ties follow the input order.
+/// Zero-valued outputs are omitted; the pool keeps scores not yet paid.
 pub fn split_by_weight(
     total: u64,
     weights: &[(StealthAddress, u64)],
@@ -137,18 +136,28 @@ pub fn split_by_weight(
     if sum == 0 {
         bail!("payout weights sum to zero");
     }
-    let mut out: Vec<(StealthAddress, u64)> = weights
-        .iter()
-        .map(|(a, w)| (*a, ((total as u128 * *w as u128) / sum) as u64))
-        .collect();
-    let paid: u64 = out.iter().map(|(_, v)| *v).sum();
-    let largest_weight = weights.iter().map(|(_, w)| *w).max().unwrap();
-    let largest = weights
-        .iter()
-        .position(|(_, w)| *w == largest_weight)
-        .expect("a positive weight exists");
-    out[largest].1 += total - paid;
-    out.retain(|(_, v)| *v > 0);
+    let mut out = Vec::with_capacity(weights.len());
+    let mut remainders = Vec::with_capacity(weights.len());
+    let mut paid = 0u64;
+    for (address, weight) in weights {
+        // The product of two u64 values fits in u128, even at their maxima.
+        let numerator = total as u128 * *weight as u128;
+        let whole = (numerator / sum) as u64;
+        out.push((*address, whole));
+        remainders.push(numerator % sum);
+        paid += whole;
+    }
+    // Sum of floors <= total; at most weights.len() - 1 units remain.
+    let mut order: Vec<usize> = (0..weights.len()).collect();
+    order.sort_by(|&a, &b| {
+        remainders[b]
+            .cmp(&remainders[a])
+            .then_with(|| a.cmp(&b))
+    });
+    for index in order.into_iter().take((total - paid) as usize) {
+        out[index].1 += 1;
+    }
+    out.retain(|(_, value)| *value > 0);
     Ok(out)
 }
 
