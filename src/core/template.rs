@@ -124,15 +124,11 @@ pub fn build_template(
     .0)
 }
 
-/// Splits `total` by weight (floor), giving the rounding remainder to the
-/// first entry. Zero-weight and zero-amount entries are dropped.
-///
-/// Every weighted payee is given one base unit before the split when the
-/// total stretches that far. During the slow start a block is worth a few
-/// hundred base units, and a plain proportional split would round the
-/// smallest of a pool's 31 payees to nothing — which their own audit reads as
-/// the pool refusing to pay them (`pool::audit_job`), so they would stop
-/// hashing on day one. One base unit each costs the split at most 32 units.
+/// Splits `total` proportionally by weight, discarding zero-value outputs.
+/// No per-address minimum is given: otherwise a miner can multiply its
+/// minimum allocations simply by splitting the same work across addresses.
+/// Integer remainder goes to the largest weight (first on ties), rather
+/// than automatically going to the first entry (usually the pool operator).
 pub fn split_by_weight(
     total: u64,
     weights: &[(StealthAddress, u64)],
@@ -141,22 +137,17 @@ pub fn split_by_weight(
     if sum == 0 {
         bail!("payout weights sum to zero");
     }
-    let payees = weights.iter().filter(|(_, w)| *w > 0).count() as u64;
-    let floor = if payees > 0 && total >= payees { 1 } else { 0 };
-    let rest = (total - floor * payees) as u128;
     let mut out: Vec<(StealthAddress, u64)> = weights
         .iter()
-        .map(|(a, w)| {
-            let share = ((rest * *w as u128) / sum) as u64;
-            (*a, if *w > 0 { share + floor } else { share })
-        })
+        .map(|(a, w)| (*a, ((total as u128 * *w as u128) / sum) as u64))
         .collect();
     let paid: u64 = out.iter().map(|(_, v)| *v).sum();
-    let first = weights
+    let largest_weight = weights.iter().map(|(_, w)| *w).max().unwrap();
+    let largest = weights
         .iter()
-        .position(|(_, w)| *w > 0)
+        .position(|(_, w)| *w == largest_weight)
         .expect("a positive weight exists");
-    out[first].1 += total - paid;
+    out[largest].1 += total - paid;
     out.retain(|(_, v)| *v > 0);
     Ok(out)
 }

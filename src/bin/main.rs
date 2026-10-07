@@ -153,6 +153,9 @@ enum Cmd {
         threads: usize,
         #[arg(long, default_value = "auto")]
         backend: String,
+        /// Refuse pool jobs advertising more than this fee percentage.
+        #[arg(long, default_value_t = 1.0)]
+        max_fee: f64,
     },
     /// List GPUs and run the miner's shader self-test.
     GpuInfo,
@@ -845,6 +848,7 @@ fn run(cli: Cli) -> Result<()> {
             worker,
             threads,
             backend,
+            max_fee,
         } => {
             tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::INFO)
@@ -864,10 +868,11 @@ fn run(cli: Cli) -> Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             loop {
                 let stats = std::sync::Arc::new(midwimble::pool::PoolMinerStats::default());
-                match runtime.block_on(midwimble::pool::run_pool_miner(
+                match runtime.block_on(midwimble::pool::run_pool_miner_with_fee_percent(
                     cfg.clone(),
                     stop.clone(),
                     stats,
+                    max_fee,
                 )) {
                     Ok(()) => return Ok(()),
                     Err(e) => {

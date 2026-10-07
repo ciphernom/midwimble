@@ -172,6 +172,80 @@ pub fn select_paid(scores: &[(AddrKey, u64)]) -> Vec<(AddrKey, u64)> {
     ranked
 }
 
+// Use fixed-point fee fractions, not ceil(score * fee / (100 - fee)).
+// The old formula paid 50% to the operator for a single share and a 2% fee.
+const FEE_SCALE: u64 = 1_000_000;
+
+fn fee_ppm(percent: f64) -> Result<u64> {
+    if !percent.is_finite() || !(0.0..100.0).contains(&percent) {
+        bail!("pool fee must be at least 0 and below 100 percent");
+    }
+    Ok((percent * 10_000.0).round() as u64)
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+fn payout_weights(
+    paid: &[(AddrKey, u64)],
+    operator: &StealthAddress,
+    fee: u64,
+) -> Result<Vec<(StealthAddress, u64)>> {
+    if fee >= FEE_SCALE {
+        bail!("invalid pool fee fraction");
+    }
+    if paid.is_empty() {
+        return Ok(vec![(*operator, 1)]);
+    }
+    // Reduce numerator/denominator before multiplication to minimise the
+    // chance that u64 template weights overflow in long-lived pools.
+    let divisor = gcd(fee, FEE_SCALE - fee);
+    let operator_factor = fee / divisor;
+    let miner_factor = (FEE_SCALE - fee) / divisor;
+    let total: u128 = paid.iter().map(|(_, score)| *score as u128).sum();
+    let mut weights = Vec::with_capacity(paid.len() + usize::from(fee > 0));
+    if fee > 0 {
+        let weight = u64::try_from(total * operator_factor as u128)
+            .context("pool fee weight exceeds u64; share scores must be settled")?;
+        weights.push((*operator, weight));
+    }
+    for (key, score) in paid {
+        let weight = u64::try_from(*score as u128 * miner_factor as u128)
+            .context("miner payout weight exceeds u64; share scores must be settled")?;
+        weights.push((key_addr(key)?, weight));
+    }
+    Ok(weights)
+}
+
+// A payout must only consume scores that were committed when its job was
+// built. Shares received after that snapshot belong to a later settlement.
+fn snapshot_deduction(
+    amount: u128,
+    distributable: u128,
+    total_at_snapshot: u128,
+    miner_at_snapshot: u64,
+) -> u64 {
+    if amount == 0 || distributable == 0 {
+        return 0;
+    }
+    (amount * total_at_snapshot / distributable)
+        .min(miner_at_snapshot as u128) as u64
+}
+
+// Historical pending values stored one record. New values are arrays so
+// replacement blocks at the same height do not overwrite unresolved debts.
+fn parse_pending(raw: &str) -> Result<Vec<Value>> {
+    match serde_json::from_str::<Value>(raw)? {
+        Value::Array(records) => Ok(records),
+        one @ Value::Object(_) => Ok(vec![one]),
+        _ => bail!("invalid pending-block entry"),
+    }
+}
+
 // ── Server ──────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -362,27 +436,10 @@ async fn build_job(state: &Arc<PoolState>, job_id: u64) -> Result<Job> {
     let scores = load_scores(&state.db)?;
     let tree = ShareMerkleTree::build(scores.clone());
     let paid = select_paid(&scores);
-    let paid_total: u128 = paid.iter().map(|(_, s)| *s as u128).sum();
-
-    let mut payouts: Vec<Value> = Vec::new();
-    let fee = state.cfg.fee_percent.clamp(0.0, 100.0);
-    if paid.is_empty() {
-        payouts.push(json!({ "address": state.cfg.pool_address.encode(), "weight": 1 }));
-    } else {
-        // Weight so that the pool receives `fee` percent of the reward.
-        let fee_weight = if fee >= 100.0 {
-            u64::MAX / 2
-        } else {
-            ((paid_total as f64) * fee / (100.0 - fee)).ceil() as u64
-        };
-        if fee_weight > 0 {
-            payouts
-                .push(json!({ "address": state.cfg.pool_address.encode(), "weight": fee_weight }));
-        }
-        for (k, s) in paid.iter() {
-            payouts.push(json!({ "address": key_addr(k)?.encode(), "weight": s }));
-        }
-    }
+    let payouts: Vec<Value> = payout_weights(&paid, &state.cfg.pool_address, fee_ppm(state.cfg.fee_percent)?)?
+        .iter()
+        .map(|(address, weight)| json!({ "address": address.encode(), "weight": weight }))
+        .collect();
     let body = json!({ "payouts": payouts, "extra": hex::encode(tree.root) });
     let node = state.cfg.node_rpc.clone();
     let tpl =
@@ -530,13 +587,10 @@ fn record_accepted(state: &PoolState, job: &Job, ext: &Extension) -> Result<()> 
     let txn = state.db.begin_write()?;
     {
         let mut table = txn.open_table(SHARES)?;
-        let mut total_score = 0u128;
-        for entry in table.iter()? {
-            total_score += entry?.1.value() as u128;
-        }
+        let total_at_snapshot: u128 = job.tree.leaves.iter().map(|(_, s)| *s as u128).sum();
         let mut deductions = Vec::new();
         let mut payouts = Vec::new();
-        for (k, _) in job.paid.iter() {
+        for (k, miner_at_snapshot) in job.paid.iter() {
             let amount: u128 = job
                 .receipts
                 .get(k)
@@ -545,7 +599,9 @@ fn record_accepted(state: &PoolState, job: &Job, ext: &Extension) -> Result<()> 
             if amount == 0 || distributable == 0 {
                 continue;
             }
-            let deduction = (amount * total_score / distributable) as u64;
+            let deduction = snapshot_deduction(
+                amount, distributable, total_at_snapshot, *miner_at_snapshot,
+            );
             let current = table.get(k.as_slice())?.map(|v| v.value()).unwrap_or(0);
             let taken = deduction.min(current);
             if current > taken {
@@ -567,52 +623,81 @@ fn record_accepted(state: &PoolState, job: &Job, ext: &Extension) -> Result<()> 
         .to_string();
         txn.open_table(BLOCKS)?
             .insert(job.height, record.as_str())?;
-        txn.open_table(PENDING)?
-            .insert(job.height, record.as_str())?;
+        let mut pending = txn.open_table(PENDING)?;
+        let mut records = match pending.get(job.height)? {
+            Some(existing) => parse_pending(existing.value())?,
+            None => Vec::new(),
+        };
+        records.push(serde_json::from_str(&record)?);
+        let encoded = serde_json::to_string(&records)?;
+        pending.insert(job.height, encoded.as_str())?;
     }
     txn.commit()?;
     Ok(())
 }
 
-/// Confirms matured blocks; restores the scores of orphaned ones.
+/// On each tip change, restore scores from orphaned blocks immediately.
+/// Canonical blocks remain pending until maturity, so a later reorg can be
+/// reconciled exactly once. Heights may have multiple candidate blocks.
 async fn reconcile_pending(state: &Arc<PoolState>, height: u64) -> Result<()> {
     let threshold = height.saturating_sub(COINBASE_MATURITY + 1);
-    let pending: Vec<(u64, Value)> = {
+    let pending_heights: Vec<u64> = {
         let txn = state.db.begin_read()?;
         let table = txn.open_table(PENDING)?;
-        let mut out = Vec::new();
-        for entry in table.range(..=threshold)? {
-            let (k, v) = entry?;
-            out.push((k.value(), serde_json::from_str(v.value())?));
-        }
-        out
+        table.iter()?.map(|entry| Ok(entry?.0.value())).collect::<Result<_>>()?
     };
-    for (h, record) in pending {
-        let node = state.cfg.node_rpc.clone();
-        let canonical =
-            tokio::task::spawn_blocking(move || RpcClient::new(node).blocks(h, 1)).await??;
-        let expected = record["hash"].as_str().unwrap_or_default();
-        let confirmed = canonical
-            .first()
-            .map(|b| hex::encode(b.extension.final_hash))
-            .as_deref()
-            == Some(expected);
+    for h in pending_heights {
+        // Node state.height is the next height. A missing block at or above
+        // that height is orphaned; below it, the node must return a block.
+        let canonical_hash = if h >= height {
+            None
+        } else {
+            let node = state.cfg.node_rpc.clone();
+            let blocks = tokio::task::spawn_blocking(move || RpcClient::new(node).blocks(h, 1)).await??;
+            let block = blocks.first().ok_or_else(|| anyhow!("missing canonical block at height {h}"))?;
+            Some(hex::encode(block.extension.final_hash))
+        };
+        let matured = h <= threshold;
         let txn = state.db.begin_write()?;
         {
-            txn.open_table(PENDING)?.remove(h)?;
-            let mut rec = record.clone();
-            rec["status"] = json!(if confirmed { "confirmed" } else { "orphaned" });
-            txn.open_table(BLOCKS)?
-                .insert(h, rec.to_string().as_str())?;
-            if !confirmed {
-                let mut shares = txn.open_table(SHARES)?;
-                for d in record["deductions"].as_array().cloned().unwrap_or_default() {
-                    let key = hex::decode(d[0].as_str().unwrap_or_default())?;
-                    let amount = d[1].as_u64().unwrap_or(0);
-                    let current = shares.get(key.as_slice())?.map(|v| v.value()).unwrap_or(0);
-                    shares.insert(key.as_slice(), current + amount)?;
+            // Re-read inside the write transaction. A just-accepted block
+            // might have appended another record while RPC was in flight.
+            let mut pending_table = txn.open_table(PENDING)?;
+            let Some(existing) = pending_table.get(h)? else { continue };
+            let records = parse_pending(existing.value())?;
+            drop(existing);
+            let mut keep = Vec::new();
+            for record in records {
+                let expected = record["hash"].as_str()
+                    .ok_or_else(|| anyhow!("pending block without a hash"))?;
+                let confirmed = canonical_hash.as_deref() == Some(expected);
+                if confirmed && !matured {
+                    keep.push(record);
+                    continue;
                 }
-                tracing::warn!("pool: block at height {} was orphaned; scores restored", h);
+                let mut result = record.clone();
+                result["status"] = json!(if confirmed { "confirmed" } else { "orphaned" });
+                txn.open_table(BLOCKS)?.insert(h, result.to_string().as_str())?;
+                if !confirmed {
+                    let deductions = record["deductions"].as_array()
+                        .ok_or_else(|| anyhow!("pending block without deductions"))?;
+                    let mut shares = txn.open_table(SHARES)?;
+                    for d in deductions {
+                        let key = hex::decode(d[0].as_str().ok_or_else(|| anyhow!("bad deduction key"))?)?;
+                        let amount = d[1].as_u64().ok_or_else(|| anyhow!("bad deduction amount"))?;
+                        let current = shares.get(key.as_slice())?.map(|v| v.value()).unwrap_or(0);
+                        let restored = current.checked_add(amount)
+                            .ok_or_else(|| anyhow!("share score overflow while restoring orphan"))?;
+                        shares.insert(key.as_slice(), restored)?;
+                    }
+                    tracing::warn!("pool: block {} at height {} was orphaned; shares restored", expected, h);
+                }
+            }
+            if keep.is_empty() {
+                pending_table.remove(h)?;
+            } else {
+                let encoded = serde_json::to_string(&keep)?;
+                pending_table.insert(h, encoded.as_str())?;
             }
         }
         txn.commit()?;
@@ -750,9 +835,15 @@ async fn api_scores(State(state): State<Arc<PoolState>>) -> Json<Value> {
         .iter()
         .map(|(a, s)| json!({ "key": hex::encode(a), "score": s }))
         .collect();
-    Json(
-        json!({ "job_id": job.job_id, "root": hex::encode(job.tree.root), "max_paid": MAX_PAID_MINERS, "scores": scores }),
-    )
+    Json(json!({
+        "job_id": job.job_id,
+        "root": hex::encode(job.tree.root),
+        "height": job.height,
+        "fee_ppm": fee_ppm(state.cfg.fee_percent).expect("validated pool fee"),
+        "pool_address": state.cfg.pool_address.encode(),
+        "max_paid": MAX_PAID_MINERS,
+        "scores": scores,
+    }))
 }
 
 async fn api_template(State(state): State<Arc<PoolState>>) -> Json<Value> {
@@ -832,8 +923,115 @@ async fn api_stats(State(state): State<Arc<PoolState>>) -> Json<Value> {
 
 // ── Miner ───────────────────────────────────────────────────────────────────
 
-/// What a miner checks before hashing on a job. `proof` is the pool's
-/// `/api/proof` answer and `scores` its `/api/scores` answer.
+/// Verify the entire committed score table and this miner's exact payout.
+/// Height is supplied by the pool API (the wire-format Batch omits height):
+/// this protects against arbitrary underpayment at that claimed height, but
+/// an independently trusted node is required to authenticate chain height.
+/// `max_fee_ppm` is the miner's own limit, never a pool-supplied setting.
+pub fn audit_job_with_fee_limit(
+    address: &StealthAddress,
+    mining_hash: &[u8; 32],
+    template_hex: &str,
+    proof: &Value,
+    scores: &Value,
+    max_fee_ppm: u64,
+) -> Result<()> {
+    let batch: Batch = bincode::deserialize(&hex::decode(template_hex)?)?;
+    if &compute_header_hash(&batch.header()) != mining_hash {
+        bail!("template does not hash to the announced mining hash");
+    }
+    if proof["job_id"].as_u64() != scores["job_id"].as_u64() {
+        bail!("proof and score table describe different jobs");
+    }
+    let height = scores["height"].as_u64().ok_or_else(|| anyhow!("missing pool height"))?;
+    let fee = scores["fee_ppm"].as_u64().ok_or_else(|| anyhow!("missing pool fee"))?;
+    if fee >= FEE_SCALE || fee > max_fee_ppm {
+        bail!("pool fee exceeds miner's configured fee limit");
+    }
+    let operator = StealthAddress::decode(
+        scores["pool_address"].as_str().ok_or_else(|| anyhow!("missing pool payout address"))?
+    )?;
+    let total = crate::core::types::block_reward(height)
+        .checked_add(batch.body.fee()?)
+        .ok_or_else(|| anyhow!("reward overflow"))?;
+    let cb = match batch.coinbase.as_ref() {
+        Some(cb) if total > 0 => cb,
+        None if total == 0 => return Ok(()), // unpayable, post-issuance block
+        None => bail!("template drops a payable coinbase"),
+        Some(_) => bail!("template has a coinbase when no reward or fees are payable"),
+    };
+    let key = addr_key(address);
+    let root = hex::encode(cb.extra);
+    if scores["root"].as_str() != Some(root.as_str())
+        || proof["root"].as_str() != Some(root.as_str()) {
+        bail!("pool API roots do not match the block's commitment");
+    }
+    let listed: Vec<(AddrKey, u64)> = scores["scores"].as_array()
+        .ok_or_else(|| anyhow!("missing committed score list"))?
+        .iter()
+        .map(|entry| {
+            let addr: AddrKey = hex::decode(
+                entry["key"].as_str().ok_or_else(|| anyhow!("missing score address"))?
+            )?.try_into().map_err(|_| anyhow!("bad score address length"))?;
+            let score = entry["score"].as_u64().ok_or_else(|| anyhow!("missing score amount"))?;
+            Ok((addr, score))
+        }).collect::<Result<_>>()?;
+    let mut seen = HashSet::new();
+    if listed.iter().any(|(k, _)| !seen.insert(*k)) {
+        bail!("duplicate address in score table");
+    }
+    let tree = ShareMerkleTree::build(listed.clone());
+    if tree.root != cb.extra {
+        bail!("published score list does not match committed root");
+    }
+    let score = proof["score"].as_u64().ok_or_else(|| anyhow!("missing claimed score"))?;
+    let expected_score = listed.iter().find(|(k, _)| *k == key).map_or(0, |(_, s)| *s);
+    if score != expected_score {
+        bail!("claimed score does not match committed score list");
+    }
+    if score > 0 {
+        let index = usize::try_from(
+            proof["index"].as_u64().ok_or_else(|| anyhow!("missing leaf index"))?
+        )?;
+        let siblings: Vec<[u8; 32]> = proof["proof"].as_array()
+            .ok_or_else(|| anyhow!("missing Merkle proof"))?
+            .iter().map(crate::core::auxpow::bytes32).collect::<Result<_>>()?;
+        if fold_proof(score_leaf(&key, score), index, &siblings) != cb.extra {
+            bail!("our share score is not committed in the coinbase");
+        }
+    }
+    let paid = select_paid(&listed);
+    let selected = paid.iter().any(|(k, _)| *k == key);
+    if proof["paid"].as_bool() != Some(selected) {
+        bail!("pool's paid flag contradicts score ranking");
+    }
+    let expected = crate::core::template::split_by_weight(
+        total, &payout_weights(&paid, &operator, fee)?
+    )?.iter().filter(|(a, _)| *a == *address)
+        .try_fold(0u64, |acc, (_, amount)| acc.checked_add(*amount))
+        .ok_or_else(|| anyhow!("expected payout overflow"))?;
+    let receipts: Vec<PayoutReceipt> = serde_json::from_value(proof["receipts"].clone())?;
+    let mut used = HashSet::new();
+    let mut proven = 0u64;
+    for receipt in receipts {
+        if !used.insert(receipt.output_index) {
+            bail!("duplicate payout receipt for one output");
+        }
+        let output = cb.outputs.outputs.get(receipt.output_index)
+            .ok_or_else(|| anyhow!("payout receipt index out of bounds"))?;
+        if !receipt.verify(address, output) {
+            bail!("invalid payout receipt");
+        }
+        proven = proven.checked_add(receipt.value)
+            .ok_or_else(|| anyhow!("proved payout overflow"))?;
+    }
+    if proven != expected {
+        bail!("pool payout mismatch: expected {expected} base units, verified {proven}");
+    }
+    Ok(())
+}
+
+/// Default call for callers that have not configured a local fee policy.
 pub fn audit_job(
     address: &StealthAddress,
     mining_hash: &[u8; 32],
@@ -841,74 +1039,7 @@ pub fn audit_job(
     proof: &Value,
     scores: &Value,
 ) -> Result<()> {
-    let batch: Batch = bincode::deserialize(&hex::decode(template_hex)?)?;
-    if &compute_header_hash(&batch.header()) != mining_hash {
-        bail!("template does not hash to the announced mining hash");
-    }
-    // After issuance ends a block with no fees pays nobody and carries no
-    // coinbase (`core::state::validate_block_contents`). There is no score
-    // commitment and no payout to check, and consensus rejects such a block
-    // if it did have something to claim, so the pool gains nothing by it.
-    let cb = match batch.coinbase.as_ref() {
-        Some(cb) => cb,
-        None => {
-            if batch.body.fee().unwrap_or(u64::MAX) != 0 {
-                bail!("template drops a coinbase but its transactions pay fees");
-            }
-            return Ok(());
-        }
-    };
-    let key = addr_key(address);
-    let score = proof["score"].as_u64().unwrap_or(0);
-    let index = proof["index"].as_u64().unwrap_or(0) as usize;
-    let siblings: Vec<[u8; 32]> = proof["proof"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(crate::core::auxpow::bytes32)
-        .collect::<Result<_>>()?;
-    if score > 0 && fold_proof(score_leaf(&key, score), index, &siblings) != cb.extra {
-        bail!("our score is not in the committed score tree");
-    }
-    // The committed score list must itself hash to the same root.
-    let listed: Vec<(AddrKey, u64)> = scores["scores"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(|s| {
-            let k: AddrKey = hex::decode(s["key"].as_str().unwrap_or_default())?
-                .try_into()
-                .map_err(|_| anyhow!("bad key"))?;
-            Ok((k, s["score"].as_u64().unwrap_or(0)))
-        })
-        .collect::<Result<_>>()?;
-    if !listed.is_empty() && ShareMerkleTree::build(listed.clone()).root != cb.extra {
-        bail!("published score list does not match the committed root");
-    }
-    let paid = select_paid(&listed);
-    let should_be_paid = paid.iter().any(|(k, _)| *k == key);
-    let receipts: Vec<PayoutReceipt> =
-        serde_json::from_value(proof["receipts"].clone()).unwrap_or_default();
-    if should_be_paid {
-        let outputs = &cb.outputs.outputs;
-        let proven: u64 = receipts
-            .iter()
-            .filter(|r| {
-                outputs
-                    .get(r.output_index)
-                    .map_or(false, |o| r.verify(address, o))
-            })
-            .map(|r| r.value)
-            .sum();
-        if proven == 0 {
-            bail!("we rank among the paid miners but the coinbase pays us nothing");
-        }
-    } else if score > 0 && proof["paid"].as_bool() == Some(true) {
-        bail!("pool claims to pay us contrary to its own ranking");
-    }
-    Ok(())
+    audit_job_with_fee_limit(address, mining_hash, template_hex, proof, scores, FEE_SCALE)
 }
 
 #[derive(Clone, Debug)]
@@ -954,11 +1085,23 @@ fn search(
     }
 }
 
-/// Connects to a pool, audits every job, and mines until `stop` is set.
+/// Backwards-compatible client entrypoint; accepts any valid advertised fee.
+/// CLI miners use `run_pool_miner_with_fee_percent` to enforce a local limit.
 pub async fn run_pool_miner(
     cfg: PoolMinerConfig,
     stop: Arc<AtomicBool>,
     stats: Arc<PoolMinerStats>,
+) -> Result<()> {
+    run_pool_miner_with_fee_percent(cfg, stop, stats, 99.9999).await
+}
+
+/// Mine only when the advertised pool fee is at most `max_fee_percent`.
+/// This local policy does not come from the unauthenticated pool API.
+pub async fn run_pool_miner_with_fee_percent(
+    cfg: PoolMinerConfig,
+    stop: Arc<AtomicBool>,
+    stats: Arc<PoolMinerStats>,
+    max_fee_percent: f64,
 ) -> Result<()> {
     let stream =
         tokio::net::TcpStream::connect(cfg.pool.trim_start_matches("stratum+tcp://")).await?;
@@ -974,6 +1117,7 @@ pub async fn run_pool_miner(
     let mut cancel = Arc::new(AtomicBool::new(false));
     let mut next_id = 2u64;
     let mut ticker = tokio::time::interval(Duration::from_millis(200));
+    let max_fee_ppm = fee_ppm(max_fee_percent)?;
     loop {
         tokio::select! {
             line = lines.next_line() => {
@@ -1004,12 +1148,11 @@ pub async fn run_pool_miner(
                     let client = RpcClient::new(api2);
                     let proof = client.get(&format!("/api/proof?address={}", addr.encode()))?;
                     let scores = client.get("/api/scores")?;
-                    if proof["job_id"].as_u64() != Some(job_id) {
-                        // The pool moved on between notify and our query;
-                        // the next notify will be audited instead.
-                        return Ok(());
+                    if proof["job_id"].as_u64() != Some(job_id)
+                        || scores["job_id"].as_u64() != Some(job_id) {
+                        bail!("audit API job differs from the announced job; reconnecting");
                     }
-                    audit_job(&addr, &mining_hash, &th, &proof, &scores)
+                    audit_job_with_fee_limit(&addr, &mining_hash, &th, &proof, &scores, max_fee_ppm)
                 })
                 .await?;
                 if let Err(e) = audit {
@@ -1059,6 +1202,40 @@ mod tests {
         let t = target_from_leading_zero_bits(12);
         assert_eq!(&t[..2], &[0x00, 0x0f]);
         assert!(t[2..].iter().all(|b| *b == 0xff));
+    }
+
+    #[test]
+    fn fee_is_proportional_even_with_one_share() {
+        let operator = WalletKeys::random().address();
+        let miner = WalletKeys::random().address();
+        let weights = payout_weights(&[(addr_key(&miner), 1)], &operator, fee_ppm(2.0).unwrap()).unwrap();
+        let split = crate::core::template::split_by_weight(100_000, &weights).unwrap();
+        assert_eq!(split.iter().find(|(a, _)| *a == operator).unwrap().1, 2_000);
+        assert_eq!(split.iter().find(|(a, _)| *a == miner).unwrap().1, 98_000);
+    }
+
+    #[test]
+    fn sybil_addresses_do_not_receive_independent_minimums() {
+        let large = WalletKeys::random().address();
+        let tiny = WalletKeys::random().address();
+        let split = crate::core::template::split_by_weight(2, &[(large, 100), (tiny, 1)]).unwrap();
+        assert_eq!(split, vec![(large, 2)]);
+    }
+
+    #[test]
+    fn deduct_only_scores_in_the_committed_job() {
+        // B submits 1000 additional shares after a 100/100 job snapshot.
+        // Deductions of that job may never consume those new shares.
+        assert_eq!(snapshot_deduction(500, 1000, 200, 100), 100);
+        assert_eq!(snapshot_deduction(1000, 1000, 200, 100), 100);
+    }
+
+    #[test]
+    fn same_height_pending_records_and_legacy_records() {
+        let a = json!({ "hash": "aaa", "deductions": [] });
+        let b = json!({ "hash": "bbb", "deductions": [] });
+        assert_eq!(parse_pending(&a.to_string()).unwrap(), vec![a.clone()]);
+        assert_eq!(parse_pending(&json!([a.clone(), b.clone()]).to_string()).unwrap(), vec![a, b]);
     }
 
     #[test]
@@ -1120,7 +1297,7 @@ mod tests {
 
         let scores = vec![(addr_key(&me), 5), (addr_key(&other), 3)];
         let tree = ShareMerkleTree::build(scores.clone());
-        let payouts = [(pool, 1), (me, 5), (other, 3)];
+        let payouts = payout_weights(&select_paid(&scores), &pool, fee_ppm(1.0).unwrap()).unwrap();
         let (tpl, receipts) =
             build_template_bonded(&state, &ts, &[], &payouts, tree.root, None, Some(&bond))
                 .unwrap();
@@ -1132,10 +1309,13 @@ mod tests {
             .collect();
         let (idx, proof) = tree.proof(&addr_key(&me)).unwrap();
         let proof_json = |score: u64, receipts: Vec<Value>| {
-            json!({ "score": score, "index": idx, "proof": proof.iter().map(hex::encode).collect::<Vec<_>>(),
-                    "paid": true, "receipts": receipts })
+            json!({ "job_id": 1, "root": hex::encode(tree.root),
+                "score": score, "index": idx, "proof": proof.iter().map(hex::encode).collect::<Vec<_>>(),
+                "paid": true, "receipts": receipts })
         };
-        let scores_json = json!({ "scores": scores.iter().map(|(k, s)| json!({ "key": hex::encode(k), "score": s })).collect::<Vec<_>>() });
+        let scores_json = json!({ "job_id": 1, "root": hex::encode(tree.root), "height": state.height,
+            "fee_ppm": fee_ppm(1.0).unwrap(), "pool_address": pool.encode(),
+            "scores": scores.iter().map(|(k, s)| json!({ "key": hex::encode(k), "score": s })).collect::<Vec<_>>() });
 
         audit_job(
             &me,
@@ -1145,6 +1325,33 @@ mod tests {
             &scores_json,
         )
         .unwrap();
+        // A dishonest pool can build a valid coinbase that pays us less
+        // than the share table entitles us to. The receipt is cryptographically
+        // valid, but the deterministic payout audit must still reject it.
+        let dishonest_payouts = [(pool, 600), (me, 5), (other, 3)];
+        let (dishonest_tpl, dishonest_receipts) = build_template_bonded(
+            &state, &ts, &[], &dishonest_payouts, tree.root, None, Some(&bond)
+        ).unwrap();
+        let dishonest_hex = hex::encode(bincode::serialize(&dishonest_tpl.batch).unwrap());
+        let dishonest_mine: Vec<Value> = dishonest_receipts.iter()
+            .filter(|(a, _)| *a == me)
+            .map(|(_, r)| serde_json::to_value(r).unwrap())
+            .collect();
+        assert!(!dishonest_mine.is_empty());
+        assert!(audit_job(
+            &me, &dishonest_tpl.mining_hash, &dishonest_hex,
+            &proof_json(5, dishonest_mine), &scores_json
+        ).is_err());
+        // A dishonest API claims a fee that does not match actual allocations.
+        let mut dishonest = scores_json.clone();
+        dishonest["fee_ppm"] = json!(fee_ppm(20.0).unwrap());
+        assert!(audit_job(&me, &tpl.mining_hash, &template_hex,
+            &proof_json(5, my_receipts.clone()), &dishonest).is_err());
+        // Changing the height must also require the claimed reward to match.
+        let mut bad_height = scores_json.clone();
+        bad_height["height"] = json!(0);
+        assert!(audit_job(&me, &tpl.mining_hash, &template_hex,
+            &proof_json(5, my_receipts.clone()), &bad_height).is_err());
         // Wrong score claimed.
         assert!(audit_job(
             &me,
