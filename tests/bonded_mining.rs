@@ -69,6 +69,7 @@ async fn a_bonded_producer_mines_and_a_peer_validates_every_block() {
         secret,
         bond_id: registration.bond_id(),
         registration: Some(registration),
+        co_bonds: vec![],
     };
 
     let producer = start(Some(bond.clone()), vec![]).await;
