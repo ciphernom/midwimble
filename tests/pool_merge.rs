@@ -11,7 +11,10 @@
 
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 use midwimble::core::auxpow::bytes32;
-use midwimble::core::bond::{devnet_registration, MinerBond};
+use midwimble::core::bond::{
+    devnet_registration, est_midstate_height, MinerBond, MIN_REMAINING_BOND_LOCK,
+};
+use midwimble::core::state::current_timestamp;
 use midwimble::core::extension::create_extension;
 use midwimble::core::mw::WalletKeys;
 use midwimble::core::types::{hash, GENESIS_TARGET};
@@ -35,8 +38,14 @@ async fn a_pool_mines_midwimble_with_its_midstate_search() {
     let dir = tempfile::tempdir().unwrap();
     let secret = Scalar::from_bytes_mod_order(hash(b"pool operator bond"));
     let mining_key = RistrettoPoint::mul_base(&secret).compress().to_bytes();
-    let registration =
-        devnet_registration(mining_key, 10_000_000, hash(b"pool bond salt"), &GENESIS_TARGET);
+    // Keep the test bond eligible without exceeding the one-year
+    // registration horizon enforced by consensus.
+    let bonded_until = est_midstate_height(current_timestamp())
+        + MIN_REMAINING_BOND_LOCK
+        + 10_000;
+    let registration = devnet_registration(
+        mining_key, bonded_until, hash(b"pool bond salt"), &GENESIS_TARGET,
+    );
     let bond = MinerBond {
         secret,
         bond_id: registration.bond_id(),

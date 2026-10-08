@@ -5,7 +5,10 @@
 #![cfg(feature = "fast-mining")]
 
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
-use midwimble::core::bond::{devnet_registration, MinerBond};
+use midwimble::core::bond::{
+    devnet_registration, est_midstate_height, MinerBond, MIN_REMAINING_BOND_LOCK,
+};
+use midwimble::core::state::current_timestamp;
 use midwimble::core::mw::WalletKeys;
 use midwimble::core::types::{hash, GENESIS_TARGET};
 use midwimble::node::{Node, NodeConfig, NodeHandle};
@@ -63,8 +66,15 @@ async fn wait_until(what: &str, secs: u64, mut done: impl FnMut() -> bool) {
 async fn a_bonded_producer_mines_and_a_peer_validates_every_block() {
     let secret = Scalar::from_bytes_mod_order(hash(b"integration bond"));
     let mining_key = RistrettoPoint::mul_base(&secret).compress().to_bytes();
-    let registration =
-        devnet_registration(mining_key, 10_000_000, hash(b"integration salt"), &GENESIS_TARGET);
+    // Test bonds must be within the registration horizon (one Midstate year),
+    // while remaining eligible throughout the test. A fixed height of
+    // 10_000_000 exceeds that horizon and prevents block template creation.
+    let bonded_until = est_midstate_height(current_timestamp())
+        + MIN_REMAINING_BOND_LOCK
+        + 10_000;
+    let registration = devnet_registration(
+        mining_key, bonded_until, hash(b"integration salt"), &GENESIS_TARGET,
+    );
     let bond = MinerBond {
         secret,
         bond_id: registration.bond_id(),
