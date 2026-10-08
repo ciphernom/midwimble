@@ -59,6 +59,42 @@ impl BlockTemplate {
     }
 }
 
+/// A copy of `template` with `extra` in its coinbase, signed again under the
+/// same bond, and its mining hash. Pools give each miner such a copy, binding
+/// its work to the miner: a nonce found for one copy is worthless for any
+/// other. Only the coinbase's `extra` and the signature change; outputs,
+/// state root and everything else stay as they were. A template without a
+/// coinbase (a block with nothing to claim) has nothing to bind and is
+/// returned unchanged.
+pub fn rebind(
+    template: &BlockTemplate,
+    extra: [u8; 32],
+    bond: Option<&MinerBond>,
+) -> Result<BlockTemplate> {
+    let mut batch = template.batch.clone();
+    let Some(coinbase) = batch.coinbase.as_mut() else {
+        return Ok(template.clone());
+    };
+    coinbase.extra = extra;
+    if let Some(auth) = &template.batch.miner {
+        let bond =
+            bond.ok_or_else(|| anyhow!("the template is signed but no mining bond is configured"))?;
+        let message = authorization_message(&batch.prev_midstate, &batch);
+        batch.miner = Some(MinerAuth {
+            bond_id: auth.bond_id,
+            signature: bond.sign(&message),
+        });
+    }
+    let mut header = batch.header();
+    header.height = template.height;
+    Ok(BlockTemplate {
+        mining_hash: compute_header_hash(&header),
+        batch,
+        height: template.height,
+        fees: template.fees,
+    })
+}
+
 /// Picks transactions greedily by fee per weight until the block is full,
 /// skipping any that conflict with one already chosen or that are not yet
 /// valid at `height`.

@@ -98,11 +98,16 @@ recovery design.
   freezes for the next tip (in the coinbase `extra` field). The sampling is
   seeded by the block the job builds on, and a job on a new tip must pay the
   window miners saw frozen on the previous one, so the pool cannot steer it.
+- **Ownership:** each miner hashes its own copy of the job, whose `extra`
+  binds the commitment to the miner's address and which the node re-signs
+  under the pool's bond (`/mining/bind`). Work found on one miner's copy is
+  worthless to anyone else, so shares cannot be stolen, even by a man in the
+  middle.
 - **Miner audit:** before hashing, a miner checks the template hash, the
-  coinbase total for the claimed height, the published windows against the
-  commitment, that every share the pool accepted from it is counted, and its
-  **payout receipts**, which prove from public data alone that a stealth
-  output pays it exactly what the rule gives it.
+  coinbase total for the claimed height, that the job is bound to its own
+  address and to the published windows, that every share the pool accepted
+  from it is counted, and its **payout receipts**, which prove from public data
+  alone that a stealth output pays it exactly what the rule gives it.
 - **Verification:** each connection's difficulty aims at one share per 15 s,
   with shares weighted by difficulty. Shares queue rather than being dropped;
   connections that have proven work are verified first, in SIMD batches; an
@@ -255,6 +260,7 @@ midwimble anchor-verify --depth 6
 - `POST /tx`
 - `POST /mining`
 - `POST /mining/template` (weighted payouts, `extra`, receipts)
+- `POST /mining/bind` (copies of a template with their own `extra`, re-signed, one per pool miner)
 - `POST /mining/submit`
 - `POST /peers`
 - `GET /utxos` (unspent outputs, for wallets on pruned nodes)

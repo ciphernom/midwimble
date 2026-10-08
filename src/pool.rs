@@ -24,12 +24,20 @@
 //!   job on a new tip must pay the window frozen on the previous one, which
 //!   miners saw before the new tip existed: the pool cannot steer the draw by
 //!   choosing which shares to count.
+//! * **Ownership.** Each miner mines its own copy of a job, whose `extra`
+//!   binds the commitment to the miner's address ([`bind_extra`]) and which
+//!   the node signs again under the pool's bond (`/mining/bind`). A nonce one
+//!   miner finds proves nothing for anyone else's copy, so nobody can be
+//!   credited with someone else's work: not another miner replaying it, and
+//!   not a man in the middle rewriting `mining.authorize`, who can only stop
+//!   the victim, whose audit then fails.
 //! * **Miner audit** ([`audit_job_with_fee_limit`], [`check_window_chain`]):
-//!   the template must hash to the announced mining hash and pay the reward
-//!   at the claimed height; the published windows must match `extra`; the
-//!   window must credit every share the pool told the miner it accepted; and
-//!   the coinbase must pay the miner exactly what the payout rule gives it,
-//!   proven by [`PayoutReceipt`]s. Any failure disconnects.
+//!   the miner's copy must hash to the announced mining hash and pay the
+//!   reward at the claimed height; its `extra` must bind the published
+//!   windows to the miner's own address; the window must credit every share
+//!   the pool told the miner it accepted; and the coinbase must pay the miner
+//!   exactly what the payout rule gives it, proven by [`PayoutReceipt`]s. Any
+//!   failure disconnects.
 //!
 //! The pool can still count shares of its own that nobody mined; making that
 //! detectable needs the shares themselves published so anyone can re-check
@@ -60,10 +68,14 @@
 //! ```text
 //! → {"id":1,"method":"mining.authorize","params":[address, worker]}
 //! ← {"id":1,"result":{"api": "<host:port>"}}
-//! ← {"id":null,"method":"mining.notify","params":[job_id, mining_hash, template_hex, share_target, network_target]}
+//! ← {"id":null,"method":"mining.notify","params":[job_id, mining_hash, template_hex, share_target, network_target, extra, miner_auth]}
 //! → {"id":2,"method":"mining.submit","params":[address, job_id, nonce]}
 //! ← {"id":2,"result":true,"block":false,"seq":n,"weight":w} | {"id":2,"result":false,"error":"..."}
 //! ```
+//!
+//! `template_hex` is the same for every miner; `extra` and `miner_auth` (the
+//! bond signature, or null) turn it into the miner's own copy, whose mining
+//! hash is `mining_hash` ([`bind_template`]).
 //!
 //! The audit API answers for any of the last 16 jobs:
 //! `/api/window?job=N` (the paid window, the next window's root, the fee and
@@ -74,7 +86,7 @@ use crate::core::mw::{PayoutReceipt, StealthAddress};
 use crate::core::simd_mining::{detected_level, pow_seed, verify_pow_batch};
 use crate::core::types::Extension;
 use crate::core::types::{compute_header_hash, hash_concat, hash_domain, Batch};
-use crate::rpc::{template_from_hex, RpcClient};
+use crate::rpc::RpcClient;
 use anyhow::{anyhow, bail, Context, Result};
 use axum::extract::{Query, State};
 use axum::routing::get;
@@ -262,6 +274,15 @@ impl Window {
 /// freezes for the jobs on the next tip.
 pub fn job_commitment(paying_root: &[u8; 32], next_root: &[u8; 32]) -> [u8; 32] {
     hash_domain(b"midwimble.pool.commit.v2", &[paying_root, next_root])
+}
+
+/// The coinbase `extra` of `miner`'s copy of a job with `commitment`. Each
+/// miner hashes on its own copy, so a nonce one miner finds proves nothing
+/// for anyone else's: a share cannot be credited to someone who did not do
+/// its work, even by a man in the middle, who can only stop a miner whose
+/// audit then fails.
+pub fn bind_extra(commitment: &[u8; 32], miner: &[u8; 96]) -> [u8; 32] {
+    hash_domain(b"midwimble.pool.bind.v1", &[commitment, miner])
 }
 
 /// The draw that decides the sampled payouts of a job built on the block
@@ -897,19 +918,47 @@ pub struct PoolConfig {
 
 struct Job {
     job_id: u64,
+    /// The mining hash of the unbound template, which nobody mines.
     mining_hash: [u8; 32],
     network_target: [u8; 32],
+    /// The unbound template, which each miner's copy patches.
     template_hex: String,
+    batch: Batch,
     height: u64,
     /// The block this job builds on.
     prev_hash: [u8; 32],
     /// The window this job pays, and the one it freezes for the next tip.
     paying: Arc<WindowSnapshot>,
     next: Arc<WindowSnapshot>,
+    /// [`job_commitment`] of the two windows: each miner's `extra` binds it.
+    commitment: [u8; 32],
     fee_ppm: u64,
     receipts: Arc<HashMap<AddrKey, Vec<PayoutReceipt>>>,
-    /// Nonces submitted for this job, including those still in verification.
-    seen: std::sync::Mutex<HashSet<u64>>,
+    /// Each miner's copy of the job, by address.
+    variants: std::sync::Mutex<HashMap<AddrKey, Arc<Variant>>>,
+    /// (miner, nonce) submitted for this job, including those still in
+    /// verification.
+    seen: std::sync::Mutex<HashSet<(AddrKey, u64)>>,
+}
+
+/// One miner's copy of a job ([`bind_extra`], `template::rebind`).
+struct Variant {
+    extra: [u8; 32],
+    mining_hash: [u8; 32],
+    /// The copy's signature under the pool's bond, if blocks need one.
+    miner: Option<crate::core::bond::MinerAuth>,
+}
+
+impl Job {
+    /// This job's block with `variant`'s coinbase `extra` and signature.
+    fn bound_batch(&self, variant: &Variant) -> Batch {
+        let mut batch = self.batch.clone();
+        if let Some(coinbase) = batch.coinbase.as_mut() {
+            coinbase.extra = variant.extra;
+        }
+        batch.miner = variant.miner.clone();
+        batch
+    }
 }
 
 #[derive(Default)]
@@ -931,6 +980,9 @@ struct PoolState {
     /// was sent even if a newer one has been published since.
     recent: RwLock<VecDeque<Arc<Job>>>,
     notifier: broadcast::Sender<Arc<Job>>,
+    /// Addresses with an authorized connection, and how many: each new job's
+    /// copies are made for them in one request to the node.
+    connected: std::sync::Mutex<HashMap<AddrKey, usize>>,
     log: std::sync::Mutex<ShareLog>,
     verifier: Verifier,
     bans: Bans,
@@ -986,6 +1038,7 @@ pub async fn run_pool(cfg: PoolConfig, stats: Arc<PoolStats>) -> Result<()> {
         current: RwLock::new(None),
         recent: RwLock::default(),
         notifier,
+        connected: Default::default(),
         log: std::sync::Mutex::new(log),
         verifier: Verifier::start(workers),
         bans: Bans::default(),
@@ -1088,6 +1141,19 @@ async fn job_loop(state: Arc<PoolState>) {
         };
         match build_job(&state, job_id + 1, tip_hash, paying.clone(), next.clone()).await {
             Ok(job) => {
+                // Copies for every connected miner in one request, before the
+                // job is announced; a miner who connects later gets its own
+                // on demand.
+                let miners: Vec<AddrKey> = state
+                    .connected
+                    .lock()
+                    .expect("connected lock")
+                    .keys()
+                    .copied()
+                    .collect();
+                if let Err(e) = bind_miners(&state, &job, miners).await {
+                    tracing::warn!("pool: could not bind the job to its miners: {e:#}");
+                }
                 let job = Arc::new(job);
                 job_id += 1;
                 last_tip = tip;
@@ -1197,14 +1263,89 @@ async fn build_job(
         mining_hash: crate::core::auxpow::bytes32(&tpl["mining_hash"])?,
         network_target: crate::core::auxpow::bytes32(&tpl["target"])?,
         template_hex,
+        batch,
         height: tpl["height"].as_u64().unwrap_or(0),
         prev_hash: tip,
         paying,
         next,
+        commitment: extra,
         fee_ppm: fee,
         receipts: Arc::new(receipts),
+        variants: Default::default(),
         seen: Default::default(),
     })
+}
+
+/// Has the node make `miners`' copies of `job` and keeps them.
+async fn bind_miners(state: &PoolState, job: &Job, miners: Vec<AddrKey>) -> Result<()> {
+    let miners: Vec<AddrKey> = {
+        let have = job.variants.lock().expect("variants lock");
+        miners
+            .into_iter()
+            .filter(|m| !have.contains_key(m))
+            .collect()
+    };
+    if miners.is_empty() {
+        return Ok(());
+    }
+    let extras: Vec<String> = miners
+        .iter()
+        .map(|m| hex::encode(bind_extra(&job.commitment, m)))
+        .collect();
+    let body = json!({ "mining_hash": hex::encode(job.mining_hash), "extras": extras });
+    let node = state.cfg.node_rpc.clone();
+    let answer =
+        tokio::task::spawn_blocking(move || RpcClient::new(node).post("/mining/bind", &body))
+            .await??;
+    let copies = answer["variants"]
+        .as_array()
+        .ok_or_else(|| anyhow!("the node returned no copies"))?;
+    if copies.len() != miners.len() {
+        bail!(
+            "the node returned {} copies for {} miners",
+            copies.len(),
+            miners.len()
+        );
+    }
+    let mut variants = job.variants.lock().expect("variants lock");
+    for (miner, copy) in miners.into_iter().zip(copies) {
+        let extra = crate::core::auxpow::bytes32(&copy["extra"])?;
+        if extra != bind_extra(&job.commitment, &miner) {
+            bail!("the node returned a copy for the wrong miner");
+        }
+        let auth = match copy["miner"].as_str() {
+            Some(h) => Some(bincode::deserialize(&hex::decode(h)?)?),
+            None => None,
+        };
+        let variant = Variant {
+            extra,
+            mining_hash: crate::core::auxpow::bytes32(&copy["mining_hash"])?,
+            miner: auth,
+        };
+        // The copy must be what the miner will check: our own template with
+        // this `extra` and signature hashes to this mining hash.
+        let mut header = job.bound_batch(&variant).header();
+        header.height = job.height;
+        if compute_header_hash(&header) != variant.mining_hash {
+            bail!("the node's copy does not hash to its mining hash");
+        }
+        variants.insert(miner, Arc::new(variant));
+    }
+    Ok(())
+}
+
+/// `miner`'s copy of `job`, made on first use.
+async fn variant_for(state: &PoolState, job: &Job, miner: &AddrKey) -> Result<Arc<Variant>> {
+    if let Some(v) = job.variants.lock().expect("variants lock").get(miner) {
+        return Ok(v.clone());
+    }
+    bind_miners(state, job, vec![*miner]).await?;
+    job.variants
+        .lock()
+        .expect("variants lock")
+        .get(miner)
+        .cloned()
+        .ok_or_else(|| anyhow!("no copy of the job for this miner"))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1224,6 +1365,9 @@ enum ShareOutcome {
 /// A share that passed the cheap checks and awaits its proof of work.
 struct PendingShare {
     job: Arc<Job>,
+    /// The submitter's copy of the job: the share's proof of work is checked
+    /// against it, so a nonce found for anyone else's copy fails.
+    variant: Arc<Variant>,
     miner: AddrKey,
     nonce: u64,
     /// The target this connection was given for the job, and what a share
@@ -1247,7 +1391,17 @@ async fn precheck_share(
         Some(j) if j.job_id == job_id => j,
         _ => return Err(ShareOutcome::StaleJob),
     };
-    if !job.seen.lock().expect("seen lock").insert(nonce) {
+    // The connection was sent this miner's copy before it could submit.
+    let Some(variant) = job
+        .variants
+        .lock()
+        .expect("variants lock")
+        .get(&miner)
+        .cloned()
+    else {
+        return Err(ShareOutcome::StaleJob);
+    };
+    if !job.seen.lock().expect("seen lock").insert((miner, nonce)) {
         return Err(ShareOutcome::Duplicate);
     }
     let extra_bits = bits
@@ -1255,6 +1409,7 @@ async fn precheck_share(
         .min(MAX_WEIGHT_BITS);
     Ok(PendingShare {
         job,
+        variant,
         miner,
         nonce,
         share_target: target_from_leading_zero_bits(bits),
@@ -1271,7 +1426,10 @@ async fn finish_share(
 ) -> Result<ShareOutcome> {
     let job = share.job;
     if final_hash >= share.share_target && final_hash >= job.network_target {
-        job.seen.lock().expect("seen lock").remove(&share.nonce);
+        job.seen
+            .lock()
+            .expect("seen lock")
+            .remove(&(share.miner, share.nonce));
         return Ok(ShareOutcome::Invalid);
     }
     let st = state.clone();
@@ -1289,7 +1447,7 @@ async fn finish_share(
             nonce: share.nonce,
             final_hash,
         };
-        submit_block(state.clone(), job, ext);
+        submit_block(state.clone(), job, share.variant, share.miner, ext);
     }
     Ok(ShareOutcome::Accepted {
         is_block,
@@ -1313,7 +1471,7 @@ async fn process_share(
         Ok(share) => share,
         Err(outcome) => return Ok(outcome),
     };
-    let seed = pow_seed(&share.job.mining_hash, nonce);
+    let seed = pow_seed(&share.variant.mining_hash, nonce);
     let final_hash = state.verifier.verify(seed, proven).await?;
     finish_share(&state, share, final_hash).await
 }
@@ -1321,15 +1479,16 @@ async fn process_share(
 /// Submits a found block. Nothing is settled afterwards: each block's
 /// coinbase pays its own window, so a block that is later orphaned simply
 /// pays nobody, like any other orphaned block.
-fn submit_block(state: Arc<PoolState>, job: Arc<Job>, ext: Extension) {
+fn submit_block(
+    state: Arc<PoolState>,
+    job: Arc<Job>,
+    variant: Arc<Variant>,
+    miner: AddrKey,
+    ext: Extension,
+) {
     tokio::spawn(async move {
-        let sealed = match template_from_hex(&job.template_hex, job.mining_hash) {
-            Ok(t) => t.seal(ext.clone()),
-            Err(e) => {
-                tracing::error!("pool: cannot rebuild the block: {e:#}");
-                return;
-            }
-        };
+        let mut sealed = job.bound_batch(&variant);
+        sealed.extension = ext.clone();
         let block_hex = match bincode::serialize(&sealed) {
             Ok(b) => hex::encode(b),
             Err(_) => return,
@@ -1358,6 +1517,8 @@ fn submit_block(state: Arc<PoolState>, job: Arc<Job>, ext: Extension) {
                     "window": hex::encode(job.paying.root),
                     "window_start": job.paying.window.start_seq,
                     "window_end": job.paying.window.end_seq,
+                    "finder": hex::encode(miner),
+                    "commitment": hex::encode(job.commitment),
                 })
                 .to_string();
                 let st = state.clone();
@@ -1382,23 +1543,65 @@ fn submit_block(state: Arc<PoolState>, job: Arc<Job>, ext: Extension) {
     });
 }
 
-fn notify_line(job: &Job, share_bits: u32) -> String {
-    json!({
+/// A job as one miner sees it: its own copy's mining hash, plus the coinbase
+/// `extra` and signature that turn the shared template into that copy.
+fn notify_line(job: &Job, share_bits: u32, variant: &Variant) -> Result<String> {
+    let miner = match &variant.miner {
+        Some(auth) => Value::String(hex::encode(bincode::serialize(auth)?)),
+        None => Value::Null,
+    };
+    Ok(json!({
         "id": null,
         "method": "mining.notify",
         "params": [
             job.job_id,
-            hex::encode(job.mining_hash),
+            hex::encode(variant.mining_hash),
             job.template_hex,
             hex::encode(target_from_leading_zero_bits(share_bits)),
             hex::encode(job.network_target),
+            hex::encode(variant.extra),
+            miner,
         ],
     })
     .to_string()
-        + "\n"
+        + "\n")
 }
 
 type ShareFuture = Pin<Box<dyn Future<Output = Result<ShareOutcome>> + Send>>;
+
+/// Keeps an address in [`PoolState::connected`] while a connection is
+/// authorized for it.
+struct Registered {
+    state: Arc<PoolState>,
+    miner: AddrKey,
+}
+
+impl Registered {
+    fn new(state: &Arc<PoolState>, miner: AddrKey) -> Self {
+        *state
+            .connected
+            .lock()
+            .expect("connected lock")
+            .entry(miner)
+            .or_default() += 1;
+        Self {
+            state: state.clone(),
+            miner,
+        }
+    }
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        let mut connected = self.state.connected.lock().expect("connected lock");
+        if let Some(count) = connected.get_mut(&self.miner) {
+            *count -= 1;
+            if *count == 0 {
+                connected.remove(&self.miner);
+            }
+        }
+    }
+}
 
 /// A connection's share difficulty and the difficulty it was given for each
 /// recent job, which is what its shares for that job are judged against.
@@ -1408,15 +1611,17 @@ struct Difficulty {
 }
 
 impl Difficulty {
-    /// Retargets for `job` and returns the notify line announcing it.
-    fn announce(&mut self, job: &Job) -> String {
+    /// Retargets for `job` and returns the notify line announcing `miner`'s
+    /// copy of it.
+    async fn announce(&mut self, state: &PoolState, job: &Job, miner: &AddrKey) -> Result<String> {
+        let variant = variant_for(state, job, miner).await?;
         let max_bits = max_share_bits(&job.network_target, self.vardiff.min_bits);
         let bits = self.vardiff.retarget(Instant::now(), max_bits);
         self.announced.push_back((job.job_id, bits));
         while self.announced.len() > 8 {
             self.announced.pop_front();
         }
-        notify_line(job, bits)
+        notify_line(job, bits, &variant)
     }
 
     fn for_job(&self, job_id: u64) -> Option<u32> {
@@ -1441,6 +1646,7 @@ async fn handle_miner(
     let mut lines = LineReader::new(read, MAX_LINE);
     let mut jobs = state.notifier.subscribe();
     let mut authorized: Option<AddrKey> = None;
+    let mut _registered: Option<Registered> = None;
     // Whether this connection has had a share accepted: its shares are then
     // verified ahead of unproven connections'.
     let mut proven = false;
@@ -1465,11 +1671,16 @@ async fn handle_miner(
                         let addr = StealthAddress::decode(
                             params.first().and_then(Value::as_str).unwrap_or_default(),
                         )?;
-                        authorized = Some(addr_key(&addr));
+                        let miner = addr_key(&addr);
+                        authorized = Some(miner);
+                        _registered = Some(Registered::new(&state, miner));
+                        // Jobs announced for another address are stale now.
+                        difficulty.announced.clear();
                         let ok = json!({ "id": id, "result": { "api": state.api_public } });
                         write.write_all((ok.to_string() + "\n").as_bytes()).await?;
                         if let Some(job) = state.current.read().await.clone() {
-                            write.write_all(difficulty.announce(&job).as_bytes()).await?;
+                            let notify = difficulty.announce(&state, &job, &miner).await?;
+                            write.write_all(notify.as_bytes()).await?;
                         }
                         continue;
                     }
@@ -1531,7 +1742,14 @@ async fn handle_miner(
             }
             job = jobs.recv() => {
                 match job {
-                    Ok(job) => write.write_all(difficulty.announce(&job).as_bytes()).await?,
+                    // Each job is bound to the miner, so nothing goes out
+                    // before it says who it is.
+                    Ok(job) => {
+                        if let Some(miner) = authorized {
+                            let notify = difficulty.announce(&state, &job, &miner).await?;
+                            write.write_all(notify.as_bytes()).await?;
+                        }
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => return Ok(()),
                 }
@@ -1623,6 +1841,7 @@ async fn api_window(State(state): State<Arc<PoolState>>, Query(q): Query<JobQuer
         "window": window_json(&job.paying.window),
         "window_root": hex::encode(job.paying.root),
         "next_root": hex::encode(job.next.root),
+        "commitment": hex::encode(job.commitment),
     }))
 }
 
@@ -1794,12 +2013,14 @@ pub fn audit_job_with_fee_limit(
     // passes only if its outputs sum to the reward at `height` plus the fees.
     cb.verify_sum(total)
         .context("coinbase does not pay the reward for the claimed height")?;
-    if cb.extra != job_commitment(&window_root, &next_root) {
-        bail!("the published windows do not match the block's commitment");
+    // Our copy binds the commitment to our address: work on it is worthless
+    // to anyone else, and a job bound to someone else stops here.
+    let key = addr_key(address);
+    if cb.extra != bind_extra(&job_commitment(&window_root, &next_root), &key) {
+        bail!("the job is not bound to our address, or its windows are not the committed ones");
     }
     // A pool that drops us from the window, or shrinks our weight, is caught
     // here: the shares it told us it accepted must all be counted.
-    let key = addr_key(address);
     let listed = paying
         .owners
         .iter()
@@ -1843,6 +2064,21 @@ pub fn audit_job_with_fee_limit(
         bail!("pool payout mismatch: expected {expected} base units, verified {proven}");
     }
     Ok(audited)
+}
+
+/// The pool's shared `template_hex` turned into one miner's copy: its
+/// coinbase `extra` and bond signature replaced.
+pub fn bind_template(
+    template_hex: &str,
+    extra: [u8; 32],
+    miner: Option<crate::core::bond::MinerAuth>,
+) -> Result<String> {
+    let mut batch: Batch = bincode::deserialize(&hex::decode(template_hex)?)?;
+    if let Some(coinbase) = batch.coinbase.as_mut() {
+        coinbase.extra = extra;
+    }
+    batch.miner = miner;
+    Ok(hex::encode(bincode::serialize(&batch)?))
 }
 
 /// [`audit_job_with_fee_limit`] for callers with no fee limit of their own
@@ -1983,7 +2219,14 @@ pub async fn run_pool_miner_with_fee_percent(
                 let p = msg["params"].as_array().cloned().unwrap_or_default();
                 let job_id = p.first().and_then(Value::as_u64).unwrap_or(0);
                 let mining_hash = crate::core::auxpow::bytes32(&p[1])?;
-                let template_hex = p[2].as_str().unwrap_or_default().to_string();
+                // The pool sends one template for everyone and, for us, the
+                // coinbase extra and signature that make it our copy.
+                let extra = crate::core::auxpow::bytes32(p.get(5).unwrap_or(&Value::Null))?;
+                let auth = match p.get(6).and_then(Value::as_str) {
+                    Some(h) => Some(bincode::deserialize(&hex::decode(h)?)?),
+                    None => None,
+                };
+                let template_hex = bind_template(p[2].as_str().unwrap_or_default(), extra, auth)?;
                 let share_target = crate::core::auxpow::bytes32(&p[3])?;
                 let network_target = crate::core::auxpow::bytes32(&p[4])?;
                 stats.jobs.fetch_add(1, Ordering::Relaxed);
@@ -2082,6 +2325,7 @@ mod tests {
             current: RwLock::new(None),
             recent: RwLock::default(),
             notifier: broadcast::channel(4).0,
+            connected: Default::default(),
             log: std::sync::Mutex::new(log),
             verifier: Verifier::start(1),
             bans: Bans::default(),
@@ -2093,20 +2337,36 @@ mod tests {
         })
     }
 
-    /// A job whose network target is never met, so no block is submitted.
-    fn test_job(job_id: u64) -> Arc<Job> {
+    /// A job whose network target is never met, so no block is submitted,
+    /// with a copy for each of `miners`.
+    fn test_job(job_id: u64, miners: &[AddrKey]) -> Arc<Job> {
         let empty = Arc::new(WindowSnapshot::new(Window::default()));
+        let commitment = hash_domain(b"test commitment", &[&job_id.to_le_bytes()]);
+        let variants = miners
+            .iter()
+            .map(|m| {
+                let variant = Variant {
+                    extra: bind_extra(&commitment, m),
+                    mining_hash: hash_domain(b"test copy", &[&job_id.to_le_bytes(), m]),
+                    miner: None,
+                };
+                (*m, Arc::new(variant))
+            })
+            .collect();
         Arc::new(Job {
             job_id,
             mining_hash: hash_domain(b"test job", &[&job_id.to_le_bytes()]),
             network_target: [0; 32],
             template_hex: String::new(),
+            batch: Batch::genesis().clone(),
             height: 1,
             prev_hash: [0; 32],
             paying: empty.clone(),
             next: empty,
+            commitment,
             fee_ppm: 0,
             receipts: Arc::default(),
+            variants: std::sync::Mutex::new(variants),
             seen: Default::default(),
         })
     }
@@ -2472,7 +2732,7 @@ mod tests {
     async fn shares_queue_instead_of_being_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(dir.path(), 0);
-        *state.current.write().await = Some(test_job(1));
+        *state.current.write().await = Some(test_job(1, &[key(7)]));
         let miner = key(7);
         // Far more shares than the one worker can take at once.
         let shares: Vec<_> = (0..40u64)
@@ -2515,7 +2775,7 @@ mod tests {
     async fn shares_weigh_two_to_the_extra_bits_of_difficulty() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(dir.path(), 0);
-        *state.current.write().await = Some(test_job(1));
+        *state.current.write().await = Some(test_job(1, &[key(1)]));
         // Difficulty 3 above the minimum: a share counts 8 times, provided
         // its hash has the three leading zero bits.
         let mut accepted = 0;
@@ -2540,7 +2800,7 @@ mod tests {
     async fn a_share_counts_even_if_its_job_is_replaced_while_it_waits() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(dir.path(), 0);
-        *state.current.write().await = Some(test_job(1));
+        *state.current.write().await = Some(test_job(1, &[key(7)]));
         let miner = key(7);
         let share = precheck_share(&state, miner, 1, 5, 0).await.ok().unwrap();
         // A copy submitted while the first is in verification is a duplicate.
@@ -2548,7 +2808,7 @@ mod tests {
             precheck_share(&state, miner, 1, 5, 0).await,
             Err(ShareOutcome::Duplicate)
         ));
-        *state.current.write().await = Some(test_job(2));
+        *state.current.write().await = Some(test_job(2, &[]));
         let final_hash = state
             .verifier
             .verify(pow_seed(&share.job.mining_hash, 5), true)
@@ -2598,7 +2858,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // No hash meets a 256-bit difficulty: every share is invalid.
         let state = test_state(dir.path(), 256);
-        *state.current.write().await = Some(test_job(1));
+        let me = WalletKeys::random().address();
+        *state.current.write().await = Some(test_job(1, &[addr_key(&me)]));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let st = state.clone();
@@ -2606,7 +2867,6 @@ mod tests {
             let (socket, peer) = listener.accept().await.unwrap();
             handle_miner(socket, peer, st).await
         });
-        let me = WalletKeys::random().address();
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
         let hello = json!({ "id": 1, "method": "mining.authorize", "params": [me.encode(), "w"] });
         let submit = json!({ "id": 2, "method": "mining.submit", "params": [me.encode(), 1, 9] });
@@ -2622,7 +2882,71 @@ mod tests {
         assert!(state.bans.is_banned(ip, Instant::now()));
         assert_eq!(credited(&state, &addr_key(&me)), 0);
         let job = state.current.read().await.clone().unwrap();
-        assert!(!job.seen.lock().unwrap().contains(&9));
+        assert!(!job.seen.lock().unwrap().contains(&(addr_key(&me), 9)));
+    }
+
+    #[tokio::test]
+    async fn a_share_is_worth_nothing_under_another_address() {
+        let dir = tempfile::tempdir().unwrap();
+        // Shares need 8 leading zero bits: a nonce meets that for a given
+        // copy of the job about one time in 256.
+        let state = test_state(dir.path(), 8);
+        let (victim, thief) = (key(1), key(2));
+        let job = test_job(1, &[victim, thief]);
+        let target = target_from_leading_zero_bits(8);
+        let hash_of = |miner: &AddrKey, nonce: u64| {
+            let mining_hash = job.variants.lock().unwrap()[miner].mining_hash;
+            crate::core::extension::create_extension(mining_hash, nonce).final_hash
+        };
+        // A nonce the victim found: a share for its own copy only.
+        let nonce = (0..u64::MAX)
+            .find(|n| hash_of(&victim, *n) < target && hash_of(&thief, *n) >= target)
+            .unwrap();
+        *state.current.write().await = Some(job.clone());
+        // Replayed under the thief's address, it fails (and bans the thief).
+        assert_eq!(
+            process_share(state.clone(), thief, 1, nonce, true, 8)
+                .await
+                .unwrap(),
+            ShareOutcome::Invalid
+        );
+        assert!(matches!(
+            process_share(state.clone(), victim, 1, nonce, true, 8)
+                .await
+                .unwrap(),
+            ShareOutcome::Accepted { .. }
+        ));
+        assert_eq!(credited(&state, &thief), 0);
+        assert_eq!(credited(&state, &victim), 1);
+    }
+
+    #[tokio::test]
+    async fn the_same_nonce_counts_once_per_miner() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), 0);
+        *state.current.write().await = Some(test_job(1, &[key(1), key(2)]));
+        // Different copies of the job: the same nonce is different work.
+        for miner in [key(1), key(2)] {
+            assert!(matches!(
+                process_share(state.clone(), miner, 1, 5, true, 0)
+                    .await
+                    .unwrap(),
+                ShareOutcome::Accepted { .. }
+            ));
+            assert_eq!(
+                process_share(state.clone(), miner, 1, 5, true, 0)
+                    .await
+                    .unwrap(),
+                ShareOutcome::Duplicate
+            );
+        }
+        // Without a copy of the job there is nothing to have mined.
+        assert_eq!(
+            process_share(state.clone(), key(3), 1, 5, true, 0)
+                .await
+                .unwrap(),
+            ShareOutcome::StaleJob
+        );
     }
 
     // ── Commitment and audit ────────────────────────────────────────────────
@@ -2691,10 +3015,19 @@ mod tests {
         };
         let next_root = hash(b"next window");
         // A template for `window` paying `weights`, with the API answers.
-        let job = |window: &Window, weights: &[(StealthAddress, u64)], height: u64, fee: u64| {
-            let extra = job_commitment(&window.root(), &next_root);
-            let (tpl, receipts) =
-                build_template_bonded(&state, &ts, &[], weights, extra, None, Some(&bond)).unwrap();
+        // A template for `window` paying `weights`, the node's copy of it
+        // for `bound_to` (`template::rebind`), and the API answers.
+        let job = |window: &Window,
+                   weights: &[(StealthAddress, u64)],
+                   height: u64,
+                   fee: u64,
+                   bound_to: &StealthAddress| {
+            let commitment = job_commitment(&window.root(), &next_root);
+            let (base, receipts) =
+                build_template_bonded(&state, &ts, &[], weights, commitment, None, Some(&bond))
+                    .unwrap();
+            let extra = bind_extra(&commitment, &addr_key(bound_to));
+            let tpl = crate::core::template::rebind(&base, extra, Some(&bond)).unwrap();
             let mine: Vec<Value> = receipts
                 .iter()
                 .filter(|(a, _)| *a == me)
@@ -2718,24 +3051,47 @@ mod tests {
             audit_job_with_fee_limit(&me, &tpl.mining_hash, &hex, proof, api, 20_000, shares)
         };
 
-        let (tpl, proof, api) = job(&window, &honest(&window), state.height, fee);
+        let (tpl, proof, api) = job(&window, &honest(&window), state.height, fee, &me);
         let audited = audit(&tpl, &proof, &api, &[(101, 2), (105, 3), (90, 7)]).unwrap();
         assert_eq!(audited.window_root, window.root());
         assert_eq!(audited.prev_hash, state.header_hash);
+
+        // The miner rebuilds its copy from the shared template plus the
+        // extra and signature the pool sends: exactly the node's copy.
+        let commitment = job_commitment(&window.root(), &next_root);
+        let (base, _) = build_template_bonded(
+            &state,
+            &ts,
+            &[],
+            &honest(&window),
+            commitment,
+            None,
+            Some(&bond),
+        )
+        .unwrap();
+        let extra = bind_extra(&commitment, &addr_key(&me));
+        let copy = crate::core::template::rebind(&base, extra, Some(&bond)).unwrap();
+        let base_hex = hex::encode(bincode::serialize(&base.batch).unwrap());
+        let rebuilt = bind_template(&base_hex, extra, copy.batch.miner.clone()).unwrap();
+        let rebuilt: Batch = bincode::deserialize(&hex::decode(rebuilt).unwrap()).unwrap();
+        assert_eq!(compute_header_hash(&rebuilt.header()), copy.mining_hash);
+        // A job bound to someone else is refused: our work would be theirs.
+        let (t, p, a) = job(&window, &honest(&window), state.height, fee, &other);
+        assert!(audit(&t, &p, &a, &[]).is_err());
 
         // A valid coinbase that pays us less than the rule gives us.
         let skim: Vec<(StealthAddress, u64)> = honest(&window)
             .into_iter()
             .map(|(a, w)| if a == me { (a, w / 2) } else { (a, w) })
             .collect();
-        let (t, p, a) = job(&window, &skim, state.height, fee);
+        let (t, p, a) = job(&window, &skim, state.height, fee, &me);
         assert!(audit(&t, &p, &a, &[]).is_err());
         // A fee above our limit, even if the coinbase matches it.
         let greedy = {
             let seed = draw_seed(&state.header_hash, &window.root());
             payout_weights(50_000, &pool, &window.owners, &seed).unwrap()
         };
-        let (t, p, a) = job(&window, &greedy, state.height, 50_000);
+        let (t, p, a) = job(&window, &greedy, state.height, 50_000, &me);
         assert!(audit(&t, &p, &a, &[]).is_err());
         // A later era claimed, every miner paid what that height would give.
         let claimed = HALVING_INTERVAL;
@@ -2745,7 +3101,7 @@ mod tests {
         let real = block_reward(state.height);
         let mut skim = vec![(pool, real - to_miners.iter().map(|(_, v)| v).sum::<u64>())];
         skim.extend(to_miners);
-        let (t, p, a) = job(&window, &skim, claimed, fee);
+        let (t, p, a) = job(&window, &skim, claimed, fee, &me);
         assert!(audit(&t, &p, &a, &[]).is_err());
         // A published window other than the committed one.
         let mut forged = api.clone();
@@ -2766,7 +3122,7 @@ mod tests {
         // the shares the pool told us it accepted.
         let mut without = window.clone();
         without.owners.retain(|(k, _)| *k != addr_key(&me));
-        let (t, p, a) = job(&without, &honest(&without), state.height, fee);
+        let (t, p, a) = job(&without, &honest(&without), state.height, fee, &me);
         assert!(audit(&t, &p, &a, &[]).is_ok());
         assert!(audit(&t, &p, &a, &[(104, 1)]).is_err());
         // Shares outside the window's range do not count against it.

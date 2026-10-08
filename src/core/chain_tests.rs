@@ -694,6 +694,34 @@ fn a_bonded_miner_registers_in_its_first_block_and_mines_on() {
 }
 
 #[test]
+fn a_rebound_template_is_a_valid_block_with_its_own_extra() {
+    let mut chain = TestChain::new();
+    let payout = TestWallet::new().address();
+    let bond = bonded_miner(&chain, b"pool operator", locked_long());
+    chain
+        .apply(chain.make_bonded_block(&bond, &payout).unwrap())
+        .unwrap();
+    let template = chain.bonded_template(&bond, &payout).unwrap();
+    let copy = super::template::rebind(&template, [7; 32], Some(&bond)).unwrap();
+    let (cb, original) = (
+        copy.batch.coinbase.as_ref().unwrap(),
+        template.batch.coinbase.as_ref().unwrap(),
+    );
+    assert_eq!(cb.extra, [7; 32]);
+    assert_eq!(cb.outputs, original.outputs);
+    assert_ne!(copy.mining_hash, template.mining_hash);
+    // The old signature does not cover a changed extra: re-signing is needed.
+    let mut stale = template.batch.clone();
+    stale.coinbase.as_mut().unwrap().extra = [7; 32];
+    assert!(
+        check_miner_authorization(&chain.state.bonds, &chain.state.mw_midstate, &stale).is_err()
+    );
+    check_miner_authorization(&chain.state.bonds, &chain.state.mw_midstate, &copy.batch).unwrap();
+    // A nonce found for the copy seals a block the chain accepts.
+    chain.apply(copy.mine_blocking()).unwrap();
+}
+
+#[test]
 fn a_forged_signature_is_rejected_even_with_valid_work() {
     let mut chain = TestChain::new();
     let payout = TestWallet::new().address();
