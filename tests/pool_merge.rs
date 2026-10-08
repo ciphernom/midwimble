@@ -41,6 +41,7 @@ async fn a_pool_mines_midwimble_with_its_midstate_search() {
         secret,
         bond_id: registration.bond_id(),
         registration: Some(registration),
+        co_bonds: vec![],
     };
     let bond_id = hex::encode(bond.bond_id);
     let mut config = NodeConfig::new(dir.path(), "/ip4/127.0.0.1/tcp/0".parse().unwrap());
