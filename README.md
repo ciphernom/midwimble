@@ -86,21 +86,28 @@ recovery design.
 - **Safety check:** the miner refuses to hash unless its reconstruction of
   midstate's fold reproduces the midstate node's mining hash exactly.
 
-### Pool (`pool.rs`, midstate's provably fair design)
+### Pool (`pool.rs`, after midstate's provably fair design)
 
-- **Commitment:** every job commits the full score table (a Merkle root in the
-  coinbase `extra` field).
-- **Payouts:** the fee plus the top 31 scorers, paid directly in the coinbase.
-  Paid miners receive **payout receipts** proving, from public data alone, that
-  a stealth output pays them a given amount.
-- **Miner audit:** before hashing, a miner checks the template hash, its own
-  score proof, its receipt (or its legitimate exclusion), and the published
-  score list.
-- **Kept from midstate:**
-  - per-job share replay protection;
-  - off-reactor proof-of-work checks;
-  - score deduction only after the network accepts the block;
-  - orphan reconciliation.
+- **Payouts (PPLNS):** every block pays the newest shares worth two blocks,
+  directly in its coinbase. Miners entitled to at least 1/31 of the block are
+  paid exactly; smaller ones share the remaining outputs by systematic
+  sampling, so everyone's *expected* payout is exactly their share and
+  splitting work across addresses gains nothing. Nothing is deducted, so there
+  is nothing to settle or restore after a reorganisation.
+- **Commitment:** every job commits the window it pays and the window it
+  freezes for the next tip (in the coinbase `extra` field). The sampling is
+  seeded by the block the job builds on, and a job on a new tip must pay the
+  window miners saw frozen on the previous one, so the pool cannot steer it.
+- **Miner audit:** before hashing, a miner checks the template hash, the
+  coinbase total for the claimed height, the published windows against the
+  commitment, that every share the pool accepted from it is counted, and its
+  **payout receipts**, which prove from public data alone that a stealth
+  output pays it exactly what the rule gives it.
+- **Verification:** each connection's difficulty aims at one share per 15 s,
+  with shares weighted by difficulty. Shares queue rather than being dropped;
+  connections that have proven work are verified first, in SIMD batches; an
+  invalid share bans its sender's address; connections and message sizes are
+  capped.
 
 ### Anchoring and post-quantum recovery (`docs/ANCHORING.md`)
 

@@ -134,9 +134,16 @@ enum Cmd {
         api_public: Option<String>,
         #[arg(long, default_value_t = 1.0)]
         fee: f64,
-        /// Share difficulty in leading zero bits.
+        /// Minimum share difficulty in leading zero bits. Each connection's
+        /// difficulty rises from here, and shares count by difficulty.
         #[arg(long, default_value_t = 12)]
         share_bits: u32,
+        /// Seconds between shares each connection should aim for.
+        #[arg(long, default_value_t = 15.0)]
+        share_interval: f64,
+        /// Blocks' worth of shares each block pays (the PPLNS window).
+        #[arg(long, default_value_t = 2)]
+        window_blocks: u64,
         #[arg(long, default_value = "./pool-data")]
         data_dir: PathBuf,
     },
@@ -823,11 +830,16 @@ fn run(cli: Cli) -> Result<()> {
             api_public,
             fee,
             share_bits,
+            share_interval,
+            window_blocks,
             data_dir,
         } => {
             tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::INFO)
                 .init();
+            if !share_interval.is_finite() || share_interval <= 0.0 {
+                bail!("--share-interval must be a positive number of seconds");
+            }
             let cfg = midwimble::pool::PoolConfig {
                 pool_address: StealthAddress::decode(&address)?,
                 node_rpc: rpc,
@@ -836,6 +848,8 @@ fn run(cli: Cli) -> Result<()> {
                 api_public,
                 fee_percent: fee,
                 share_bits,
+                share_interval: std::time::Duration::from_secs_f64(share_interval),
+                window_blocks,
                 data_dir,
                 poll_interval: std::time::Duration::from_secs(1),
             };
