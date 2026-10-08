@@ -960,6 +960,12 @@ pub fn audit_job_with_fee_limit(
         None => bail!("template drops a payable coinbase"),
         Some(_) => bail!("template has a coinbase when no reward or fees are payable"),
     };
+    // The height comes from the pool's API, not from the template, so a pool
+    // could claim a later era and pay every miner exactly what the audit then
+    // expects while keeping the rest. The coinbase commits to its total: this
+    // passes only if its outputs sum to the reward at `height` plus the fees.
+    cb.verify_sum(total)
+        .context("coinbase does not pay the reward for the claimed height")?;
     let key = addr_key(address);
     let root = hex::encode(cb.extra);
     if scores["root"].as_str() != Some(root.as_str())
@@ -1352,6 +1358,38 @@ mod tests {
         bad_height["height"] = json!(0);
         assert!(audit_job(&me, &tpl.mining_hash, &template_hex,
             &proof_json(5, my_receipts.clone()), &bad_height).is_err());
+        // A pool that claims a later-era height shrinks what every miner
+        // expects, pays exactly that, and keeps the rest of the real reward.
+        // Each payout matches the audit's expectation; only the coinbase
+        // total gives it away.
+        let claimed = crate::core::types::HALVING_INTERVAL;
+        let mut claimed_scores = scores_json.clone();
+        claimed_scores["height"] = json!(claimed);
+        let shrunk = crate::core::template::split_by_weight(
+            crate::core::types::block_reward(claimed),
+            &payout_weights(&select_paid(&scores), &pool, fee_ppm(1.0).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let to_miners: Vec<(StealthAddress, u64)> =
+            shrunk.into_iter().filter(|(a, _)| *a != pool).collect();
+        let real = crate::core::types::block_reward(state.height);
+        let mut skim = vec![(pool, real - to_miners.iter().map(|(_, v)| v).sum::<u64>())];
+        skim.extend(to_miners);
+        let (skim_tpl, skim_receipts) =
+            build_template_bonded(&state, &ts, &[], &skim, tree.root, None, Some(&bond)).unwrap();
+        let skim_mine: Vec<Value> = skim_receipts
+            .iter()
+            .filter(|(a, _)| *a == me)
+            .map(|(_, r)| serde_json::to_value(r).unwrap())
+            .collect();
+        assert!(audit_job(
+            &me,
+            &skim_tpl.mining_hash,
+            &hex::encode(bincode::serialize(&skim_tpl.batch).unwrap()),
+            &proof_json(5, skim_mine),
+            &claimed_scores
+        )
+        .is_err());
         // Wrong score claimed.
         assert!(audit_job(
             &me,
