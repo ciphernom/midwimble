@@ -546,19 +546,57 @@ fn fees_after_the_last_coin_still_need_a_coinbase() {
     chain.mine(&[tx], &alice.address()).unwrap();
 }
 
-/// Slow-start blocks are worth only a few hundred base units, and a pool
-/// splits them across up to 32 payees. Nobody weighted may round to nothing.
+/// Tiny rewards cannot promise one base unit to every address: that would
+/// subsidise Sybil splitting. Verify conservation and proportional rounding.
 #[test]
-fn tiny_rewards_still_pay_every_payee() {
+fn tiny_rewards_round_proportionally() {
     let payees: Vec<(StealthAddress, u64)> = (0..32)
         .map(|i| (TestWallet::new().address(), 1 + i as u64 * 97))
         .collect();
-    for total in [32u64, 100, 553, 1_108, 23_932_616] {
+    let total_weight: u128 = payees.iter().map(|(_, w)| *w as u128).sum();
+    for total in [0u64, 1, 2, 32, 100, 553, 1_108, 23_932_616] {
         let split = super::template::split_by_weight(total, &payees).unwrap();
-        assert_eq!(split.len(), payees.len(), "someone was dropped at {total}");
-        assert!(split.iter().all(|(_, v)| *v > 0));
         assert_eq!(split.iter().map(|(_, v)| *v).sum::<u64>(), total);
+        assert!(split.len() <= payees.len());
+        assert!(split.iter().all(|(_, v)| *v > 0));
+        if total == 32 {
+            assert!(
+                split.len() < payees.len(),
+                "minimum per address is a Sybil subsidy"
+            );
+        }
+        for (address, weight) in &payees {
+            let actual = split
+                .iter()
+                .find(|(recipient, _)| recipient == address)
+                .map_or(0, |(_, value)| *value);
+            let numerator = total as u128 * *weight as u128;
+            let floor = (numerator / total_weight) as u64;
+            let ceil = floor + u64::from(numerator % total_weight != 0);
+            assert!(
+                actual >= floor && actual <= ceil,
+                "{actual} base units for weight {weight} at reward {total}: expected {floor}..={ceil}"
+            );
+        }
     }
+}
+
+#[test]
+fn coinbase_rounding_ties_use_input_order_without_overflow() {
+    let a = TestWallet::new().address();
+    let b = TestWallet::new().address();
+    let c = TestWallet::new().address();
+    let payees = [(a, u64::MAX), (b, u64::MAX), (c, u64::MAX)];
+    let split = super::template::split_by_weight(2, &payees).unwrap();
+    assert_eq!(split, vec![(a, 1), (b, 1)]);
+
+    let split = super::template::split_by_weight(u64::MAX, &payees).unwrap();
+    assert_eq!(
+        split.iter().map(|(_, v)| *v as u128).sum::<u128>(),
+        u64::MAX as u128
+    );
+    let amounts: Vec<u64> = split.iter().map(|(_, value)| *value).collect();
+    assert!(*amounts.iter().max().unwrap() - *amounts.iter().min().unwrap() <= 1);
 }
 
 #[test]
