@@ -110,49 +110,42 @@ const fn hex_digit(c: u8) -> u8 {
 /// Distinguishes this network from midstate and from other deployments of
 /// this code. Feeds the genesis midstate, every signed message, the merged-
 /// mining commitment and the DHT rendezvous key.
-pub const NETWORK_MAGIC: &[u8] = b"MIDWIMBLE_DEVNET_V1";
+pub const NETWORK_MAGIC: &[u8] = b"MIDWIMBLE_TESTNET_V1";
 
-/// Bitcoin block anchoring the genesis. Its hash cannot be known before it is
-/// mined, so a chain committing to it cannot have been started (or quietly
-/// pre-mined) any earlier. **Pick a block mined after the code freeze.**
+/// Bitcoin block anchoring the genesis. Its hash could not be known before it
+/// was mined, so a chain committing to it cannot have been started (or quietly
+/// pre-mined) any earlier.
 pub const BITCOIN_BLOCK_HASH: &str =
-    "000000000000000000018f5ad5625d43356136c2e50c6dc18967a90a18f0af2e";
-pub const BITCOIN_BLOCK_HEIGHT: u64 = 938708;
-/// The anchor block's own timestamp. Genesis may not precede it.
-pub const BITCOIN_BLOCK_TIME: u64 = 1_772_274_770;
+    "0000000000000000000040c857e566e33db423ecc6ccc06d0ea0ae9bc332e7ab";
+pub const BITCOIN_BLOCK_HEIGHT: u64 = 970015;
+/// The anchor block's own timestamp (2026-10-05 12:03 UTC). Genesis may not precede it.
+pub const BITCOIN_BLOCK_TIME: u64 = 1_791_201_787;
 
 /// Midstate block anchoring the genesis: midstate's tip at launch. Like the
-/// Bitcoin anchor it cannot be known before it is mined, and it pins the
-/// midstate chain that bonded mining is judged against. Placeholder: zeros.
+/// Bitcoin anchor it could not be known before it was mined, and it pins the
+/// midstate chain that bonded mining is judged against.
 pub const MIDSTATE_BLOCK_HASH: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
-pub const MIDSTATE_BLOCK_HEIGHT: u64 = 0;
+    "0000030d24c024652a5498ad326ee14f4999c08989a638235938a2909730548c";
+pub const MIDSTATE_BLOCK_HEIGHT: u64 = 317982;
 
 /// Mainnet genesis time; see [`GENESIS_TIMESTAMP`].
-const LAUNCH_GENESIS_TIMESTAMP: u64 = 1_789_430_400; // 2026-09-15 00:00:00 UTC — placeholder
+const LAUNCH_GENESIS_TIMESTAMP: u64 = 1_791_202_464; // 2026-10-05 12:14 UTC
 
-/// Mainnet genesis target; see [`GENESIS_TARGET`]. Placeholder: midstate's
-/// genesis target, which is calibrated for one machine and is roughly four
-/// orders of magnitude too easy for a network of merged miners.
+/// Mainnet genesis target; see [`GENESIS_TARGET`].
+/// midstate's target at height 317982 (0000030f3effffff…) divided by an expected merged-mining share of 0.01.
 const LAUNCH_GENESIS_TARGET: [u8; 32] =
-    hex32("0011ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    hex32("000131f49bffffffffffffffffffffffffffffffffffffffffffffffffffff9c");
 
 /// Smallest bond that grants mining eligibility, in midstate base units.
-/// Midstate coins are powers of two, so this is one too: 2^34 = 16 gMDS on
-/// mainnet. A testnet sets it low (`--min-bond`), because nobody will lock
-/// real money to test someone else's chain, and the bonded path is exercised
-/// just as well by a trivial coin.
-pub const LAUNCH_MIN_MINING_BOND: u64 = 1 << 34;
+/// 2^24 units
+pub const LAUNCH_MIN_MINING_BOND: u64 = 16_777_216;
 
 /// Midstate blocks a bond must still be locked for to be eligible: the
-/// unbonding delay, 30 days on mainnet (`--bond-lock-days`). A testnet sets
-/// it to a day or two so testers' coins come back quickly.
-pub const LAUNCH_MIN_REMAINING_BOND_LOCK: u64 = 30 * 24 * 60;
+/// unbonding delay, 2 day(s).
+pub const LAUNCH_MIN_REMAINING_BOND_LOCK: u64 = 2_880;
 
-/// False while the parameters above are placeholders. The node says so at
-/// startup and `midwimble params` prints it, so a release built without
-/// running the launch script cannot be mistaken for the real network.
-pub const LAUNCH_PARAMETERS_SET: bool = false;
+/// Set by `scripts/set_launch_params.py`: these are real launch parameters.
+pub const LAUNCH_PARAMETERS_SET: bool = true;
 
 // @launch-params:end
 
