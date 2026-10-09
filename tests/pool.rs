@@ -74,6 +74,8 @@ async fn pool_pays_auditing_miners() {
         api_public: None,
         fee_percent: 2.0,
         share_bits: 2,
+        share_interval: Duration::from_millis(200),
+        window_blocks: 2,
         data_dir: dir.path().join("pool"),
         poll_interval: Duration::from_millis(200),
     };
