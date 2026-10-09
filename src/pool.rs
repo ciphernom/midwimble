@@ -232,8 +232,7 @@ fn snapshot_deduction(
     if amount == 0 || distributable == 0 {
         return 0;
     }
-    (amount * total_at_snapshot / distributable)
-        .min(miner_at_snapshot as u128) as u64
+    (amount * total_at_snapshot / distributable).min(miner_at_snapshot as u128) as u64
 }
 
 // Historical pending values stored one record. New values are arrays so
@@ -436,10 +435,14 @@ async fn build_job(state: &Arc<PoolState>, job_id: u64) -> Result<Job> {
     let scores = load_scores(&state.db)?;
     let tree = ShareMerkleTree::build(scores.clone());
     let paid = select_paid(&scores);
-    let payouts: Vec<Value> = payout_weights(&paid, &state.cfg.pool_address, fee_ppm(state.cfg.fee_percent)?)?
-        .iter()
-        .map(|(address, weight)| json!({ "address": address.encode(), "weight": weight }))
-        .collect();
+    let payouts: Vec<Value> = payout_weights(
+        &paid,
+        &state.cfg.pool_address,
+        fee_ppm(state.cfg.fee_percent)?,
+    )?
+    .iter()
+    .map(|(address, weight)| json!({ "address": address.encode(), "weight": weight }))
+    .collect();
     let body = json!({ "payouts": payouts, "extra": hex::encode(tree.root) });
     let node = state.cfg.node_rpc.clone();
     let tpl =
@@ -599,9 +602,8 @@ fn record_accepted(state: &PoolState, job: &Job, ext: &Extension) -> Result<()> 
             if amount == 0 || distributable == 0 {
                 continue;
             }
-            let deduction = snapshot_deduction(
-                amount, distributable, total_at_snapshot, *miner_at_snapshot,
-            );
+            let deduction =
+                snapshot_deduction(amount, distributable, total_at_snapshot, *miner_at_snapshot);
             let current = table.get(k.as_slice())?.map(|v| v.value()).unwrap_or(0);
             let taken = deduction.min(current);
             if current > taken {
@@ -644,7 +646,10 @@ async fn reconcile_pending(state: &Arc<PoolState>, height: u64) -> Result<()> {
     let pending_heights: Vec<u64> = {
         let txn = state.db.begin_read()?;
         let table = txn.open_table(PENDING)?;
-        table.iter()?.map(|entry| Ok(entry?.0.value())).collect::<Result<_>>()?
+        table
+            .iter()?
+            .map(|entry| Ok(entry?.0.value()))
+            .collect::<Result<_>>()?
     };
     for h in pending_heights {
         // Node state.height is the next height. A missing block at or above
@@ -653,8 +658,11 @@ async fn reconcile_pending(state: &Arc<PoolState>, height: u64) -> Result<()> {
             None
         } else {
             let node = state.cfg.node_rpc.clone();
-            let blocks = tokio::task::spawn_blocking(move || RpcClient::new(node).blocks(h, 1)).await??;
-            let block = blocks.first().ok_or_else(|| anyhow!("missing canonical block at height {h}"))?;
+            let blocks =
+                tokio::task::spawn_blocking(move || RpcClient::new(node).blocks(h, 1)).await??;
+            let block = blocks
+                .first()
+                .ok_or_else(|| anyhow!("missing canonical block at height {h}"))?;
             Some(hex::encode(block.extension.final_hash))
         };
         let matured = h <= threshold;
@@ -663,12 +671,15 @@ async fn reconcile_pending(state: &Arc<PoolState>, height: u64) -> Result<()> {
             // Re-read inside the write transaction. A just-accepted block
             // might have appended another record while RPC was in flight.
             let mut pending_table = txn.open_table(PENDING)?;
-            let Some(existing) = pending_table.get(h)? else { continue };
+            let Some(existing) = pending_table.get(h)? else {
+                continue;
+            };
             let records = parse_pending(existing.value())?;
             drop(existing);
             let mut keep = Vec::new();
             for record in records {
-                let expected = record["hash"].as_str()
+                let expected = record["hash"]
+                    .as_str()
                     .ok_or_else(|| anyhow!("pending block without a hash"))?;
                 let confirmed = canonical_hash.as_deref() == Some(expected);
                 if confirmed && !matured {
@@ -677,20 +688,31 @@ async fn reconcile_pending(state: &Arc<PoolState>, height: u64) -> Result<()> {
                 }
                 let mut result = record.clone();
                 result["status"] = json!(if confirmed { "confirmed" } else { "orphaned" });
-                txn.open_table(BLOCKS)?.insert(h, result.to_string().as_str())?;
+                txn.open_table(BLOCKS)?
+                    .insert(h, result.to_string().as_str())?;
                 if !confirmed {
-                    let deductions = record["deductions"].as_array()
+                    let deductions = record["deductions"]
+                        .as_array()
                         .ok_or_else(|| anyhow!("pending block without deductions"))?;
                     let mut shares = txn.open_table(SHARES)?;
                     for d in deductions {
-                        let key = hex::decode(d[0].as_str().ok_or_else(|| anyhow!("bad deduction key"))?)?;
-                        let amount = d[1].as_u64().ok_or_else(|| anyhow!("bad deduction amount"))?;
+                        let key = hex::decode(
+                            d[0].as_str().ok_or_else(|| anyhow!("bad deduction key"))?,
+                        )?;
+                        let amount = d[1]
+                            .as_u64()
+                            .ok_or_else(|| anyhow!("bad deduction amount"))?;
                         let current = shares.get(key.as_slice())?.map(|v| v.value()).unwrap_or(0);
-                        let restored = current.checked_add(amount)
-                            .ok_or_else(|| anyhow!("share score overflow while restoring orphan"))?;
+                        let restored = current.checked_add(amount).ok_or_else(|| {
+                            anyhow!("share score overflow while restoring orphan")
+                        })?;
                         shares.insert(key.as_slice(), restored)?;
                     }
-                    tracing::warn!("pool: block {} at height {} was orphaned; shares restored", expected, h);
+                    tracing::warn!(
+                        "pool: block {} at height {} was orphaned; shares restored",
+                        expected,
+                        h
+                    );
                 }
             }
             if keep.is_empty() {
@@ -943,13 +965,19 @@ pub fn audit_job_with_fee_limit(
     if proof["job_id"].as_u64() != scores["job_id"].as_u64() {
         bail!("proof and score table describe different jobs");
     }
-    let height = scores["height"].as_u64().ok_or_else(|| anyhow!("missing pool height"))?;
-    let fee = scores["fee_ppm"].as_u64().ok_or_else(|| anyhow!("missing pool fee"))?;
+    let height = scores["height"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("missing pool height"))?;
+    let fee = scores["fee_ppm"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("missing pool fee"))?;
     if fee >= FEE_SCALE || fee > max_fee_ppm {
         bail!("pool fee exceeds miner's configured fee limit");
     }
     let operator = StealthAddress::decode(
-        scores["pool_address"].as_str().ok_or_else(|| anyhow!("missing pool payout address"))?
+        scores["pool_address"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing pool payout address"))?,
     )?;
     let total = crate::core::types::block_reward(height)
         .checked_add(batch.body.fee()?)
@@ -969,19 +997,28 @@ pub fn audit_job_with_fee_limit(
     let key = addr_key(address);
     let root = hex::encode(cb.extra);
     if scores["root"].as_str() != Some(root.as_str())
-        || proof["root"].as_str() != Some(root.as_str()) {
+        || proof["root"].as_str() != Some(root.as_str())
+    {
         bail!("pool API roots do not match the block's commitment");
     }
-    let listed: Vec<(AddrKey, u64)> = scores["scores"].as_array()
+    let listed: Vec<(AddrKey, u64)> = scores["scores"]
+        .as_array()
         .ok_or_else(|| anyhow!("missing committed score list"))?
         .iter()
         .map(|entry| {
             let addr: AddrKey = hex::decode(
-                entry["key"].as_str().ok_or_else(|| anyhow!("missing score address"))?
-            )?.try_into().map_err(|_| anyhow!("bad score address length"))?;
-            let score = entry["score"].as_u64().ok_or_else(|| anyhow!("missing score amount"))?;
+                entry["key"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("missing score address"))?,
+            )?
+            .try_into()
+            .map_err(|_| anyhow!("bad score address length"))?;
+            let score = entry["score"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("missing score amount"))?;
             Ok((addr, score))
-        }).collect::<Result<_>>()?;
+        })
+        .collect::<Result<_>>()?;
     let mut seen = HashSet::new();
     if listed.iter().any(|(k, _)| !seen.insert(*k)) {
         bail!("duplicate address in score table");
@@ -990,18 +1027,28 @@ pub fn audit_job_with_fee_limit(
     if tree.root != cb.extra {
         bail!("published score list does not match committed root");
     }
-    let score = proof["score"].as_u64().ok_or_else(|| anyhow!("missing claimed score"))?;
-    let expected_score = listed.iter().find(|(k, _)| *k == key).map_or(0, |(_, s)| *s);
+    let score = proof["score"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("missing claimed score"))?;
+    let expected_score = listed
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map_or(0, |(_, s)| *s);
     if score != expected_score {
         bail!("claimed score does not match committed score list");
     }
     if score > 0 {
         let index = usize::try_from(
-            proof["index"].as_u64().ok_or_else(|| anyhow!("missing leaf index"))?
+            proof["index"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("missing leaf index"))?,
         )?;
-        let siblings: Vec<[u8; 32]> = proof["proof"].as_array()
+        let siblings: Vec<[u8; 32]> = proof["proof"]
+            .as_array()
             .ok_or_else(|| anyhow!("missing Merkle proof"))?
-            .iter().map(crate::core::auxpow::bytes32).collect::<Result<_>>()?;
+            .iter()
+            .map(crate::core::auxpow::bytes32)
+            .collect::<Result<_>>()?;
         if fold_proof(score_leaf(&key, score), index, &siblings) != cb.extra {
             bail!("our share score is not committed in the coinbase");
         }
@@ -1011,11 +1058,12 @@ pub fn audit_job_with_fee_limit(
     if proof["paid"].as_bool() != Some(selected) {
         bail!("pool's paid flag contradicts score ranking");
     }
-    let expected = crate::core::template::split_by_weight(
-        total, &payout_weights(&paid, &operator, fee)?
-    )?.iter().filter(|(a, _)| *a == *address)
-        .try_fold(0u64, |acc, (_, amount)| acc.checked_add(*amount))
-        .ok_or_else(|| anyhow!("expected payout overflow"))?;
+    let expected =
+        crate::core::template::split_by_weight(total, &payout_weights(&paid, &operator, fee)?)?
+            .iter()
+            .filter(|(a, _)| *a == *address)
+            .try_fold(0u64, |acc, (_, amount)| acc.checked_add(*amount))
+            .ok_or_else(|| anyhow!("expected payout overflow"))?;
     let receipts: Vec<PayoutReceipt> = serde_json::from_value(proof["receipts"].clone())?;
     let mut used = HashSet::new();
     let mut proven = 0u64;
@@ -1023,12 +1071,16 @@ pub fn audit_job_with_fee_limit(
         if !used.insert(receipt.output_index) {
             bail!("duplicate payout receipt for one output");
         }
-        let output = cb.outputs.outputs.get(receipt.output_index)
+        let output = cb
+            .outputs
+            .outputs
+            .get(receipt.output_index)
             .ok_or_else(|| anyhow!("payout receipt index out of bounds"))?;
         if !receipt.verify(address, output) {
             bail!("invalid payout receipt");
         }
-        proven = proven.checked_add(receipt.value)
+        proven = proven
+            .checked_add(receipt.value)
             .ok_or_else(|| anyhow!("proved payout overflow"))?;
     }
     if proven != expected {
@@ -1214,7 +1266,8 @@ mod tests {
     fn fee_is_proportional_even_with_one_share() {
         let operator = WalletKeys::random().address();
         let miner = WalletKeys::random().address();
-        let weights = payout_weights(&[(addr_key(&miner), 1)], &operator, fee_ppm(2.0).unwrap()).unwrap();
+        let weights =
+            payout_weights(&[(addr_key(&miner), 1)], &operator, fee_ppm(2.0).unwrap()).unwrap();
         let split = crate::core::template::split_by_weight(100_000, &weights).unwrap();
         assert_eq!(split.iter().find(|(a, _)| *a == operator).unwrap().1, 2_000);
         assert_eq!(split.iter().find(|(a, _)| *a == miner).unwrap().1, 98_000);
@@ -1241,7 +1294,10 @@ mod tests {
         let a = json!({ "hash": "aaa", "deductions": [] });
         let b = json!({ "hash": "bbb", "deductions": [] });
         assert_eq!(parse_pending(&a.to_string()).unwrap(), vec![a.clone()]);
-        assert_eq!(parse_pending(&json!([a.clone(), b.clone()]).to_string()).unwrap(), vec![a, b]);
+        assert_eq!(
+            parse_pending(&json!([a.clone(), b.clone()]).to_string()).unwrap(),
+            vec![a, b]
+        );
     }
 
     #[test]
@@ -1336,28 +1392,52 @@ mod tests {
         // valid, but the deterministic payout audit must still reject it.
         let dishonest_payouts = [(pool, 600), (me, 5), (other, 3)];
         let (dishonest_tpl, dishonest_receipts) = build_template_bonded(
-            &state, &ts, &[], &dishonest_payouts, tree.root, None, Some(&bond)
-        ).unwrap();
+            &state,
+            &ts,
+            &[],
+            &dishonest_payouts,
+            tree.root,
+            None,
+            Some(&bond),
+        )
+        .unwrap();
         let dishonest_hex = hex::encode(bincode::serialize(&dishonest_tpl.batch).unwrap());
-        let dishonest_mine: Vec<Value> = dishonest_receipts.iter()
+        let dishonest_mine: Vec<Value> = dishonest_receipts
+            .iter()
             .filter(|(a, _)| *a == me)
             .map(|(_, r)| serde_json::to_value(r).unwrap())
             .collect();
         assert!(!dishonest_mine.is_empty());
         assert!(audit_job(
-            &me, &dishonest_tpl.mining_hash, &dishonest_hex,
-            &proof_json(5, dishonest_mine), &scores_json
-        ).is_err());
+            &me,
+            &dishonest_tpl.mining_hash,
+            &dishonest_hex,
+            &proof_json(5, dishonest_mine),
+            &scores_json
+        )
+        .is_err());
         // A dishonest API claims a fee that does not match actual allocations.
         let mut dishonest = scores_json.clone();
         dishonest["fee_ppm"] = json!(fee_ppm(20.0).unwrap());
-        assert!(audit_job(&me, &tpl.mining_hash, &template_hex,
-            &proof_json(5, my_receipts.clone()), &dishonest).is_err());
+        assert!(audit_job(
+            &me,
+            &tpl.mining_hash,
+            &template_hex,
+            &proof_json(5, my_receipts.clone()),
+            &dishonest
+        )
+        .is_err());
         // Changing the height must also require the claimed reward to match.
         let mut bad_height = scores_json.clone();
         bad_height["height"] = json!(0);
-        assert!(audit_job(&me, &tpl.mining_hash, &template_hex,
-            &proof_json(5, my_receipts.clone()), &bad_height).is_err());
+        assert!(audit_job(
+            &me,
+            &tpl.mining_hash,
+            &template_hex,
+            &proof_json(5, my_receipts.clone()),
+            &bad_height
+        )
+        .is_err());
         // A pool that claims a later-era height shrinks what every miner
         // expects, pays exactly that, and keeps the rest of the real reward.
         // Each payout matches the audit's expectation; only the coinbase
