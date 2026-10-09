@@ -140,4 +140,27 @@ async fn pool_pays_auditing_miners() {
         .unwrap();
     assert!(stats["blocks_found"].as_u64().unwrap() >= 5, "{stats}");
     let _ = StealthAddress::decode(&alice.address().encode()).unwrap();
+
+    // Every block the pool found is bound to the miner who found it: its
+    // coinbase extra is the job's commitment bound to that miner's address,
+    // so the work could not have been credited to anyone else.
+    let found = stats["blocks"].as_array().unwrap();
+    assert!(found.len() >= 5, "{stats}");
+    for record in found {
+        let height = record["height"].as_u64().unwrap();
+        let block = handle.storage().load_batch(height).unwrap().unwrap();
+        assert_eq!(hex::encode(block.extension.final_hash), record["hash"].as_str().unwrap());
+        let commitment: [u8; 32] = hex::decode(record["commitment"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let finder: [u8; 96] = hex::decode(record["finder"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            block.coinbase.unwrap().extra,
+            midwimble::pool::bind_extra(&commitment, &finder)
+        );
+    }
 }

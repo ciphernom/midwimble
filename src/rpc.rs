@@ -14,6 +14,7 @@
 //! | POST | `/mining` | `{"address": "mw1..." \| null}` |
 //! | POST | `/peers` | `{"addr": multiaddr}` dial |
 //! | POST | `/mining/template` | `{"payouts": [{"address", "weight"}], "extra"?}` → template, mining hash, receipts |
+//! | POST | `/mining/bind` | `{"mining_hash", "extras": [hex]}` → one copy of that template per `extra`, re-signed |
 //! | POST | `/mining/submit` | `{"block_hex"}` solved block (native or merged-mined) |
 
 use crate::core::mw::{StealthAddress, Transaction};
@@ -57,6 +58,7 @@ pub fn router(node: NodeHandle) -> Router {
         .route("/anchors", get(list_anchors).post(submit_anchor))
         .route("/finality", get(finality))
         .route("/mining/template", post(mining_template))
+        .route("/mining/bind", post(mining_bind))
         .route("/mining/submit", post(mining_submit))
         .route("/explorer/blocks", get(crate::explorer::blocks))
         .route("/explorer/block/{id}", get(crate::explorer::block))
@@ -507,11 +509,85 @@ async fn build_mining_template(
     Ok((template, receipts))
 }
 
+/// Recent templates by mining hash, newest last.
+type TemplateCache =
+    std::sync::Mutex<std::collections::VecDeque<([u8; 32], crate::core::template::BlockTemplate)>>;
+
+/// Templates handed out by `/mining/template`, by mining hash, so that
+/// `/mining/bind` only ever re-signs a block this node built itself.
+static MINING_TEMPLATES: std::sync::OnceLock<TemplateCache> = std::sync::OnceLock::new();
+
+fn mining_templates() -> &'static TemplateCache {
+    MINING_TEMPLATES.get_or_init(Default::default)
+}
+
+#[derive(Deserialize)]
+struct BindBody {
+    /// The mining hash `/mining/template` returned.
+    mining_hash: String,
+    /// One coinbase `extra` per copy wanted.
+    extras: Vec<String>,
+}
+
+/// Copies of a template from `/mining/template`, one per `extra`, each
+/// signed again under the same bond (`template::rebind`). A pool gives each
+/// miner its own copy, so a share found by one miner is worthless to any
+/// other.
+async fn mining_bind(AxState(node): AxState<NodeHandle>, Json(body): Json<BindBody>) -> ApiResult {
+    const MAX_EXTRAS: usize = 4_096;
+    if body.extras.len() > MAX_EXTRAS {
+        return Err(bad(format!("at most {MAX_EXTRAS} copies per request")));
+    }
+    let mining_hash = hex32_of(&body.mining_hash)?;
+    let extras: Vec<[u8; 32]> = body
+        .extras
+        .iter()
+        .map(|e| hex32_of(e))
+        .collect::<std::result::Result<_, _>>()?;
+    let template = {
+        let templates = mining_templates().lock().map_err(|e| bad(e.to_string()))?;
+        templates
+            .iter()
+            .find(|(hash, _)| *hash == mining_hash)
+            .map(|(_, template)| template.clone())
+            .ok_or_else(|| bad("no template with that mining hash; ask for a fresh one"))?
+    };
+    let bond = node.mining_bond();
+    let variants = tokio::task::spawn_blocking(move || -> Result<Vec<Value>> {
+        extras
+            .iter()
+            .map(|extra| {
+                let copy = crate::core::template::rebind(&template, *extra, bond.as_ref())?;
+                let miner = match &copy.batch.miner {
+                    Some(auth) => Value::String(hex::encode(bincode::serialize(auth)?)),
+                    None => Value::Null,
+                };
+                Ok(json!({
+                    "extra": hex::encode(extra),
+                    "mining_hash": hex::encode(copy.mining_hash),
+                    "miner": miner,
+                }))
+            })
+            .collect()
+    })
+    .await
+    .map_err(bad)?
+    .map_err(bad)?;
+    Ok(Json(json!({ "variants": variants })))
+}
+
 async fn mining_template(
     AxState(node): AxState<NodeHandle>,
     Json(body): Json<TemplateBody>,
 ) -> ApiResult {
     let (template, receipts) = build_mining_template(&node, body).await?;
+    {
+        let mut templates = mining_templates().lock().map_err(|e| bad(e.to_string()))?;
+        templates.push_back((template.mining_hash, template.clone()));
+        while templates.len() > 16 {
+            templates.pop_front();
+        }
+    }
     let receipts: Vec<Value> = receipts
         .iter()
         .map(|(a, r)| {
