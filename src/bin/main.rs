@@ -170,6 +170,12 @@ enum Cmd {
         /// with x% of fake weight fails each check with probability x%.
         #[arg(long, default_value_t = 4)]
         spot_checks: usize,
+        /// RPC address of a node of your own (e.g. 127.0.0.1:9434). The miner
+        /// then refuses jobs for a height that node passed more than 15 s
+        /// ago: the sign of a pool holding back new tips to steer its payout
+        /// draw.
+        #[arg(long)]
+        node: Option<String>,
     },
     /// List GPUs and run the miner's shader self-test.
     GpuInfo,
@@ -874,6 +880,7 @@ fn run(cli: Cli) -> Result<()> {
             backend,
             max_fee,
             spot_checks,
+            node,
         } => {
             tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::INFO)
@@ -893,6 +900,7 @@ fn run(cli: Cli) -> Result<()> {
                 worker,
                 threads,
                 spot_checks,
+                node,
             };
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             {

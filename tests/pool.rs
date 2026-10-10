@@ -68,7 +68,7 @@ async fn pool_pays_auditing_miners() {
     let pool_stats = Arc::new(PoolStats::default());
     let cfg = PoolConfig {
         pool_address: operator.address(),
-        node_rpc: rpc,
+        node_rpc: rpc.clone(),
         stratum_bind: format!("127.0.0.1:{stratum_port}").parse().unwrap(),
         api_bind: format!("127.0.0.1:{api_port}").parse().unwrap(),
         api_public: None,
@@ -94,6 +94,9 @@ async fn pool_pays_auditing_miners() {
             worker: name.to_string(),
             threads: 1,
             spot_checks: 4,
+            // Alice watches the chain with the node too, so a pool holding
+            // back tips would be caught; this one never does.
+            node: (name == "alice").then(|| rpc.clone()),
         };
         let (stop, stats2) = (stop.clone(), stats.clone());
         tokio::spawn(async move {

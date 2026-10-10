@@ -97,7 +97,10 @@ recovery design.
 - **Commitment:** every job commits the window it pays and the window it
   freezes for the next tip (in the coinbase `extra` field). The sampling is
   seeded by the block the job builds on, and a job on a new tip must pay the
-  window miners saw frozen on the previous one, so the pool cannot steer it.
+  window miners saw frozen on the previous one, so the pool cannot steer it,
+  short of holding a new tip back until it has seen the next block. A miner
+  run with `--node <own node's RPC>` refuses jobs for a height its own node
+  passed more than 15 s earlier, which is how such a delay shows.
 - **Ownership:** each miner hashes its own copy of the job, whose `extra`
   binds the commitment to the miner's address and which the node re-signs
   under the pool's bond (`/mining/bind`). Work found on one miner's copy is

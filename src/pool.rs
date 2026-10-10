@@ -549,8 +549,9 @@ pub fn bind_extra(commitment: &[u8; 32], owner: &OwnerId) -> [u8; 32] {
 /// One way around this remains: a pool that holds back announcing a tip
 /// until it has seen the next block can freeze that tip's window with the
 /// next block's hash in view. Its miners then work on a stale job for a
-/// block interval, which costs the pool its own chance of a block meanwhile;
-/// a miner following the chain with a node of its own can see the delay.
+/// block interval, which costs the pool its own chance of a block meanwhile,
+/// and a miner following the chain with a node of its own refuses the late
+/// job ([`TipWatch`]).
 pub fn draw_seed(prev_header_hash: &[u8; 32], paying_root: &[u8; 32]) -> [u8; 32] {
     hash_domain(b"midwimble.pool.draw.v1", &[prev_header_hash, paying_root])
 }
@@ -2353,8 +2354,9 @@ async fn api_stats(State(state): State<Arc<PoolState>>) -> Json<Value> {
 /// jobs ([`check_window_chain`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditedJob {
-    /// The block the job builds on.
+    /// The block the job builds on, and the height of the block it mines.
     pub prev_hash: [u8; 32],
+    pub height: u64,
     /// The window the job pays, and the one it freezes for the next tip.
     pub window_root: [u8; 32],
     pub next_root: [u8; 32],
@@ -2448,6 +2450,7 @@ pub fn audit_job_with_fee_limit(
     let next_root = crate::core::auxpow::bytes32(&window["next_root"])?;
     let audited = AuditedJob {
         prev_hash: batch.prev_header_hash,
+        height,
         window_root,
         next_root,
         window: paying.clone(),
@@ -2638,6 +2641,65 @@ pub fn verify_sample(window: &Window, at: u128, sample: &Value) -> Result<()> {
     Ok(())
 }
 
+/// How long our own node may have been past a job's height before the pool
+/// sending or keeping us on that job counts as holding the tip back. Room
+/// for the pool's node hearing of a block after ours and building a job.
+pub const STALE_JOB_GRACE: Duration = Duration::from_secs(15);
+
+/// When our own node first passed each recent height.
+///
+/// A pool can steer its payout draw only by holding back a new tip until it
+/// has seen the block after it ([`draw_seed`]): its jobs then arrive for a
+/// height our node passed about a block interval earlier. Only a node of our
+/// own can show that, so the check needs one (`PoolMinerConfig::node`).
+#[derive(Debug, Default)]
+pub struct TipWatch {
+    /// (our node's height, when we first saw it), oldest first, rising.
+    seen: VecDeque<(u64, Instant)>,
+}
+
+impl TipWatch {
+    /// Records our node's height (that of the next block) at `now`. A lower
+    /// height after a reorganisation changes nothing: the blocks were seen.
+    pub fn observe(&mut self, height: u64, now: Instant) {
+        if self.seen.back().is_none_or(|(h, _)| height > *h) {
+            self.seen.push_back((height, now));
+            while self.seen.len() > 256 {
+                self.seen.pop_front();
+            }
+        }
+    }
+
+    /// How long ago our node first had a block at `height`, so was past a
+    /// job mining that height, if it has.
+    pub fn passed(&self, height: u64, now: Instant) -> Option<Duration> {
+        self.seen
+            .iter()
+            .find(|(h, _)| *h > height)
+            .map(|(_, at)| now.saturating_duration_since(*at))
+    }
+
+    /// An error if a job mining `height` is staler than [`STALE_JOB_GRACE`].
+    pub fn check(&self, height: u64, now: Instant) -> Result<()> {
+        match self.passed(height, now) {
+            Some(ago) if ago > STALE_JOB_GRACE => bail!(
+                "the pool has us mining height {height}, which our node passed {}s ago",
+                ago.as_secs()
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Aborts a background task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PoolMinerConfig {
     pub pool: String,
@@ -2648,6 +2710,9 @@ pub struct PoolMinerConfig {
     pub threads: usize,
     /// Shares of each newly paid window to re-check ([`verify_sample`]).
     pub spot_checks: usize,
+    /// RPC address of a node of our own, to catch a pool holding back new
+    /// tips ([`TipWatch`]).
+    pub node: Option<String>,
 }
 
 #[derive(Default, Debug)]
@@ -2732,6 +2797,25 @@ pub async fn run_pool_miner_with_fee_percent(
     // Spot checks run beside mining, once for each newly paid window.
     let (spot_tx, mut spot_rx) = tokio::sync::mpsc::channel::<Result<usize>>(4);
     let mut last_checked: Option<[u8; 32]> = None;
+    // Our own node's progress, polled every second.
+    let watch = Arc::new(std::sync::Mutex::new(TipWatch::default()));
+    let _poller = cfg.node.clone().map(|node| {
+        let watch = watch.clone();
+        AbortOnDrop(tokio::spawn(async move {
+            loop {
+                let rpc = node.clone();
+                if let Ok(Ok(height)) =
+                    tokio::task::spawn_blocking(move || RpcClient::new(rpc).height()).await
+                {
+                    watch
+                        .lock()
+                        .expect("tip watch lock")
+                        .observe(height, Instant::now());
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }))
+    });
     loop {
         tokio::select! {
             line = lines.next_line() => {
@@ -2786,6 +2870,10 @@ pub async fn run_pool_miner_with_fee_percent(
                 .await?;
                 let audited = match audit
                     .and_then(|a| check_window_chain(last_audit.as_ref(), &a).map(|()| a))
+                    .and_then(|a| {
+                        let watch = watch.lock().expect("tip watch lock");
+                        watch.check(a.height, Instant::now()).map(|()| a)
+                    })
                 {
                     Ok(audited) => audited,
                     Err(e) => {
@@ -2860,6 +2948,16 @@ pub async fn run_pool_miner_with_fee_percent(
                 if stop.load(Ordering::Relaxed) {
                     cancel.store(true, Ordering::Relaxed);
                     return Ok(());
+                }
+                // Kept on a job our node has long passed: the pool is holding
+                // back the new tip, or has stalled. Either way, stop.
+                if let Some(job) = &last_audit {
+                    let stale = watch.lock().expect("tip watch lock").check(job.height, Instant::now());
+                    if let Err(e) = stale {
+                        cancel.store(true, Ordering::Relaxed);
+                        stats.audits_failed.fetch_add(1, Ordering::Relaxed);
+                        bail!("{e:#}, disconnecting");
+                    }
                 }
             }
         }
@@ -3242,9 +3340,34 @@ mod tests {
     }
 
     #[test]
+    fn a_job_for_a_height_our_node_long_passed_is_refused() {
+        let t0 = Instant::now();
+        let mut watch = TipWatch::default();
+        // Our node's next block was 10 from t0, 11 from t0 + 5 s, then 12
+        // from t0 + 70 s; a reorganisation back to 11 changes nothing.
+        watch.observe(10, t0);
+        watch.observe(11, t0 + Duration::from_secs(5));
+        watch.observe(12, t0 + Duration::from_secs(70));
+        watch.observe(11, t0 + Duration::from_secs(71));
+        let at = t0 + Duration::from_secs(80);
+        assert_eq!(watch.passed(9, at), Some(Duration::from_secs(80)));
+        assert_eq!(watch.passed(10, at), Some(Duration::from_secs(75)));
+        assert_eq!(watch.passed(11, at), Some(Duration::from_secs(10)));
+        assert_eq!(watch.passed(12, at), None);
+        // A job for height 10 arriving now was held back for over a minute;
+        // one for 11 is within the grace a slower node needs.
+        assert!(watch.check(10, at).is_err());
+        assert!(watch.check(11, at).is_ok());
+        assert!(watch.check(12, at).is_ok());
+        // Without a node of our own there is nothing to compare against.
+        assert!(TipWatch::default().check(0, at).is_ok());
+    }
+
+    #[test]
     fn a_job_on_a_new_tip_must_pay_the_window_frozen_on_the_last() {
         let job = |prev: u8, paying: u8, next: u8| AuditedJob {
             prev_hash: [prev; 32],
+            height: prev as u64,
             window_root: [paying; 32],
             next_root: [next; 32],
             window: Window::default(),
