@@ -152,8 +152,11 @@ enum Cmd {
         /// Pool Stratum endpoint (host:port or stratum+tcp://host:port).
         #[arg(long)]
         pool: String,
+        /// View key of the wallet to be paid (`wallet view-key`), or set
+        /// MIDWIMBLE_VIEW_KEY. The miner finds its own payouts in each job's
+        /// coinbase with it; the pool never sees it.
         #[arg(long)]
-        address: String,
+        view_key: Option<String>,
         #[arg(long, default_value = "worker")]
         worker: String,
         #[arg(long, default_value_t = 0)]
@@ -246,6 +249,9 @@ enum WalletCmd {
     },
     /// Print the receiving address.
     Address,
+    /// Print a view key: it sees every payment to this wallet but cannot
+    /// spend any. `pool-mine` needs one to check its payouts.
+    ViewKey,
     /// Scan new blocks from the node.
     Sync,
     /// Scan, then print the balance.
@@ -858,7 +864,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::PoolMine {
             pool,
-            address,
+            view_key,
             worker,
             threads,
             backend,
@@ -868,9 +874,17 @@ fn run(cli: Cli) -> Result<()> {
                 .with_max_level(tracing::Level::INFO)
                 .init();
             set_backend(&backend)?;
+            let view_key = match view_key {
+                Some(key) => key,
+                None => std::env::var("MIDWIMBLE_VIEW_KEY").map_err(|_| {
+                    anyhow::anyhow!(
+                        "pass --view-key or set MIDWIMBLE_VIEW_KEY (see `wallet view-key`)"
+                    )
+                })?,
+            };
             let cfg = midwimble::pool::PoolMinerConfig {
                 pool,
-                address: StealthAddress::decode(&address)?,
+                view: midwimble::core::mw::ViewKey::decode(&view_key)?,
                 worker,
                 threads,
             };
@@ -1004,6 +1018,11 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 WalletCmd::Address => {
                     out!("{}", Wallet::open(&path, &password()?)?.address());
+                }
+                WalletCmd::ViewKey => {
+                    let view = Wallet::open(&path, &password()?)?.view_key();
+                    eprintln!("Anyone with this key can see every payment to this wallet (never spend it).");
+                    out!("{}", view.encode());
                 }
                 WalletCmd::Sync => {
                     let mut w = Wallet::open(&path, &password()?)?;

@@ -107,8 +107,11 @@ recovery design.
 - **Miner audit:** before hashing, a miner checks the template hash, the
   coinbase total for the claimed height, that the job is bound to its own
   address and to the published windows, that every share the pool accepted
-  from it is counted, and its **payout receipts**, which prove from public data
-  alone that a stealth output pays it exactly what the rule gives it.
+  from it is counted, and, with its wallet's **view key**, that the coinbase
+  pays it exactly what the rule gives it, in outputs it can claim.
+- **Privacy:** the window names owners by a hash of their address, and the
+  pool publishes nothing that links a coinbase output to anyone. The view key
+  stays with the miner; it sees payments but cannot spend them.
 - **Verification:** each connection's difficulty aims at one share per 15 s,
   with shares weighted by difficulty. Shares queue rather than being dropped;
   connections that have proven work are verified first, in SIMD batches; an
@@ -244,7 +247,8 @@ midwimble merge-mine --midstate-rpc 127.0.0.1:8545 --midstate-address <hex> \
 
 # pool and pool miners
 midwimble pool --address <operator address> --stratum 0.0.0.0:3333 --api 0.0.0.0:8081
-midwimble pool-mine --pool stratum+tcp://host:3333 --address <address>
+MIDWIMBLE_VIEW_KEY="$(midwimble wallet view-key)" \
+    midwimble pool-mine --pool stratum+tcp://host:3333   # the view key never leaves the miner
 
 # anchoring checkpoints in midstate
 midwimble anchor --midstate-rpc 127.0.0.1:8545 --depth 6
@@ -324,8 +328,9 @@ verify. The vendored copy keys the file by a seed fingerprint.
   scans the UTXO set once.
 - **Linked outputs:** outputs in one range-proof group are visibly linked (the
   cost of keeping aggregation; one proof per output would remove it).
-- **Pool:** at most 31 miners are paid per block; the others carry their score
-  forward. The WebRTC browser pool from midstate is not ported.
+- **Pool:** a coinbase pays at most 31 miners, so miners with less than 1/31
+  of a block are paid by sampling: exactly their share on average, but in
+  fewer, larger payouts. The WebRTC browser pool from midstate is not ported.
 - **Wallet:** no outgoing history, and the password prompt echoes (use
   `MIDWIMBLE_PASSWORD`).
 

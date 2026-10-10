@@ -198,6 +198,12 @@ impl Wallet {
         self.keys.address()
     }
 
+    /// A key that sees this wallet's incoming payments but cannot spend
+    /// them, e.g. for a pool miner to audit its payouts with.
+    pub fn view_key(&self) -> crate::core::mw::ViewKey {
+        self.keys.view_only()
+    }
+
     pub fn scanned_height(&self) -> u64 {
         self.data.scanned_height
     }

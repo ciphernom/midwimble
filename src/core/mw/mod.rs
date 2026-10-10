@@ -30,7 +30,7 @@ pub use builder::{
     build_coinbase, build_coinbase_with, build_transaction, BuiltTransaction, Payment, Spendable,
 };
 pub use crypto::{Point32, Scalar32};
-pub use stealth::{scan_output, PayoutReceipt, StealthAddress, WalletKeys};
+pub use stealth::{scan_output, PayoutReceipt, StealthAddress, ViewKey, WalletKeys};
 pub use transaction::{
     Coinbase, Context, GroupMember, Input, Kernel, KernelFeatures, Output, OutputGroup,
     StoredGroup, Transaction, TxBody,

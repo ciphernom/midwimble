@@ -90,7 +90,7 @@ async fn pool_pays_auditing_miners() {
         let stats = Arc::new(PoolMinerStats::default());
         let cfg = PoolMinerConfig {
             pool: format!("stratum+tcp://127.0.0.1:{stratum_port}"),
-            address: keys.address(),
+            view: keys.view_only(),
             worker: name.to_string(),
             threads: 1,
         };
@@ -141,8 +141,19 @@ async fn pool_pays_auditing_miners() {
     assert!(stats["blocks_found"].as_u64().unwrap() >= 5, "{stats}");
     let _ = StealthAddress::decode(&alice.address().encode()).unwrap();
 
+    // The pool publishes owners only by id: its window names alice and bob
+    // without giving away their addresses.
+    let window = midwimble::rpc::RpcClient::new(format!("127.0.0.1:{api_port}"))
+        .get("/api/window")
+        .unwrap();
+    let published = window.to_string();
+    for keys in [&alice, &bob] {
+        assert!(!published.contains(&keys.address().encode()));
+        assert!(!published.contains(&hex::encode(keys.address().spend)));
+    }
+
     // Every block the pool found is bound to the miner who found it: its
-    // coinbase extra is the job's commitment bound to that miner's address,
+    // coinbase extra is the job's commitment bound to that miner's owner id,
     // so the work could not have been credited to anyone else.
     let found = stats["blocks"].as_array().unwrap();
     assert!(found.len() >= 5, "{stats}");
@@ -154,7 +165,7 @@ async fn pool_pays_auditing_miners() {
             .unwrap()
             .try_into()
             .unwrap();
-        let finder: [u8; 96] = hex::decode(record["finder"].as_str().unwrap())
+        let finder: [u8; 32] = hex::decode(record["finder"].as_str().unwrap())
             .unwrap()
             .try_into()
             .unwrap();

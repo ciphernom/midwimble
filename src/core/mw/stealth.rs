@@ -206,6 +206,78 @@ impl Drop for ViewKey {
     }
 }
 
+impl std::fmt::Debug for ViewKey {
+    /// Never prints the scan secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ViewKey")
+            .field("address", &self.address.encode())
+            .finish_non_exhaustive()
+    }
+}
+
+const VIEW_KEY_HRP: bech32::Hrp = bech32::Hrp::parse_unchecked("mwview");
+const VIEW_KEY_VERSION: u8 = 1;
+const VIEW_KEY_LEN: usize = 1 + 32 + 32 + 32;
+
+impl ViewKey {
+    /// The address whose payments this key sees.
+    pub fn address(&self) -> StealthAddress {
+        self.address
+    }
+
+    /// Bech32m, human-readable part `mwview`, payload `version ‖ a ‖ B ‖ R`:
+    /// the scan secret, then the address's spend and recovery keys. Whoever
+    /// holds it sees every payment to the address, though it cannot spend
+    /// any of them.
+    pub fn encode(&self) -> String {
+        let mut data = Vec::with_capacity(VIEW_KEY_LEN);
+        data.push(VIEW_KEY_VERSION);
+        data.extend_from_slice(self.scan_secret.as_bytes());
+        data.extend_from_slice(&self.address.spend);
+        data.extend_from_slice(&self.address.recovery);
+        let encoded = bech32::encode::<bech32::Bech32m>(VIEW_KEY_HRP, &data)
+            .expect("a 97-byte payload is well within bech32m limits");
+        data.zeroize();
+        encoded
+    }
+
+    pub fn decode(s: &str) -> Result<Self> {
+        let (hrp, mut data) =
+            bech32::decode(s.trim()).map_err(|e| anyhow!("invalid view key: {e}"))?;
+        let parsed = (|| {
+            if hrp != VIEW_KEY_HRP {
+                bail!("a view key starts with '{}1'", VIEW_KEY_HRP);
+            }
+            if data.len() != VIEW_KEY_LEN || data[0] != VIEW_KEY_VERSION {
+                bail!("unsupported view key version or length");
+            }
+            let scan_secret = scalar_from_bytes(&data[1..33].try_into().expect("32 bytes"))
+                .ok_or_else(|| anyhow!("view key secret is not a canonical scalar"))?;
+            let address = StealthAddress {
+                scan: compress(&RistrettoPoint::mul_base(&scan_secret)),
+                spend: data[33..65].try_into().expect("32 bytes"),
+                recovery: data[65..97].try_into().expect("32 bytes"),
+            };
+            address.points()?;
+            Ok(Self {
+                scan_secret,
+                address,
+            })
+        })();
+        data.zeroize();
+        parsed
+    }
+
+    /// The value of `output` if it pays this key's address, and whether its
+    /// recovery commitment is right (see [`OwnedOutput::recovery_ok`]).
+    pub fn scan(&self, output: &Output) -> Option<(u64, bool)> {
+        let (value, blinding, _, salt) = detect(&self.scan_secret, &self.address.spend, output)?;
+        let recovery_ok = output.recovery_commitment
+            == recovery_commitment(&self.address.recovery, value, &blinding.to_bytes(), &salt);
+        Some((value, recovery_ok))
+    }
+}
+
 // ── Output creation ─────────────────────────────────────────────────────────
 
 /// A freshly created output together with the opening its creator knows.
@@ -499,6 +571,26 @@ mod tests {
         let created = new_output(&bob.address(), 77).unwrap();
         assert_eq!(scan_output_view_only(&view, &created.output), Some(77));
         // The view key alone never exposes b, so it cannot produce ko.
+    }
+
+    #[test]
+    fn view_keys_round_trip_and_audit_payments() {
+        let bob = WalletKeys::random();
+        let s = bob.view_only().encode();
+        assert!(s.starts_with("mwview1"), "{s}");
+        let view = ViewKey::decode(&s).unwrap();
+        assert_eq!(view.address(), bob.address());
+        assert!(ViewKey::decode(&bob.address().encode()).is_err());
+        assert!(!format!("{view:?}").contains(&hex::encode(bob.scan_secret.as_bytes())));
+
+        let paid = new_output(&bob.address(), 41).unwrap();
+        assert_eq!(view.scan(&paid.output), Some((41, true)));
+        let mut wrong_key = bob.address();
+        wrong_key.recovery = [0x42; 32];
+        let unclaimable = new_output(&wrong_key, 41).unwrap();
+        assert_eq!(view.scan(&unclaimable.output), Some((41, false)));
+        let elsewhere = new_output(&WalletKeys::random().address(), 41).unwrap();
+        assert_eq!(view.scan(&elsewhere.output), None);
     }
 
     #[test]

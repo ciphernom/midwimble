@@ -39,8 +39,12 @@
 //!   reward at the claimed height; its `extra` must bind the published
 //!   windows to the miner's own address; the window must credit every share
 //!   the pool told the miner it accepted; and the coinbase must pay the miner
-//!   exactly what the payout rule gives it, proven by [`PayoutReceipt`]s. Any
-//!   failure disconnects.
+//!   exactly what the payout rule gives it, which the miner checks by finding
+//!   its own outputs with its wallet's view key ([`ViewKey`]). Any failure
+//!   disconnects.
+//! * **Privacy.** The window names owners by a hash of their address
+//!   ([`owner_id`]), and the pool publishes nothing that links a coinbase
+//!   output to anyone: only the owner's view key recognises its payouts.
 //!
 //! The pool can still count shares of its own that nobody mined; making that
 //! detectable needs the shares themselves published so anyone can re-check
@@ -81,12 +85,12 @@
 //! hash is `mining_hash` ([`bind_template`]). An accepted share without
 //! `seq` and `weight` was credited to nobody: its job had nothing to pay.
 //!
-//! The audit API answers for any of the last 16 jobs:
-//! `/api/window?job=N` (the paid window, the next window's root, the fee and
-//! the operator's address) and `/api/proof?address=A&job=N` (A's receipts).
+//! The audit API answers for any of the last 16 jobs: `/api/window?job=N`
+//! (the paid window, the next window's root, the fee and the operator's
+//! owner id).
 
 use crate::core::extension::MiningResult;
-use crate::core::mw::{PayoutReceipt, StealthAddress};
+use crate::core::mw::{StealthAddress, ViewKey};
 use crate::core::simd_mining::{detected_level, pow_seed, verify_pow_batch};
 use crate::core::types::Extension;
 use crate::core::types::{compute_header_hash, hash_concat, hash_domain, Batch};
@@ -131,21 +135,25 @@ fn addr_key(a: &StealthAddress) -> AddrKey {
     k
 }
 
-fn key_addr(k: &[u8]) -> Result<StealthAddress> {
-    if k.len() != 96 {
-        bail!("bad address key");
+/// How the pool names a payout address in public: a hash of it.
+pub type OwnerId = [u8; 32];
+
+/// The [`OwnerId`] of `address`. Windows, payouts and bindings use it, so
+/// the pool can publish each owner's weight without publishing its address.
+pub fn owner_id(address: &StealthAddress) -> OwnerId {
+    owner_of(&addr_key(address))
+}
+
+fn owner_of(key: &AddrKey) -> OwnerId {
+    hash_domain(b"midwimble.pool.owner.v1", &[key])
+}
+
+fn key_addr(k: &AddrKey) -> StealthAddress {
+    StealthAddress {
+        scan: k[..32].try_into().expect("32 bytes"),
+        spend: k[32..64].try_into().expect("32 bytes"),
+        recovery: k[64..].try_into().expect("32 bytes"),
     }
-    let mut scan = [0u8; 32];
-    let mut spend = [0u8; 32];
-    let mut recovery = [0u8; 32];
-    scan.copy_from_slice(&k[..32]);
-    spend.copy_from_slice(&k[32..64]);
-    recovery.copy_from_slice(&k[64..]);
-    Ok(StealthAddress {
-        scan,
-        spend,
-        recovery,
-    })
 }
 
 /// `2^(256-bits)`: a hash below it has at least `bits` leading zero bits.
@@ -156,19 +164,19 @@ pub fn target_from_leading_zero_bits(bits: u32) -> [u8; 32] {
 
 // ── Score commitment (midstate's ShareMerkleTree) ───────────────────────────
 
-pub fn score_leaf(addr: &AddrKey, score: u64) -> [u8; 32] {
-    hash_domain(b"midwimble.pool.leaf.v1", &[addr, &score.to_le_bytes()])
+pub fn score_leaf(owner: &OwnerId, score: u64) -> [u8; 32] {
+    hash_domain(b"midwimble.pool.leaf.v2", &[owner, &score.to_le_bytes()])
 }
 
 #[derive(Clone, Default)]
 pub struct ShareMerkleTree {
     pub root: [u8; 32],
-    pub leaves: Vec<(AddrKey, u64)>,
+    pub leaves: Vec<(OwnerId, u64)>,
     layers: Vec<Vec<[u8; 32]>>,
 }
 
 impl ShareMerkleTree {
-    pub fn build(mut shares: Vec<(AddrKey, u64)>) -> Self {
+    pub fn build(mut shares: Vec<(OwnerId, u64)>) -> Self {
         if shares.is_empty() {
             return Self::default();
         }
@@ -195,8 +203,8 @@ impl ShareMerkleTree {
         }
     }
 
-    pub fn proof(&self, addr: &AddrKey) -> Option<(usize, Vec<[u8; 32]>)> {
-        let idx = self.leaves.iter().position(|(a, _)| a == addr)?;
+    pub fn proof(&self, owner: &OwnerId) -> Option<(usize, Vec<[u8; 32]>)> {
+        let idx = self.leaves.iter().position(|(a, _)| a == owner)?;
         let mut proof = Vec::new();
         let mut i = idx;
         for layer in &self.layers[..self.layers.len() - 1] {
@@ -249,8 +257,8 @@ pub const PAYOUT_SCALE: u64 = 1 << 50;
 pub struct Window {
     pub start_seq: u64,
     pub end_seq: u64,
-    /// Total share weight per owner, sorted by key, every weight positive.
-    pub owners: Vec<(AddrKey, u64)>,
+    /// Total share weight per owner, sorted by id, every weight positive.
+    pub owners: Vec<(OwnerId, u64)>,
 }
 
 impl Window {
@@ -262,7 +270,7 @@ impl Window {
         let tree = ShareMerkleTree::build(self.owners.clone());
         let total: u128 = self.owners.iter().map(|(_, w)| *w as u128).sum();
         hash_domain(
-            b"midwimble.pool.window.v1",
+            b"midwimble.pool.window.v2",
             &[
                 &tree.root,
                 &(self.owners.len() as u64).to_le_bytes(),
@@ -280,13 +288,13 @@ pub fn job_commitment(paying_root: &[u8; 32], next_root: &[u8; 32]) -> [u8; 32] 
     hash_domain(b"midwimble.pool.commit.v2", &[paying_root, next_root])
 }
 
-/// The coinbase `extra` of `miner`'s copy of a job with `commitment`. Each
+/// The coinbase `extra` of `owner`'s copy of a job with `commitment`. Each
 /// miner hashes on its own copy, so a nonce one miner finds proves nothing
 /// for anyone else's: a share cannot be credited to someone who did not do
 /// its work, even by a man in the middle, who can only stop a miner whose
 /// audit then fails.
-pub fn bind_extra(commitment: &[u8; 32], miner: &[u8; 96]) -> [u8; 32] {
-    hash_domain(b"midwimble.pool.bind.v1", &[commitment, miner])
+pub fn bind_extra(commitment: &[u8; 32], owner: &OwnerId) -> [u8; 32] {
+    hash_domain(b"midwimble.pool.bind.v2", &[commitment, owner])
 }
 
 /// The draw that decides the sampled payouts of a job built on the block
@@ -310,7 +318,7 @@ pub fn draw_seed(prev_header_hash: &[u8; 32], paying_root: &[u8; 32]) -> [u8; 32
 ///   rounded down.
 /// * The rest is split into equal slots, one per remaining output, and the
 ///   slots are assigned by systematic sampling: the smaller owners are laid
-///   end to end by key, each spanning its weight, and the slots are evenly
+///   end to end by id, each spanning its weight, and the slots are evenly
 ///   spaced points along that line, the first at `offset` (taken modulo the
 ///   smaller owners' total weight). Over a uniformly random offset each
 ///   owner's expected number of slots is exactly proportional to its weight,
@@ -319,14 +327,14 @@ pub fn draw_seed(prev_header_hash: &[u8; 32], paying_root: &[u8; 32]) -> [u8; 32
 ///
 /// Returns amounts in key order, and separately the rounding dust: what
 /// rounding the exact payments and the slot value down left over.
-fn allocate(total: u128, owners: &[(AddrKey, u64)], offset: u128) -> (Vec<(AddrKey, u128)>, u128) {
+fn allocate(total: u128, owners: &[(OwnerId, u64)], offset: u128) -> (Vec<(OwnerId, u128)>, u128) {
     let weight: u128 = owners.iter().map(|(_, w)| *w as u128).sum();
     if weight == 0 {
         return (Vec::new(), total);
     }
     let slots_total = MAX_PAID_MINERS as u128;
-    let mut paid: Vec<(AddrKey, u128)> = Vec::new();
-    let mut small: Vec<(AddrKey, u128)> = Vec::new();
+    let mut paid: Vec<(OwnerId, u128)> = Vec::new();
+    let mut small: Vec<(OwnerId, u128)> = Vec::new();
     let mut exact = 0u128;
     for (key, w) in owners {
         let w = *w as u128;
@@ -373,14 +381,15 @@ fn allocate(total: u128, owners: &[(AddrKey, u64)], offset: u128) -> (Vec<(AddrK
     (paid, rest - slots * slot_value)
 }
 
-/// Coinbase payout weights for a job: the operator's fee and the miners'
-/// payouts from `window`, drawn with `seed`, out of [`PAYOUT_SCALE`].
+/// Coinbase payout weights for a job, by owner id: the operator's fee first,
+/// then the miners' payouts from `window`, drawn with `seed`, out of
+/// [`PAYOUT_SCALE`].
 pub fn payout_weights(
     fee_ppm: u64,
-    operator: &StealthAddress,
-    window: &[(AddrKey, u64)],
+    operator: &OwnerId,
+    window: &[(OwnerId, u64)],
     seed: &[u8; 32],
-) -> Result<Vec<(StealthAddress, u64)>> {
+) -> Result<Vec<(OwnerId, u64)>> {
     if fee_ppm >= FEE_SCALE {
         bail!("invalid pool fee fraction");
     }
@@ -393,22 +402,28 @@ pub fn payout_weights(
     if fee + dust > 0 {
         weights.push((*operator, (fee + dust) as u64));
     }
-    for (key, amount) in miners {
-        weights.push((key_addr(&key)?, amount as u64));
+    for (owner, amount) in miners {
+        weights.push((owner, amount as u64));
     }
     Ok(weights)
 }
 
-/// A frozen [`Window`] and its root.
+/// A frozen [`Window`], its root, and the addresses its owner ids stand for
+/// (which only the pool knows).
 struct WindowSnapshot {
     window: Window,
     root: [u8; 32],
+    addresses: HashMap<OwnerId, StealthAddress>,
 }
 
 impl WindowSnapshot {
-    fn new(window: Window) -> Self {
+    fn new(window: Window, addresses: HashMap<OwnerId, StealthAddress>) -> Self {
         let root = window.root();
-        Self { window, root }
+        Self {
+            window,
+            root,
+            addresses,
+        }
     }
 }
 
@@ -469,9 +484,10 @@ impl ShareLog {
     }
 
     /// The newest shares whose weights add up to at least `size`, or every
-    /// share if there are not that many.
-    fn window(&self, size: u128) -> Window {
-        let mut owners: HashMap<AddrKey, u64> = HashMap::new();
+    /// share if there are not that many, and the address of each owner.
+    fn window(&self, size: u128) -> (Window, HashMap<OwnerId, StealthAddress>) {
+        let mut owners: HashMap<OwnerId, u64> = HashMap::new();
+        let mut addresses = HashMap::new();
         let mut total = 0u128;
         let mut start_seq = self.next_seq;
         for (seq, owner, weight) in self.entries.iter().rev() {
@@ -479,17 +495,20 @@ impl ShareLog {
                 break;
             }
             total += *weight as u128;
-            let sum = owners.entry(*owner).or_default();
+            let id = owner_of(owner);
+            addresses.entry(id).or_insert_with(|| key_addr(owner));
+            let sum = owners.entry(id).or_default();
             *sum = sum.saturating_add(*weight);
             start_seq = *seq;
         }
-        let mut owners: Vec<(AddrKey, u64)> = owners.into_iter().collect();
+        let mut owners: Vec<(OwnerId, u64)> = owners.into_iter().collect();
         owners.sort_by_key(|a| a.0);
-        Window {
+        let window = Window {
             start_seq,
             end_seq: self.next_seq,
             owners,
-        }
+        };
+        (window, addresses)
     }
 
     /// Forgets shares older than `keep_from` that are also outside the newest
@@ -937,7 +956,6 @@ struct Job {
     /// [`job_commitment`] of the two windows: each miner's `extra` binds it.
     commitment: [u8; 32],
     fee_ppm: u64,
-    receipts: Arc<HashMap<AddrKey, Vec<PayoutReceipt>>>,
     /// Each miner's copy of the job, by address.
     variants: std::sync::Mutex<HashMap<AddrKey, Arc<Variant>>>,
     /// (copy's mining hash, nonce) submitted for this job, including those
@@ -1055,7 +1073,6 @@ pub async fn run_pool(cfg: PoolConfig, stats: Arc<PoolStats>) -> Result<()> {
 
     let app = Router::new()
         .route("/pool/stats", get(api_stats))
-        .route("/api/proof", get(api_proof))
         .route("/api/window", get(api_window))
         .route("/api/template", get(api_template))
         .with_state(state.clone());
@@ -1213,8 +1230,8 @@ fn freeze_window(state: &PoolState, network_target: &[u8; 32]) -> Arc<WindowSnap
         state.cfg.share_bits,
         state.cfg.window_blocks,
     );
-    let window = state.log.lock().expect("share log lock").window(size);
-    Arc::new(WindowSnapshot::new(window))
+    let (window, addresses) = state.log.lock().expect("share log lock").window(size);
+    Arc::new(WindowSnapshot::new(window, addresses))
 }
 
 async fn build_job(
@@ -1226,11 +1243,23 @@ async fn build_job(
 ) -> Result<Job> {
     let fee = fee_ppm(state.cfg.fee_percent)?;
     let seed = draw_seed(&tip, &paying.root);
-    let payouts: Vec<Value> =
-        payout_weights(fee, &state.cfg.pool_address, &paying.window.owners, &seed)?
-            .iter()
-            .map(|(address, weight)| json!({ "address": address.encode(), "weight": weight }))
-            .collect();
+    let operator = owner_id(&state.cfg.pool_address);
+    // The payouts go by owner id; only the pool knows the addresses behind
+    // them, so only the node it asks for the template learns them.
+    let payouts: Vec<Value> = payout_weights(fee, &operator, &paying.window.owners, &seed)?
+        .iter()
+        .map(|(owner, weight)| {
+            let address = if *owner == operator {
+                state.cfg.pool_address
+            } else {
+                *paying
+                    .addresses
+                    .get(owner)
+                    .ok_or_else(|| anyhow!("no address for a paid owner"))?
+            };
+            Ok(json!({ "address": address.encode(), "weight": weight }))
+        })
+        .collect::<Result<_>>()?;
     let extra = job_commitment(&paying.root, &next.root);
     let body = json!({ "payouts": payouts, "extra": hex::encode(extra) });
     let node = state.cfg.node_rpc.clone();
@@ -1247,21 +1276,6 @@ async fn build_job(
     if batch.prev_header_hash != tip {
         bail!("the node's tip moved while the job was built");
     }
-
-    let mut receipts: HashMap<AddrKey, Vec<PayoutReceipt>> = HashMap::new();
-    for r in tpl["receipts"]
-        .as_array()
-        .ok_or_else(|| anyhow!("template without receipts"))?
-    {
-        let addr = StealthAddress::decode(r["address"].as_str().unwrap_or_default())?;
-        let receipt = PayoutReceipt {
-            output_index: r["output_index"].as_u64().unwrap_or(0) as usize,
-            value: r["value"].as_u64().unwrap_or(0),
-            blinding: crate::core::auxpow::bytes32(&r["blinding"])?,
-            ephemeral_secret: crate::core::auxpow::bytes32(&r["ephemeral_secret"])?,
-        };
-        receipts.entry(addr_key(&addr)).or_default().push(receipt);
-    }
     Ok(Job {
         job_id,
         mining_hash: crate::core::auxpow::bytes32(&tpl["mining_hash"])?,
@@ -1274,7 +1288,6 @@ async fn build_job(
         next,
         commitment: extra,
         fee_ppm: fee,
-        receipts: Arc::new(receipts),
         variants: Default::default(),
         seen: Default::default(),
     })
@@ -1294,7 +1307,7 @@ async fn bind_miners(state: &PoolState, job: &Job, miners: Vec<AddrKey>) -> Resu
     }
     let extras: Vec<String> = miners
         .iter()
-        .map(|m| hex::encode(bind_extra(&job.commitment, m)))
+        .map(|m| hex::encode(bind_extra(&job.commitment, &owner_of(m))))
         .collect();
     let body = json!({ "mining_hash": hex::encode(job.mining_hash), "extras": extras });
     let node = state.cfg.node_rpc.clone();
@@ -1314,7 +1327,7 @@ async fn bind_miners(state: &PoolState, job: &Job, miners: Vec<AddrKey>) -> Resu
     let mut variants = job.variants.lock().expect("variants lock");
     for (miner, copy) in miners.into_iter().zip(copies) {
         let extra = crate::core::auxpow::bytes32(&copy["extra"])?;
-        if extra != bind_extra(&job.commitment, &miner) {
+        if extra != bind_extra(&job.commitment, &owner_of(&miner)) {
             bail!("the node returned a copy for the wrong miner");
         }
         let auth = match copy["miner"].as_str() {
@@ -1546,7 +1559,7 @@ fn submit_block(
                     "window": hex::encode(job.paying.root),
                     "window_start": job.paying.window.start_seq,
                     "window_end": job.paying.window.end_seq,
-                    "finder": hex::encode(miner),
+                    "finder": hex::encode(owner_of(&miner)),
                     "commitment": hex::encode(job.commitment),
                 })
                 .to_string();
@@ -1799,12 +1812,6 @@ async fn handle_miner(
 const RECENT_JOBS: usize = 16;
 
 #[derive(Deserialize)]
-struct AddressQuery {
-    address: String,
-    job: Option<u64>,
-}
-
-#[derive(Deserialize)]
 struct JobQuery {
     job: Option<u64>,
 }
@@ -1823,30 +1830,6 @@ async fn find_job(state: &PoolState, job_id: Option<u64>) -> Option<Arc<Job>> {
     }
 }
 
-/// The receipts for one address's outputs in a job's coinbase.
-async fn api_proof(
-    State(state): State<Arc<PoolState>>,
-    Query(q): Query<AddressQuery>,
-) -> Json<Value> {
-    let Some(job) = find_job(&state, q.job).await else {
-        return Json(json!({ "error": "no such job" }));
-    };
-    let addr = match StealthAddress::decode(&q.address) {
-        Ok(a) => addr_key(&a),
-        Err(e) => return Json(json!({ "error": e.to_string() })),
-    };
-    let receipts: Vec<Value> = job
-        .receipts
-        .get(&addr)
-        .map(|rs| {
-            rs.iter()
-                .map(|r| serde_json::to_value(r).unwrap_or_default())
-                .collect()
-        })
-        .unwrap_or_default();
-    Json(json!({ "job_id": job.job_id, "receipts": receipts }))
-}
-
 fn window_json(window: &Window) -> Value {
     json!({
         "start_seq": window.start_seq,
@@ -1854,14 +1837,14 @@ fn window_json(window: &Window) -> Value {
         "owners": window
             .owners
             .iter()
-            .map(|(k, w)| json!({ "key": hex::encode(k), "weight": w }))
+            .map(|(id, w)| json!({ "id": hex::encode(id), "weight": w }))
             .collect::<Vec<_>>(),
     })
 }
 
 /// Everything a miner needs to recompute a job's payouts: the window it
 /// pays, the root of the window it freezes, the fee and the operator's
-/// address.
+/// owner id.
 async fn api_window(State(state): State<Arc<PoolState>>, Query(q): Query<JobQuery>) -> Json<Value> {
     let Some(job) = find_job(&state, q.job).await else {
         return Json(json!({ "error": "no such job" }));
@@ -1871,7 +1854,7 @@ async fn api_window(State(state): State<Arc<PoolState>>, Query(q): Query<JobQuer
         "height": job.height,
         "prev_hash": hex::encode(job.prev_hash),
         "fee_ppm": job.fee_ppm,
-        "pool_address": state.cfg.pool_address.encode(),
+        "operator": hex::encode(owner_id(&state.cfg.pool_address)),
         "max_paid": MAX_PAID_MINERS,
         "window": window_json(&job.paying.window),
         "window_root": hex::encode(job.paying.root),
@@ -1947,18 +1930,12 @@ pub struct AuditedJob {
 }
 
 fn parse_window(value: &Value) -> Result<Window> {
-    let owners: Vec<(AddrKey, u64)> = value["owners"]
+    let owners: Vec<(OwnerId, u64)> = value["owners"]
         .as_array()
         .ok_or_else(|| anyhow!("missing window owners"))?
         .iter()
         .map(|entry| {
-            let key: AddrKey = hex::decode(
-                entry["key"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("missing owner key"))?,
-            )?
-            .try_into()
-            .map_err(|_| anyhow!("bad owner key length"))?;
+            let key = crate::core::auxpow::bytes32(&entry["id"]).context("bad owner id")?;
             let weight = entry["weight"]
                 .as_u64()
                 .ok_or_else(|| anyhow!("missing owner weight"))?;
@@ -1983,10 +1960,10 @@ fn parse_window(value: &Value) -> Result<Window> {
 
 /// Verifies a job before mining it: the template, the commitment to the
 /// window it pays, our own weight in that window, and that the coinbase pays
-/// us exactly what the payout rule ([`payout_weights`]) gives us.
+/// us exactly what the payout rule ([`payout_weights`]) gives us, found with
+/// our view key.
 ///
-/// * `proof` and `window` are the pool's `/api/proof` and `/api/window`
-///   answers for the job.
+/// * `window` is the pool's `/api/window` answer for the job.
 /// * `max_fee_ppm` is the miner's own limit, never a pool-supplied setting.
 /// * `my_shares` are `(sequence number, weight)` of shares the pool accepted
 ///   from us: the window must credit us at least the ones inside its range.
@@ -1995,10 +1972,9 @@ fn parse_window(value: &Value) -> Result<Window> {
 /// coinbase total pins it to the reward at that height, but only a node of
 /// one's own can confirm the chain itself.
 pub fn audit_job_with_fee_limit(
-    address: &StealthAddress,
+    view: &ViewKey,
     mining_hash: &[u8; 32],
     template_hex: &str,
-    proof: &Value,
     window: &Value,
     max_fee_ppm: u64,
     my_shares: &[(u64, u64)],
@@ -2006,9 +1982,6 @@ pub fn audit_job_with_fee_limit(
     let batch: Batch = bincode::deserialize(&hex::decode(template_hex)?)?;
     if &compute_header_hash(&batch.header()) != mining_hash {
         bail!("template does not hash to the announced mining hash");
-    }
-    if proof["job_id"].as_u64() != window["job_id"].as_u64() {
-        bail!("proof and window describe different jobs");
     }
     let height = window["height"]
         .as_u64()
@@ -2019,11 +1992,8 @@ pub fn audit_job_with_fee_limit(
     if fee >= FEE_SCALE || fee > max_fee_ppm {
         bail!("pool fee exceeds miner's configured fee limit");
     }
-    let operator = StealthAddress::decode(
-        window["pool_address"]
-            .as_str()
-            .ok_or_else(|| anyhow!("missing pool payout address"))?,
-    )?;
+    let operator =
+        crate::core::auxpow::bytes32(&window["operator"]).context("missing operator id")?;
     let paying = parse_window(&window["window"])?;
     let window_root = paying.root();
     let next_root = crate::core::auxpow::bytes32(&window["next_root"])?;
@@ -2050,7 +2020,7 @@ pub fn audit_job_with_fee_limit(
         .context("coinbase does not pay the reward for the claimed height")?;
     // Our copy binds the commitment to our address: work on it is worthless
     // to anyone else, and a job bound to someone else stops here.
-    let key = addr_key(address);
+    let key = owner_id(&view.address());
     if cb.extra != bind_extra(&job_commitment(&window_root, &next_root), &key) {
         bail!("the job is not bound to our address, or its windows are not the committed ones");
     }
@@ -2073,30 +2043,25 @@ pub fn audit_job_with_fee_limit(
     let weights = payout_weights(fee, &operator, &paying.owners, &seed)?;
     let expected = crate::core::template::split_by_weight(total, &weights)?
         .iter()
-        .filter(|(a, _)| *a == *address)
+        .filter(|(owner, _)| *owner == key)
         .try_fold(0u64, |acc, (_, amount)| acc.checked_add(*amount))
         .ok_or_else(|| anyhow!("expected payout overflow"))?;
-    let receipts: Vec<PayoutReceipt> = serde_json::from_value(proof["receipts"].clone())?;
-    let mut used = HashSet::new();
-    let mut proven = 0u64;
-    for receipt in receipts {
-        if !used.insert(receipt.output_index) {
-            bail!("duplicate payout receipt for one output");
+    // Our view key finds what the coinbase really pays us. Nothing the pool
+    // publishes links an output to anyone, and nothing it could publish
+    // would let it claim an output pays us when it does not.
+    let mut found = 0u64;
+    for output in &cb.outputs.outputs {
+        if let Some((value, recovery_ok)) = view.scan(output) {
+            if !recovery_ok {
+                bail!("the pool paid us an output that could not be claimed after a curve break");
+            }
+            found = found
+                .checked_add(value)
+                .ok_or_else(|| anyhow!("found payout overflow"))?;
         }
-        let output = cb
-            .outputs
-            .outputs
-            .get(receipt.output_index)
-            .ok_or_else(|| anyhow!("payout receipt index out of bounds"))?;
-        if !receipt.verify(address, output) {
-            bail!("invalid payout receipt");
-        }
-        proven = proven
-            .checked_add(receipt.value)
-            .ok_or_else(|| anyhow!("proved payout overflow"))?;
     }
-    if proven != expected {
-        bail!("pool payout mismatch: expected {expected} base units, verified {proven}");
+    if found != expected {
+        bail!("pool payout mismatch: expected {expected} base units, found {found}");
     }
     Ok(audited)
 }
@@ -2119,21 +2084,12 @@ pub fn bind_template(
 /// [`audit_job_with_fee_limit`] for callers with no fee limit of their own
 /// and no record of accepted shares.
 pub fn audit_job(
-    address: &StealthAddress,
+    view: &ViewKey,
     mining_hash: &[u8; 32],
     template_hex: &str,
-    proof: &Value,
     window: &Value,
 ) -> Result<AuditedJob> {
-    audit_job_with_fee_limit(
-        address,
-        mining_hash,
-        template_hex,
-        proof,
-        window,
-        FEE_SCALE,
-        &[],
-    )
+    audit_job_with_fee_limit(view, mining_hash, template_hex, window, FEE_SCALE, &[])
 }
 
 /// Checks a newly audited job against the previous one. On the same tip
@@ -2155,7 +2111,9 @@ pub fn check_window_chain(last: Option<&AuditedJob>, job: &AuditedJob) -> Result
 #[derive(Clone, Debug)]
 pub struct PoolMinerConfig {
     pub pool: String,
-    pub address: StealthAddress,
+    /// The view key of the wallet to be paid: the miner authorizes as its
+    /// address and finds its own payouts with it. It never leaves the miner.
+    pub view: ViewKey,
     pub worker: String,
     pub threads: usize,
 }
@@ -2217,7 +2175,8 @@ pub async fn run_pool_miner_with_fee_percent(
         tokio::net::TcpStream::connect(cfg.pool.trim_start_matches("stratum+tcp://")).await?;
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
-    let hello = json!({ "id": 1, "method": "mining.authorize", "params": [cfg.address.encode(), cfg.worker] });
+    let address = cfg.view.address().encode();
+    let hello = json!({ "id": 1, "method": "mining.authorize", "params": [address, cfg.worker] });
     write
         .write_all((hello.to_string() + "\n").as_bytes())
         .await?;
@@ -2266,21 +2225,15 @@ pub async fn run_pool_miner_with_fee_percent(
                 let network_target = crate::core::auxpow::bytes32(&p[4])?;
                 stats.jobs.fetch_add(1, Ordering::Relaxed);
 
-                let (api2, addr) = (api.clone(), cfg.address);
+                let (api2, view) = (api.clone(), cfg.view.clone());
                 let th = template_hex.clone();
                 let shares: Vec<(u64, u64)> = my_shares.iter().copied().collect();
                 let audit = tokio::task::spawn_blocking(move || -> Result<AuditedJob> {
-                    let client = RpcClient::new(api2);
-                    let proof = client
-                        .get(&format!("/api/proof?address={}&job={job_id}", addr.encode()))?;
-                    let window = client.get(&format!("/api/window?job={job_id}"))?;
-                    if proof["job_id"].as_u64() != Some(job_id)
-                        || window["job_id"].as_u64() != Some(job_id) {
+                    let window = RpcClient::new(api2).get(&format!("/api/window?job={job_id}"))?;
+                    if window["job_id"].as_u64() != Some(job_id) {
                         bail!("the audit API does not describe the announced job");
                     }
-                    audit_job_with_fee_limit(
-                        &addr, &mining_hash, &th, &proof, &window, max_fee_ppm, &shares,
-                    )
+                    audit_job_with_fee_limit(&view, &mining_hash, &th, &window, max_fee_ppm, &shares)
                 })
                 .await?;
                 let audited = match audit
@@ -2317,7 +2270,7 @@ pub async fn run_pool_miner_with_fee_percent(
                 });
             }
             Some((job_id, nonce)) = share_rx.recv() => {
-                let submit = json!({ "id": next_id, "method": "mining.submit", "params": [cfg.address.encode(), job_id, nonce] });
+                let submit = json!({ "id": next_id, "method": "mining.submit", "params": [address, job_id, nonce] });
                 next_id += 1;
                 stats.shares_sent.fetch_add(1, Ordering::Relaxed);
                 write.write_all((submit.to_string() + "\n").as_bytes()).await?;
@@ -2402,13 +2355,13 @@ mod tests {
         batch: Batch,
         copy: impl Fn(&AddrKey) -> [u8; 32],
     ) -> Arc<Job> {
-        let empty = Arc::new(WindowSnapshot::new(Window::default()));
+        let empty = Arc::new(WindowSnapshot::new(Window::default(), HashMap::new()));
         let commitment = hash_domain(b"test commitment", &[&job_id.to_le_bytes()]);
         let variants = miners
             .iter()
             .map(|m| {
                 let variant = Variant {
-                    extra: bind_extra(&commitment, m),
+                    extra: bind_extra(&commitment, &owner_of(m)),
                     mining_hash: copy(m),
                     miner: None,
                 };
@@ -2427,7 +2380,6 @@ mod tests {
             next: empty,
             commitment,
             fee_ppm: 0,
-            receipts: Arc::default(),
             variants: std::sync::Mutex::new(variants),
             seen: Default::default(),
         })
@@ -2457,8 +2409,14 @@ mod tests {
         k
     }
 
+    fn id(i: u32) -> OwnerId {
+        let mut k = [0u8; 32];
+        k[..4].copy_from_slice(&i.to_be_bytes());
+        k
+    }
+
     /// Average allocation per owner over every offset the draw can take.
-    fn expected(total: u128, owners: &[(AddrKey, u64)]) -> HashMap<AddrKey, f64> {
+    fn expected(total: u128, owners: &[(OwnerId, u64)]) -> HashMap<OwnerId, f64> {
         let weight: u128 = owners.iter().map(|(_, w)| *w as u128).sum();
         let slots = MAX_PAID_MINERS as u128;
         let small: u128 = owners
@@ -2467,7 +2425,7 @@ mod tests {
             .filter(|w| w * slots < weight)
             .sum();
         let draws = small.max(1);
-        let mut sum: HashMap<AddrKey, f64> = HashMap::new();
+        let mut sum: HashMap<OwnerId, f64> = HashMap::new();
         for offset in 0..draws {
             let (paid, dust) = allocate(total, owners, offset);
             assert_eq!(paid.iter().map(|(_, a)| a).sum::<u128>() + dust, total);
@@ -2484,28 +2442,28 @@ mod tests {
 
     #[test]
     fn large_owners_are_paid_exactly_and_small_ones_by_slot() {
-        let mut owners = vec![(key(0), 50), (key(1), 30)];
-        owners.extend((2..42).map(|i| (key(i), 1)));
+        let mut owners = vec![(id(0), 50), (id(1), 30)];
+        owners.extend((2..42).map(|i| (id(i), 1)));
         let total = 1_000_000u128;
         let (paid, dust) = allocate(total, &owners, 7);
         // Only the rounding of 29 equal slots is left over.
         assert!(dust < 29);
         assert_eq!(paid.iter().map(|(_, a)| a).sum::<u128>() + dust, total);
-        let get = |k: AddrKey| paid.iter().find(|(o, _)| *o == k).map_or(0, |(_, a)| *a);
-        assert_eq!(get(key(0)), total * 50 / 120);
-        assert_eq!(get(key(1)), total * 30 / 120);
+        let get = |k: OwnerId| paid.iter().find(|(o, _)| *o == k).map_or(0, |(_, a)| *a);
+        assert_eq!(get(id(0)), total * 50 / 120);
+        assert_eq!(get(id(1)), total * 30 / 120);
         // 29 slots are left for the 40 owners of weight 1.
         assert_eq!(paid.len(), 2 + 29);
     }
 
     #[test]
     fn every_owner_expects_exactly_its_entitlement() {
-        let mut owners = vec![(key(9), 1_000)];
+        let mut owners = vec![(id(9), 1_000)];
         owners.extend(
             [1u64, 2, 3, 5, 8, 13]
                 .iter()
                 .enumerate()
-                .map(|(i, w)| (key(i as u32), *w)),
+                .map(|(i, w)| (id(i as u32), *w)),
         );
         owners.sort();
         let total = 1_000_000_000u128;
@@ -2513,10 +2471,10 @@ mod tests {
         let exact = total * 1_000 / weight;
         let rest = total - exact;
         let got = expected(total, &owners);
-        assert_eq!(got[&key(9)], exact as f64);
+        assert_eq!(got[&id(9)], exact as f64);
         // 30 equal slots over the owners of weight 1..13, 32 in all.
         let slot = (rest / 30) as f64;
-        for (k, w) in owners.iter().filter(|(k, _)| *k != key(9)) {
+        for (k, w) in owners.iter().filter(|(k, _)| *k != id(9)) {
             let want = 30.0 * *w as f64 / 32.0 * slot;
             assert!((got[k] - want).abs() < 1e-6, "{} vs {want}", got[k]);
         }
@@ -2527,45 +2485,45 @@ mod tests {
         let total = 1_000_000_000u128;
         // One owner at exactly 1/31 of the window, paid exactly, against the
         // same weight split in two, each half sampled.
-        let mut whole: Vec<(AddrKey, u64)> = (0..60).map(|i| (key(i), 50)).collect();
-        whole.push((key(100), 100));
-        let mut split: Vec<(AddrKey, u64)> = (0..60).map(|i| (key(i), 50)).collect();
-        split.push((key(100), 50));
-        split.push((key(101), 50));
+        let mut whole: Vec<(OwnerId, u64)> = (0..60).map(|i| (id(i), 50)).collect();
+        whole.push((id(100), 100));
+        let mut split: Vec<(OwnerId, u64)> = (0..60).map(|i| (id(i), 50)).collect();
+        split.push((id(100), 50));
+        split.push((id(101), 50));
         let a = expected(total, &whole);
         let b = expected(total, &split);
-        let alone = a[&key(100)];
-        let halves = b[&key(100)] + b[&key(101)];
+        let alone = a[&id(100)];
+        let halves = b[&id(100)] + b[&id(101)];
         assert!((alone - halves).abs() < 1e-6, "{alone} vs {halves}");
         // Nobody else's expectation moves either.
         for i in 0..60 {
-            assert!((a[&key(i)] - b[&key(i)]).abs() < 1e-6);
+            assert!((a[&id(i)] - b[&id(i)]).abs() < 1e-6);
         }
         // Splitting a sampled owner, too.
-        let mut small = vec![(key(9), 1_000)];
+        let mut small = vec![(id(9), 1_000)];
         small.extend(
             [1u64, 2, 3, 5, 21]
                 .iter()
                 .enumerate()
-                .map(|(i, w)| (key(i as u32), *w)),
+                .map(|(i, w)| (id(i as u32), *w)),
         );
         let mut smaller = small.clone();
-        smaller.retain(|(k, _)| *k != key(4));
-        smaller.extend([(key(4), 9), (key(5), 12)]);
+        smaller.retain(|(k, _)| *k != id(4));
+        smaller.extend([(id(4), 9), (id(5), 12)]);
         smaller.sort();
         small.sort();
         let (x, y) = (expected(total, &small), expected(total, &smaller));
-        assert!((x[&key(4)] - (y[&key(4)] + y[&key(5)])).abs() < 1e-6);
-        assert!((x[&key(9)] - y[&key(9)]).abs() < 1e-6);
+        assert!((x[&id(4)] - (y[&id(4)] + y[&id(5)])).abs() < 1e-6);
+        assert!((x[&id(9)] - y[&id(9)]).abs() < 1e-6);
     }
 
     #[test]
     fn payout_weights_fit_one_coinbase() {
-        let operator = WalletKeys::random().address();
-        let owners: Vec<(AddrKey, u64)> = (0..1_000)
+        let operator = owner_id(&WalletKeys::random().address());
+        let owners: Vec<(OwnerId, u64)> = (0..1_000)
             .map(|i| {
                 let w = WalletKeys::random().address();
-                (addr_key(&w), 1 + (i * 7919) % 500)
+                (owner_id(&w), 1 + (i * 7919) % 500)
             })
             .collect();
         let mut owners = owners;
@@ -2589,15 +2547,10 @@ mod tests {
 
     #[test]
     fn fee_is_proportional_even_with_one_share() {
-        let operator = WalletKeys::random().address();
-        let miner = WalletKeys::random().address();
-        let weights = payout_weights(
-            fee_ppm(2.0).unwrap(),
-            &operator,
-            &[(addr_key(&miner), 1)],
-            &[0; 32],
-        )
-        .unwrap();
+        let operator = owner_id(&WalletKeys::random().address());
+        let miner = owner_id(&WalletKeys::random().address());
+        let weights =
+            payout_weights(fee_ppm(2.0).unwrap(), &operator, &[(miner, 1)], &[0; 32]).unwrap();
         let split = crate::core::template::split_by_weight(100_000, &weights).unwrap();
         assert_eq!(split.iter().find(|(a, _)| *a == operator).unwrap().1, 2_000);
         assert_eq!(split.iter().find(|(a, _)| *a == miner).unwrap().1, 98_000);
@@ -2611,11 +2564,14 @@ mod tests {
                 .push_back((10 + i as u64, key(i as u32 % 2), *w));
         }
         log.next_seq = 15;
-        let w = log.window(6);
-        // The newest shares: 4, 3 (7 >= 6).
+        let (w, addresses) = log.window(6);
+        // The newest shares: 4, 3 (7 >= 6), each owner named by its id.
         assert_eq!((w.start_seq, w.end_seq), (13, 15));
-        assert_eq!(w.owners, vec![(key(0), 4), (key(1), 3)]);
-        assert_eq!(log.window(1_000).start_seq, 10);
+        let mut want = vec![(owner_of(&key(0)), 4), (owner_of(&key(1)), 3)];
+        want.sort();
+        assert_eq!(w.owners, want);
+        assert_eq!(addresses[&owner_of(&key(1))], key_addr(&key(1)));
+        assert_eq!(log.window(1_000).0.start_seq, 10);
         // Pruning keeps the newest weight and anything a window still uses.
         assert_eq!(log.prune(12, 3), 12);
         assert_eq!(log.entries.front().unwrap().0, 12);
@@ -2626,12 +2582,12 @@ mod tests {
         let w = Window {
             start_seq: 3,
             end_seq: 9,
-            owners: vec![(key(0), 4), (key(1), 2), (key(2), 1)],
+            owners: vec![(id(0), 4), (id(1), 2), (id(2), 1)],
         };
         let mut moved = w.clone();
         moved.start_seq = 4;
         let mut padded = w.clone();
-        padded.owners.push((key(2), 1));
+        padded.owners.push((id(2), 1));
         assert_ne!(w.root(), moved.root());
         assert_ne!(w.root(), padded.root());
         assert_eq!(w.root(), w.clone().root());
@@ -3052,7 +3008,7 @@ mod tests {
 
     #[test]
     fn proofs_verify_for_every_leaf() {
-        let leaves: Vec<(AddrKey, u64)> = (0..7u8).map(|i| ([i; 96], 10 + i as u64)).collect();
+        let leaves: Vec<(OwnerId, u64)> = (0..7u8).map(|i| ([i; 32], 10 + i as u64)).collect();
         let tree = ShareMerkleTree::build(leaves.clone());
         for (k, s) in &leaves {
             let (idx, proof) = tree.proof(k).unwrap();
@@ -3069,9 +3025,19 @@ mod tests {
         use crate::core::state::apply_batch;
         use crate::core::template::{build_template_bonded, split_by_weight};
         use crate::core::types::{block_reward, hash, State, HALVING_INTERVAL};
-        let me = WalletKeys::random().address();
+        let my_keys = WalletKeys::random();
+        let me = my_keys.address();
+        let view = my_keys.view_only();
         let other = WalletKeys::random().address();
         let pool = WalletKeys::random().address();
+        // Payout weights come by owner id; the pool knows whose they are.
+        let book: HashMap<OwnerId, StealthAddress> = [me, other, pool]
+            .into_iter()
+            .map(|a| (owner_id(&a), a))
+            .collect();
+        let to_addresses = |weights: Vec<(OwnerId, u64)>| -> Vec<(StealthAddress, u64)> {
+            weights.into_iter().map(|(id, w)| (book[&id], w)).collect()
+        };
         let mut state = State::genesis();
         apply_batch(&mut state, Batch::genesis(), &[]).unwrap();
         let ts = vec![Batch::genesis().timestamp];
@@ -3098,7 +3064,7 @@ mod tests {
             },
         );
         let fee = fee_ppm(1.0).unwrap();
-        let mut owners = vec![(addr_key(&me), 5), (addr_key(&other), 3)];
+        let mut owners = vec![(owner_id(&me), 5), (owner_id(&other), 3)];
         owners.sort();
         let window = Window {
             start_seq: 100,
@@ -3106,47 +3072,43 @@ mod tests {
             owners,
         };
         let next_root = hash(b"next window");
-        // A template for `window` paying `weights`, with the API answers.
         // A template for `window` paying `weights`, the node's copy of it
-        // for `bound_to` (`template::rebind`), and the API answers.
+        // for `bound_to` (`template::rebind`), and the API's answer.
         let job = |window: &Window,
                    weights: &[(StealthAddress, u64)],
                    height: u64,
                    fee: u64,
                    bound_to: &StealthAddress| {
             let commitment = job_commitment(&window.root(), &next_root);
-            let (base, receipts) =
+            let (base, _) =
                 build_template_bonded(&state, &ts, &[], weights, commitment, None, Some(&bond))
                     .unwrap();
-            let extra = bind_extra(&commitment, &addr_key(bound_to));
+            let extra = bind_extra(&commitment, &owner_id(bound_to));
             let tpl = crate::core::template::rebind(&base, extra, Some(&bond)).unwrap();
-            let mine: Vec<Value> = receipts
-                .iter()
-                .filter(|(a, _)| *a == me)
-                .map(|(_, r)| serde_json::to_value(r).unwrap())
-                .collect();
             let api = json!({
-                "job_id": 1, "height": height, "fee_ppm": fee, "pool_address": pool.encode(),
+                "job_id": 1, "height": height, "fee_ppm": fee,
+                "operator": hex::encode(owner_id(&pool)),
                 "window": window_json(window), "next_root": hex::encode(next_root),
             });
-            (tpl, json!({ "job_id": 1, "receipts": mine }), api)
+            (tpl, api)
         };
         let honest = |window: &Window| {
             let seed = draw_seed(&state.header_hash, &window.root());
-            payout_weights(fee, &pool, &window.owners, &seed).unwrap()
+            to_addresses(payout_weights(fee, &owner_id(&pool), &window.owners, &seed).unwrap())
         };
-        let audit = |tpl: &crate::core::template::BlockTemplate,
-                     proof: &Value,
-                     api: &Value,
-                     shares: &[(u64, u64)]| {
-            let hex = hex::encode(bincode::serialize(&tpl.batch).unwrap());
-            audit_job_with_fee_limit(&me, &tpl.mining_hash, &hex, proof, api, 20_000, shares)
-        };
+        let audit =
+            |tpl: &crate::core::template::BlockTemplate, api: &Value, shares: &[(u64, u64)]| {
+                let hex = hex::encode(bincode::serialize(&tpl.batch).unwrap());
+                audit_job_with_fee_limit(&view, &tpl.mining_hash, &hex, api, 20_000, shares)
+            };
 
-        let (tpl, proof, api) = job(&window, &honest(&window), state.height, fee, &me);
-        let audited = audit(&tpl, &proof, &api, &[(101, 2), (105, 3), (90, 7)]).unwrap();
+        let (tpl, api) = job(&window, &honest(&window), state.height, fee, &me);
+        let audited = audit(&tpl, &api, &[(101, 2), (105, 3), (90, 7)]).unwrap();
         assert_eq!(audited.window_root, window.root());
         assert_eq!(audited.prev_hash, state.header_hash);
+        // The window names owners only by id.
+        assert!(!api.to_string().contains(&me.encode()));
+        assert!(!api.to_string().contains(&hex::encode(me.spend)));
 
         // The miner rebuilds its copy from the shared template plus the
         // extra and signature the pool sends: exactly the node's copy.
@@ -3161,30 +3123,41 @@ mod tests {
             Some(&bond),
         )
         .unwrap();
-        let extra = bind_extra(&commitment, &addr_key(&me));
+        let extra = bind_extra(&commitment, &owner_id(&me));
         let copy = crate::core::template::rebind(&base, extra, Some(&bond)).unwrap();
         let base_hex = hex::encode(bincode::serialize(&base.batch).unwrap());
         let rebuilt = bind_template(&base_hex, extra, copy.batch.miner.clone()).unwrap();
         let rebuilt: Batch = bincode::deserialize(&hex::decode(rebuilt).unwrap()).unwrap();
         assert_eq!(compute_header_hash(&rebuilt.header()), copy.mining_hash);
         // A job bound to someone else is refused: our work would be theirs.
-        let (t, p, a) = job(&window, &honest(&window), state.height, fee, &other);
-        assert!(audit(&t, &p, &a, &[]).is_err());
+        let (t, a) = job(&window, &honest(&window), state.height, fee, &other);
+        assert!(audit(&t, &a, &[]).is_err());
 
         // A valid coinbase that pays us less than the rule gives us.
         let skim: Vec<(StealthAddress, u64)> = honest(&window)
             .into_iter()
             .map(|(a, w)| if a == me { (a, w / 2) } else { (a, w) })
             .collect();
-        let (t, p, a) = job(&window, &skim, state.height, fee, &me);
-        assert!(audit(&t, &p, &a, &[]).is_err());
+        let (t, a) = job(&window, &skim, state.height, fee, &me);
+        assert!(audit(&t, &a, &[]).is_err());
+        // Our full share, but in an output that names the wrong recovery
+        // key, so it could not be claimed if the curve were ever broken.
+        let mut unclaimable = me;
+        unclaimable.recovery = [0x42; 32];
+        let swapped: Vec<(StealthAddress, u64)> = honest(&window)
+            .into_iter()
+            .map(|(a, w)| if a == me { (unclaimable, w) } else { (a, w) })
+            .collect();
+        let (t, a) = job(&window, &swapped, state.height, fee, &me);
+        let err = audit(&t, &a, &[]).unwrap_err().to_string();
+        assert!(err.contains("could not be claimed"), "{err}");
         // A fee above our limit, even if the coinbase matches it.
         let greedy = {
             let seed = draw_seed(&state.header_hash, &window.root());
-            payout_weights(50_000, &pool, &window.owners, &seed).unwrap()
+            to_addresses(payout_weights(50_000, &owner_id(&pool), &window.owners, &seed).unwrap())
         };
-        let (t, p, a) = job(&window, &greedy, state.height, 50_000, &me);
-        assert!(audit(&t, &p, &a, &[]).is_err());
+        let (t, a) = job(&window, &greedy, state.height, 50_000, &me);
+        assert!(audit(&t, &a, &[]).is_err());
         // A later era claimed, every miner paid what that height would give.
         let claimed = HALVING_INTERVAL;
         let shrunk = split_by_weight(block_reward(claimed), &honest(&window)).unwrap();
@@ -3193,15 +3166,15 @@ mod tests {
         let real = block_reward(state.height);
         let mut skim = vec![(pool, real - to_miners.iter().map(|(_, v)| v).sum::<u64>())];
         skim.extend(to_miners);
-        let (t, p, a) = job(&window, &skim, claimed, fee, &me);
-        assert!(audit(&t, &p, &a, &[]).is_err());
+        let (t, a) = job(&window, &skim, claimed, fee, &me);
+        assert!(audit(&t, &a, &[]).is_err());
         // A published window other than the committed one.
         let mut forged = api.clone();
         forged["window"]["owners"][0]["weight"] = json!(9);
-        assert!(audit(&tpl, &proof, &forged, &[]).is_err());
+        assert!(audit(&tpl, &forged, &[]).is_err());
         let mut forged = api.clone();
         forged["next_root"] = json!(hex::encode([7u8; 32]));
-        assert!(audit(&tpl, &proof, &forged, &[]).is_err());
+        assert!(audit(&tpl, &forged, &[]).is_err());
         // Duplicate or unsorted owners are refused outright.
         let mut forged = api.clone();
         let first = forged["window"]["owners"][0].clone();
@@ -3209,20 +3182,18 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(first);
-        assert!(audit(&tpl, &proof, &forged, &[]).is_err());
+        assert!(audit(&tpl, &forged, &[]).is_err());
         // A window that leaves us out: honest-looking on its own, caught by
         // the shares the pool told us it accepted.
         let mut without = window.clone();
-        without.owners.retain(|(k, _)| *k != addr_key(&me));
-        let (t, p, a) = job(&without, &honest(&without), state.height, fee, &me);
-        assert!(audit(&t, &p, &a, &[]).is_ok());
-        assert!(audit(&t, &p, &a, &[(104, 1)]).is_err());
+        without.owners.retain(|(k, _)| *k != owner_id(&me));
+        let (t, a) = job(&without, &honest(&without), state.height, fee, &me);
+        assert!(audit(&t, &a, &[]).is_ok());
+        assert!(audit(&t, &a, &[(104, 1)]).is_err());
         // Shares outside the window's range do not count against it.
-        assert!(audit(&t, &p, &a, &[(99, 1), (110, 1)]).is_ok());
-        // Someone else's receipts, and a template that is not the job.
-        let theirs = json!({ "job_id": 1, "receipts": [] });
-        assert!(audit(&tpl, &theirs, &api, &[]).is_err());
+        assert!(audit(&t, &a, &[(99, 1), (110, 1)]).is_ok());
+        // A template that is not the job.
         let hex = hex::encode(bincode::serialize(&tpl.batch).unwrap());
-        assert!(audit_job(&me, &[0; 32], &hex, &proof, &api).is_err());
+        assert!(audit_job(&view, &[0; 32], &hex, &api).is_err());
     }
 }

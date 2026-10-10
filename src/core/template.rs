@@ -163,11 +163,9 @@ pub fn build_template(
 /// Splits `total` in proportion to weight, without per-address minimums.
 /// Floors each exact entitlement, then assigns the remaining base units to
 /// the largest fractional entitlements. Ties follow the input order.
-/// Zero-valued outputs are omitted; the pool keeps scores not yet paid.
-pub fn split_by_weight(
-    total: u64,
-    weights: &[(StealthAddress, u64)],
-) -> Result<Vec<(StealthAddress, u64)>> {
+/// Zero-valued outputs are omitted. Payees can be addresses or anything
+/// standing for them (the pool's audit splits by hashed owner id).
+pub fn split_by_weight<K: Copy>(total: u64, weights: &[(K, u64)]) -> Result<Vec<(K, u64)>> {
     let sum: u128 = weights.iter().map(|(_, w)| *w as u128).sum();
     if sum == 0 {
         bail!("payout weights sum to zero");
