@@ -12,11 +12,11 @@ miners the fractured wallet that importing mined coinbases produces.
 
 - **The pool operator** runs a midwimble node with a mining bond
   (`docs/BONDED_POW.md`). One bond lets a pool mine, but the per-bond cap
-  decides how many of its blocks count in full. Once 20 or more bonds are
-  active, each bond counts at full weight for at most 1/20 of the last 1,440
-  blocks, so a pool with a share `s` of the hashrate needs about `20 × s`
-  bonds: 6 at 30%. While fewer bonds are active, they share the window
-  equally. Blocks past the cap stay valid and still pay, but add almost no
+  decides how many of its blocks count in full. Once 360 or more bonds are
+  active, each bond counts at full weight for at most 1/360 of the last 1,440
+  blocks (four a day), so a pool with a share `s` of the hashrate needs about
+  `360 × s` bonds: 108 at 30%. While fewer bonds are active, they share the
+  window equally. Blocks past the cap stay valid and still pay, but add almost no
   weight, so they lose any fork race against a block from a bond under its
   quota.
 - **Co-bonders** supply the extra bonds. A co-bonder locks their own MDS in a

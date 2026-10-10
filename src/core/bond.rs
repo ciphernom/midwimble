@@ -804,8 +804,13 @@ pub const CAP_WINDOW: usize = 24 * 60;
 pub const CAP_WINDOW: usize = 16;
 /// With at least this many eligible bonds, each may sign `1 / CAP_K` of the
 /// window at full weight; with fewer, they share it equally.
+///
+/// 360 divides the window exactly: four full-weight blocks a bond a day. A
+/// pool with a share `s` of the hashrate then needs about `360 × s` bonds (108
+/// at 30%), so the capital behind block production grows with the hashrate it
+/// covers, while a miner with less than 1/360 of it needs only its one bond.
 #[cfg(not(feature = "fast-mining"))]
-pub const CAP_K: usize = 20;
+pub const CAP_K: usize = 360;
 #[cfg(feature = "fast-mining")]
 pub const CAP_K: usize = 4;
 pub const OVER_CAP_WORK_DIVISOR: u128 = 1024;
@@ -937,18 +942,26 @@ mod cap_tests {
         BondEntry { mining_key: [0u8; 32], value: MIN_MINING_BOND, bonded_until: u64::MAX }
     }
 
+    /// A distinct bond id for each `i`, beyond the 256 a repeated byte allows.
+    fn bond_id(i: usize) -> [u8; 32] {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        id
+    }
+
     #[test]
     fn cap_is_an_equal_share_never_below_one_kth() {
         let mut bonds = im::HashMap::new();
         assert_eq!(signer_cap(&bonds, 0), CAP_WINDOW, "a lone producer is uncapped");
-        for i in 0..3u8 {
-            bonds.insert([i; 32], eligible_bond());
+        for i in 0..3 {
+            bonds.insert(bond_id(i), eligible_bond());
         }
         assert_eq!(signer_cap(&bonds, 0), CAP_WINDOW.div_ceil(3));
-        for i in 3..(CAP_K as u8 + 10) {
-            bonds.insert([i; 32], eligible_bond());
+        for i in 3..CAP_K + 10 {
+            bonds.insert(bond_id(i), eligible_bond());
         }
         assert_eq!(signer_cap(&bonds, 0), CAP_WINDOW.div_ceil(CAP_K));
+        assert_eq!(CAP_WINDOW % CAP_K, 0, "K divides the window, so the cap is exact");
 
         // Expired and undersized bonds do not dilute the cap.
         let mut few = im::HashMap::new();

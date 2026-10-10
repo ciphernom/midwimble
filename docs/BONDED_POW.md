@@ -280,8 +280,9 @@ ever spend the coin, and the pool signs blocks with the bond.
 
 **The cap is a fork-choice rule, not a validity rule.** Over any 1,440 blocks
 (`CAP_WINDOW`), a bond adds full work to its chain's weight for at most
-`ceil(1440 / min(eligible bonds, 20))` of them (`CAP_K = 20`). Blocks beyond
-that stay valid and pay, but add only 1/1024 of their work. So:
+`ceil(1440 / min(eligible bonds, 360))` of them (`CAP_K = 360`): four blocks
+a day once 360 or more bonds are eligible. Blocks beyond that stay valid and
+pay, but add only 1/1024 of their work. So:
 
 - the chain never stalls: a lone producer can always extend it, and a longer
   chain is always a heavier one;
@@ -290,10 +291,13 @@ that stay valid and pay, but add only 1/1024 of their work. So:
 - the cap counts *registered, eligible* bonds, not recent signers. On an
   attacker's private chain the attacker is the only signer, so a cap measured
   by signers would lift exactly where it is needed;
-- a pool with a share `s` of the hashrate needs about `20 × s` bonds for all
-  of its blocks to count in full: 6 bonds at 30%.
+- a pool with a share `s` of the hashrate needs about `360 × s` bonds for all
+  of its blocks to count in full: 108 bonds at 30%. Covering the whole
+  network takes 360 bonds, so the capital locked behind block production
+  grows with the hashrate it covers, while a miner with less than 1/360 of it
+  needs only its one bond.
 
-While the network has fewer than 20 eligible bonds, they share the window
+While the network has fewer than 360 eligible bonds, they share the window
 equally, and a lone producer is uncapped. The window is the last 1,440 blocks,
 the new one included. It is not part of the state root: nodes rebuild it from
 their stored blocks. Cumulative work, which checkpoints and anchors measure, is
