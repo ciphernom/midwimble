@@ -30,7 +30,10 @@
 //!   miner finds proves nothing for anyone else's copy, so nobody can be
 //!   credited with someone else's work: not another miner replaying it, and
 //!   not a man in the middle rewriting `mining.authorize`, who can only stop
-//!   the victim, whose audit then fails.
+//!   the victim, whose audit then fails. A block with nothing to pay (no
+//!   reward and no fees, once issuance has ended) has no coinbase to carry
+//!   the binding, so work on such a job is verified and submitted but
+//!   credited to nobody.
 //! * **Miner audit** ([`audit_job_with_fee_limit`], [`check_window_chain`]):
 //!   the miner's copy must hash to the announced mining hash and pay the
 //!   reward at the claimed height; its `extra` must bind the published
@@ -75,7 +78,8 @@
 //!
 //! `template_hex` is the same for every miner; `extra` and `miner_auth` (the
 //! bond signature, or null) turn it into the miner's own copy, whose mining
-//! hash is `mining_hash` ([`bind_template`]).
+//! hash is `mining_hash` ([`bind_template`]). An accepted share without
+//! `seq` and `weight` was credited to nobody: its job had nothing to pay.
 //!
 //! The audit API answers for any of the last 16 jobs:
 //! `/api/window?job=N` (the paid window, the next window's root, the fee and
@@ -936,9 +940,9 @@ struct Job {
     receipts: Arc<HashMap<AddrKey, Vec<PayoutReceipt>>>,
     /// Each miner's copy of the job, by address.
     variants: std::sync::Mutex<HashMap<AddrKey, Arc<Variant>>>,
-    /// (miner, nonce) submitted for this job, including those still in
-    /// verification.
-    seen: std::sync::Mutex<HashSet<(AddrKey, u64)>>,
+    /// (copy's mining hash, nonce) submitted for this job, including those
+    /// still in verification: each piece of work counts once.
+    seen: std::sync::Mutex<HashSet<([u8; 32], u64)>>,
 }
 
 /// One miner's copy of a job ([`bind_extra`], `template::rebind`).
@@ -1356,6 +1360,12 @@ enum ShareOutcome {
         seq: u64,
         weight: u64,
     },
+    /// Valid, but for a job with nothing to pay: such a block has no
+    /// coinbase to carry the binding, so every miner's copy is the same
+    /// header and the work cannot be tied to whoever did it.
+    Uncredited {
+        is_block: bool,
+    },
     Duplicate,
     StaleJob,
     /// The proof of work does not meet the share target: the sender is banned.
@@ -1401,7 +1411,15 @@ async fn precheck_share(
     else {
         return Err(ShareOutcome::StaleJob);
     };
-    if !job.seen.lock().expect("seen lock").insert((miner, nonce)) {
+    // Keyed by the work, not the miner: on a job whose copies are all the
+    // same header (nothing to pay, so no coinbase to bind), one nonce must
+    // not count once for every address it is submitted under.
+    if !job
+        .seen
+        .lock()
+        .expect("seen lock")
+        .insert((variant.mining_hash, nonce))
+    {
         return Err(ShareOutcome::Duplicate);
     }
     let extra_bits = bits
@@ -1419,6 +1437,8 @@ async fn precheck_share(
 
 /// Credits a verified share against the job it was submitted for, even if a
 /// newer job has replaced that one since, and submits it if it is a block.
+/// Work on a job with nothing to pay is verified and submitted, but credited
+/// to nobody ([`ShareOutcome::Uncredited`]).
 async fn finish_share(
     state: &Arc<PoolState>,
     share: PendingShare,
@@ -1429,18 +1449,24 @@ async fn finish_share(
         job.seen
             .lock()
             .expect("seen lock")
-            .remove(&(share.miner, share.nonce));
+            .remove(&(share.variant.mining_hash, share.nonce));
         return Ok(ShareOutcome::Invalid);
     }
-    let st = state.clone();
-    let (miner, weight) = (share.miner, share.weight);
-    let seq = tokio::task::spawn_blocking(move || {
-        st.log
-            .lock()
-            .expect("share log lock")
-            .append(&st.db, &miner, weight)
-    })
-    .await??;
+    let credited = job.batch.coinbase.is_some();
+    let seq = if credited {
+        let st = state.clone();
+        let (miner, weight) = (share.miner, share.weight);
+        let seq = tokio::task::spawn_blocking(move || {
+            st.log
+                .lock()
+                .expect("share log lock")
+                .append(&st.db, &miner, weight)
+        })
+        .await??;
+        Some(seq)
+    } else {
+        None
+    };
     let is_block = final_hash < job.network_target;
     if is_block && state.submitted_job.swap(job.job_id, Ordering::SeqCst) != job.job_id {
         let ext = Extension {
@@ -1449,10 +1475,13 @@ async fn finish_share(
         };
         submit_block(state.clone(), job, share.variant, share.miner, ext);
     }
-    Ok(ShareOutcome::Accepted {
-        is_block,
-        seq,
-        weight,
+    Ok(match seq {
+        Some(seq) => ShareOutcome::Accepted {
+            is_block,
+            seq,
+            weight: share.weight,
+        },
+        None => ShareOutcome::Uncredited { is_block },
     })
 }
 
@@ -1721,6 +1750,12 @@ async fn handle_miner(
                             "id": id, "result": true, "block": is_block,
                             "seq": seq, "weight": weight,
                         })
+                    }
+                    ShareOutcome::Uncredited { is_block } => {
+                        proven = true;
+                        difficulty.vardiff.shares += 1;
+                        state.stats.accepted_shares.fetch_add(1, Ordering::Relaxed);
+                        json!({ "id": id, "result": true, "block": is_block })
                     }
                     ShareOutcome::Invalid => {
                         state.stats.invalid_shares.fetch_add(1, Ordering::Relaxed);
@@ -2337,9 +2372,36 @@ mod tests {
         })
     }
 
+    /// A block with a coinbase, which is what makes its work creditable.
+    fn paying_batch() -> Batch {
+        static COINBASE: std::sync::OnceLock<crate::core::mw::Coinbase> =
+            std::sync::OnceLock::new();
+        let mut batch = Batch::genesis().clone();
+        batch.coinbase = Some(
+            COINBASE
+                .get_or_init(|| {
+                    crate::core::mw::build_coinbase(&[(WalletKeys::random().address(), 1)]).unwrap()
+                })
+                .clone(),
+        );
+        batch
+    }
+
     /// A job whose network target is never met, so no block is submitted,
     /// with a copy for each of `miners`.
     fn test_job(job_id: u64, miners: &[AddrKey]) -> Arc<Job> {
+        test_job_with(job_id, miners, paying_batch(), |m| {
+            hash_domain(b"test copy", &[&job_id.to_le_bytes(), m])
+        })
+    }
+
+    /// [`test_job`] on `batch`, each miner's copy hashing to `copy(miner)`.
+    fn test_job_with(
+        job_id: u64,
+        miners: &[AddrKey],
+        batch: Batch,
+        copy: impl Fn(&AddrKey) -> [u8; 32],
+    ) -> Arc<Job> {
         let empty = Arc::new(WindowSnapshot::new(Window::default()));
         let commitment = hash_domain(b"test commitment", &[&job_id.to_le_bytes()]);
         let variants = miners
@@ -2347,7 +2409,7 @@ mod tests {
             .map(|m| {
                 let variant = Variant {
                     extra: bind_extra(&commitment, m),
-                    mining_hash: hash_domain(b"test copy", &[&job_id.to_le_bytes(), m]),
+                    mining_hash: copy(m),
                     miner: None,
                 };
                 (*m, Arc::new(variant))
@@ -2358,7 +2420,7 @@ mod tests {
             mining_hash: hash_domain(b"test job", &[&job_id.to_le_bytes()]),
             network_target: [0; 32],
             template_hex: String::new(),
-            batch: Batch::genesis().clone(),
+            batch,
             height: 1,
             prev_hash: [0; 32],
             paying: empty.clone(),
@@ -2882,7 +2944,8 @@ mod tests {
         assert!(state.bans.is_banned(ip, Instant::now()));
         assert_eq!(credited(&state, &addr_key(&me)), 0);
         let job = state.current.read().await.clone().unwrap();
-        assert!(!job.seen.lock().unwrap().contains(&(addr_key(&me), 9)));
+        let copy = job.variants.lock().unwrap()[&addr_key(&me)].mining_hash;
+        assert!(!job.seen.lock().unwrap().contains(&(copy, 9)));
     }
 
     #[tokio::test]
@@ -2947,6 +3010,35 @@ mod tests {
                 .unwrap(),
             ShareOutcome::StaleJob
         );
+    }
+
+    #[tokio::test]
+    async fn work_on_a_job_with_nothing_to_pay_is_credited_to_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), 0);
+        let (a, b) = (key(1), key(2));
+        // Once issuance has ended, a block with no fees has no coinbase, so
+        // the node's copies of the job are one header for every miner.
+        let shared = hash_domain(b"the one header", &[]);
+        *state.current.write().await =
+            Some(test_job_with(1, &[a, b], Batch::genesis().clone(), |_| {
+                shared
+            }));
+        assert_eq!(
+            process_share(state.clone(), a, 1, 5, true, 0)
+                .await
+                .unwrap(),
+            ShareOutcome::Uncredited { is_block: false }
+        );
+        // The same work under another address is the same work.
+        assert_eq!(
+            process_share(state.clone(), b, 1, 5, true, 0)
+                .await
+                .unwrap(),
+            ShareOutcome::Duplicate
+        );
+        assert_eq!(credited(&state, &a) + credited(&state, &b), 0);
+        assert_eq!(state.log.lock().unwrap().next_seq, 0);
     }
 
     // ── Commitment and audit ────────────────────────────────────────────────

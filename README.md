@@ -102,7 +102,8 @@ recovery design.
   binds the commitment to the miner's address and which the node re-signs
   under the pool's bond (`/mining/bind`). Work found on one miner's copy is
   worthless to anyone else, so shares cannot be stolen, even by a man in the
-  middle.
+  middle. A block with nothing to pay (no reward and no fees, after issuance
+  ends) has no coinbase to bind, so work on it is credited to nobody.
 - **Miner audit:** before hashing, a miner checks the template hash, the
   coinbase total for the claimed height, that the job is bound to its own
   address and to the published windows, that every share the pool accepted
