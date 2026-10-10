@@ -112,6 +112,13 @@ recovery design.
 - **Privacy:** the window names owners by a hash of their address, and the
   pool publishes nothing that links a coinbase output to anyone. The view key
   stays with the miner; it sees payments but cannot spend them.
+- **Spot checks:** every window commits to each share, ordered by its proof
+  of work's output. Each miner picks random points of each window it is paid
+  from (four by default, `--spot-checks`), weighted by weight, and has the
+  pool prove the share covering each and the job it was mined on, then
+  recomputes that share's proof of work on its owner's own copy of the job.
+  Weight nobody mined, or real work counted twice, fails a check that lands
+  on it.
 - **Verification:** each connection's difficulty aims at one share per 15 s,
   with shares weighted by difficulty. Shares queue rather than being dropped;
   connections that have proven work are verified first, in SIMD batches; an

@@ -8,7 +8,9 @@
 //!   and weighs `2^(difficulty - minimum)`; each connection's difficulty is
 //!   steered toward one share per [`PoolConfig::share_interval`].
 //! * **Window.** A block pays the newest shares worth
-//!   [`PoolConfig::window_blocks`] blocks, summed per owner ([`Window`]).
+//!   [`PoolConfig::window_blocks`] blocks, per owner ([`Window`]), each
+//!   owner's shares committed one by one in a tree ordered by their proof of
+//!   work's output ([`ShareTree`]).
 //!   Nothing is deducted when a block is found, so there are no balances to
 //!   settle or restore after a reorganisation, and a share's expected payout
 //!   does not depend on when in a round it was found.
@@ -45,10 +47,13 @@
 //! * **Privacy.** The window names owners by a hash of their address
 //!   ([`owner_id`]), and the pool publishes nothing that links a coinbase
 //!   output to anyone: only the owner's view key recognises its payouts.
-//!
-//! The pool can still count shares of its own that nobody mined; making that
-//! detectable needs the shares themselves published so anyone can re-check
-//! a sample.
+//! * **Spot checks** ([`verify_sample`]). Each miner picks random points of
+//!   each window it is paid from, weighted by weight, and asks the pool for
+//!   the share covering each: its path in the committed window, and the job
+//!   it was mined on ([`JobProof`]), from which the miner recomputes the
+//!   share's proof of work on its owner's own copy. A window padded with
+//!   x% of weight nobody mined, or with real work counted twice, fails each
+//!   check with probability x%, and every miner checks every window.
 //!
 //! **Verification.** Checking a share means recomputing its whole sequential
 //! proof of work (about 70 ms of a core at mainnet settings), and a junk share
@@ -87,20 +92,23 @@
 //!
 //! The audit API answers for any of the last 16 jobs: `/api/window?job=N`
 //! (the paid window, the next window's root, the fee and the operator's
-//! owner id).
+//! owner id) and `/api/sample?job=N&at=X` (the paid window's share at point
+//! `X` of its weight, with its proofs).
 
 use crate::core::extension::MiningResult;
-use crate::core::mw::{StealthAddress, ViewKey};
+use crate::core::mw::{Coinbase, StealthAddress, ViewKey};
 use crate::core::simd_mining::{detected_level, pow_seed, verify_pow_batch};
 use crate::core::types::Extension;
-use crate::core::types::{compute_header_hash, hash_concat, hash_domain, Batch};
+use crate::core::types::{
+    compute_header_hash, hash_concat, hash_domain, registrations_hash, Batch, BatchHeader,
+};
 use crate::rpc::RpcClient;
 use anyhow::{anyhow, bail, Context, Result};
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use redb::{Database, ReadableTable, TableDefinition};
-use serde::Deserialize;
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -116,11 +124,18 @@ use tokio::sync::{broadcast, oneshot, RwLock};
 /// One coinbase output is the pool fee; the rest pay miners.
 pub const MAX_PAID_MINERS: usize = crate::core::mw::crypto::MAX_GROUP_OUTPUTS - 1;
 
-/// The score table of the previous payout scheme. Read once, on the first
-/// start of this version, to carry unpaid scores into the share log.
+/// Credit from before shares carried their proof of work: the score table of
+/// the scheme before PPLNS, and the first share log (owner ‖ weight). Both
+/// are dropped on upgrade ([`drop_unproven_credit`]).
 const LEGACY_SCORES: TableDefinition<&[u8], u64> = TableDefinition::new("shares");
-/// Accepted shares by sequence number: owner key ‖ weight (little endian).
 const SHARE_LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("share_log");
+/// Credited shares by sequence number ([`ShareRecord`], bincode).
+const SHARE_RECORDS: TableDefinition<u64, &[u8]> = TableDefinition::new("share_records");
+/// The payout address behind each owner id with shares in the log.
+const OWNERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("owners");
+/// What it takes to recompute each job's copies' mining hashes, by job id
+/// ([`JobProof`], bincode), for as long as its shares can be paid.
+const JOB_PROOFS: TableDefinition<u64, &[u8]> = TableDefinition::new("job_proofs");
 /// Blocks the pool found, by hash: a JSON record for `/pool/stats`.
 const FOUND: TableDefinition<&[u8], &str> = TableDefinition::new("found_blocks");
 
@@ -162,75 +177,254 @@ pub fn target_from_leading_zero_bits(bits: u32) -> [u8; 32] {
     (primitive_types::U256::MAX >> bits.min(256) as usize).to_big_endian()
 }
 
-// ── Score commitment (midstate's ShareMerkleTree) ───────────────────────────
+// ── Share commitment: every share, re-checkable ─────────────────────────────
 
-pub fn score_leaf(owner: &OwnerId, score: u64) -> [u8; 32] {
-    hash_domain(b"midwimble.pool.leaf.v2", &[owner, &score.to_le_bytes()])
+/// One credited share, with what anyone needs to re-check its proof of
+/// work against the job it was mined on ([`JobProof`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareRecord {
+    pub seq: u64,
+    pub owner: OwnerId,
+    pub weight: u64,
+    pub job_id: u64,
+    pub nonce: u64,
+    /// The proof of work's output. Only this work produces it, so each
+    /// owner's shares are ordered by it, and work counted twice is a tie.
+    pub final_hash: [u8; 32],
+    /// `MinerAuth::hash` of the signed copy the share was mined on, if
+    /// blocks needed a signature.
+    pub auth: Option<[u8; 32]>,
 }
 
-#[derive(Clone, Default)]
-pub struct ShareMerkleTree {
-    pub root: [u8; 32],
-    pub leaves: Vec<(OwnerId, u64)>,
-    layers: Vec<Vec<[u8; 32]>>,
-}
+impl ShareRecord {
+    fn leaf(&self) -> [u8; 32] {
+        hash_domain(
+            b"midwimble.pool.share.v1",
+            &[
+                &self.seq.to_le_bytes(),
+                &self.owner,
+                &self.weight.to_le_bytes(),
+                &self.job_id.to_le_bytes(),
+                &self.nonce.to_le_bytes(),
+                &self.final_hash,
+                &[self.auth.is_some() as u8],
+                &self.auth.unwrap_or_default(),
+            ],
+        )
+    }
 
-impl ShareMerkleTree {
-    pub fn build(mut shares: Vec<(OwnerId, u64)>) -> Self {
-        if shares.is_empty() {
-            return Self::default();
+    /// The share as a leaf of its owner's [`ShareTree`].
+    pub fn node(&self) -> TreeNode {
+        TreeNode {
+            hash: self.leaf(),
+            weight: self.weight,
+            low: self.final_hash,
+            high: self.final_hash,
         }
-        shares.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut layer: Vec<[u8; 32]> = shares.iter().map(|(a, s)| score_leaf(a, *s)).collect();
-        let mut layers = vec![layer.clone()];
-        while layer.len() > 1 {
-            layer = layer
+    }
+}
+
+/// What anyone needs to recompute the mining hash of any miner's copy of a
+/// job: the header fields the hash covers, the running midstate after the
+/// block's body, the coinbase (whose `extra` each copy replaces), the hash of
+/// the block's bond registrations, and the two window roots each copy's
+/// `extra` commits to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobProof {
+    pub prev_header_hash: [u8; 32],
+    pub timestamp: u64,
+    pub target: [u8; 32],
+    pub state_root: [u8; 32],
+    pub body_midstate: [u8; 32],
+    pub coinbase: Coinbase,
+    pub registrations: Option<[u8; 32]>,
+    pub paying_root: [u8; 32],
+    pub next_root: [u8; 32],
+}
+
+impl JobProof {
+    /// The proof for a job on `batch`, or `None` if it has no coinbase and
+    /// so no work to credit.
+    pub fn of(batch: &Batch, paying_root: [u8; 32], next_root: [u8; 32]) -> Option<Self> {
+        Some(Self {
+            prev_header_hash: batch.prev_header_hash,
+            timestamp: batch.timestamp,
+            target: batch.target,
+            state_root: batch.state_root,
+            body_midstate: hash_concat(&batch.prev_midstate, &batch.body.hash()),
+            coinbase: batch.coinbase.clone()?,
+            registrations: (!batch.registrations.is_empty())
+                .then(|| registrations_hash(&batch.registrations)),
+            paying_root,
+            next_root,
+        })
+    }
+
+    /// The mining hash of `owner`'s copy, signed with `auth` if any: what
+    /// hashing that copy's whole block gives (`types::fold_block`).
+    pub fn mining_hash(&self, owner: &OwnerId, auth: Option<&[u8; 32]>) -> [u8; 32] {
+        let mut coinbase = self.coinbase.clone();
+        coinbase.extra = bind_extra(&job_commitment(&self.paying_root, &self.next_root), owner);
+        let mut midstate = hash_concat(&self.body_midstate, &coinbase.hash());
+        midstate = hash_concat(&midstate, &self.state_root);
+        if let Some(registrations) = &self.registrations {
+            midstate = hash_concat(&midstate, registrations);
+        }
+        if let Some(auth) = auth {
+            midstate = hash_concat(&midstate, auth);
+        }
+        compute_header_hash(&BatchHeader {
+            height: 0,
+            prev_midstate: [0; 32],
+            post_tx_midstate: midstate,
+            extension: Extension {
+                nonce: 0,
+                final_hash: [0; 32],
+            },
+            timestamp: self.timestamp,
+            target: self.target,
+            state_root: self.state_root,
+            prev_header_hash: self.prev_header_hash,
+            aux_pow: None,
+        })
+    }
+}
+
+/// A node of a [`ShareTree`]: its hash, the weight of the shares beneath
+/// it, and the lowest and highest final hash among them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TreeNode {
+    pub hash: [u8; 32],
+    pub weight: u64,
+    pub low: [u8; 32],
+    pub high: [u8; 32],
+}
+
+impl TreeNode {
+    /// The parent of two nodes. Each child's weight and range go into the
+    /// parent's hash, so a sibling on a path is committed to them.
+    fn join(left: &Self, right: &Self) -> Self {
+        Self {
+            hash: hash_domain(
+                b"midwimble.pool.share-node.v1",
+                &[
+                    &left.hash,
+                    &left.weight.to_le_bytes(),
+                    &left.low,
+                    &left.high,
+                    &right.hash,
+                    &right.weight.to_le_bytes(),
+                    &right.low,
+                    &right.high,
+                ],
+            ),
+            weight: left.weight.saturating_add(right.weight),
+            low: left.low,
+            high: right.high,
+        }
+    }
+
+    /// [`TreeNode::join`] as a verifier does it: the left side's final
+    /// hashes must all be below the right side's, and the weights must add.
+    fn join_checked(left: &Self, right: &Self) -> Option<Self> {
+        left.weight.checked_add(right.weight)?;
+        (left.high < right.low).then(|| Self::join(left, right))
+    }
+}
+
+/// One owner's shares in a window, ordered by final hash, as a Merkle tree
+/// whose nodes also carry the weight beneath them and the range of final
+/// hashes they cover. A path from a share to the root proves that the share
+/// is in the window, where its weight sits on the owner's span of the window
+/// (so a sample drawn at a point can be held to the share covering it), and,
+/// node by node, that the shares around it are in strictly increasing order:
+/// the same work counted twice cannot pass where a check lands on it. An odd
+/// node at the end of a level moves up unchanged.
+struct ShareTree {
+    levels: Vec<Vec<TreeNode>>,
+}
+
+impl ShareTree {
+    fn build(leaves: Vec<TreeNode>) -> Self {
+        let mut levels = vec![leaves];
+        while levels.last().is_some_and(|level| level.len() > 1) {
+            let above = levels
+                .last()
+                .expect("a level")
                 .chunks(2)
-                .map(|c| {
-                    if c.len() == 2 {
-                        hash_concat(&c[0], &c[1])
-                    } else {
-                        hash_concat(&c[0], &c[0])
-                    }
+                .map(|pair| match pair {
+                    [left, right] => TreeNode::join(left, right),
+                    [only] => *only,
+                    _ => unreachable!("chunks of two"),
                 })
                 .collect();
-            layers.push(layer.clone());
+            levels.push(above);
         }
-        Self {
-            root: layer[0],
-            leaves: shares,
-            layers,
-        }
+        Self { levels }
     }
 
-    pub fn proof(&self, owner: &OwnerId) -> Option<(usize, Vec<[u8; 32]>)> {
-        let idx = self.leaves.iter().position(|(a, _)| a == owner)?;
-        let mut proof = Vec::new();
-        let mut i = idx;
-        for layer in &self.layers[..self.layers.len() - 1] {
-            let sibling = if i % 2 == 1 {
-                i - 1
-            } else {
-                (i + 1).min(layer.len() - 1)
-            };
-            proof.push(layer[sibling]);
-            i /= 2;
+    fn root(&self) -> Option<TreeNode> {
+        self.levels.last().and_then(|level| level.first()).copied()
+    }
+
+    /// The siblings on the way from leaf `index` to the root, skipping the
+    /// levels where it moves up alone.
+    fn path(&self, mut index: usize) -> Vec<TreeNode> {
+        let mut path = Vec::new();
+        for level in &self.levels[..self.levels.len().saturating_sub(1)] {
+            if let Some(sibling) = level.get(index ^ 1) {
+                path.push(*sibling);
+            }
+            index /= 2;
         }
-        Some((idx, proof))
+        path
     }
 }
 
-pub fn fold_proof(leaf: [u8; 32], index: usize, proof: &[[u8; 32]]) -> [u8; 32] {
-    let (mut h, mut i) = (leaf, index);
-    for sibling in proof {
-        h = if i % 2 == 1 {
-            hash_concat(sibling, &h)
-        } else {
-            hash_concat(&h, sibling)
-        };
-        i /= 2;
+/// Folds `leaf`, at `index` of a [`ShareTree`] of `count` leaves, up `path`.
+/// Returns the root and where the leaf's weight starts on the owner's span,
+/// or `None` if the path does not fit the tree's shape, a sum overflows, or
+/// any node on the way joins final hashes out of order.
+pub fn fold_share_path(
+    leaf: TreeNode,
+    index: u64,
+    count: u64,
+    path: &[TreeNode],
+) -> Option<(TreeNode, u64)> {
+    if index >= count {
+        return None;
     }
-    h
+    let (mut node, mut i, mut n, mut start) = (leaf, index, count, 0u64);
+    let mut siblings = path.iter();
+    while n > 1 {
+        if (i ^ 1) < n {
+            let sibling = siblings.next()?;
+            node = if i % 2 == 1 {
+                start = start.checked_add(sibling.weight)?;
+                TreeNode::join_checked(sibling, &node)?
+            } else {
+                TreeNode::join_checked(&node, sibling)?
+            };
+        }
+        i /= 2;
+        n = n.div_ceil(2);
+    }
+    siblings.next().is_none().then_some((node, start))
+}
+
+/// Merkle root of `leaves`, an odd last node paired with itself (midstate's
+/// share tree). Callers bind the count, so two lists cannot share a root.
+fn merkle_root(mut layer: Vec<[u8; 32]>) -> [u8; 32] {
+    if layer.is_empty() {
+        return [0; 32];
+    }
+    while layer.len() > 1 {
+        layer = layer
+            .chunks(2)
+            .map(|c| hash_concat(&c[0], c.get(1).unwrap_or(&c[0])))
+            .collect();
+    }
+    layer[0]
 }
 
 // ── Payouts: a PPLNS window, exact or sampled ───────────────────────────────
@@ -251,34 +445,84 @@ fn fee_ppm(percent: f64) -> Result<u64> {
 /// they only need to be precise, not to know the fees.
 pub const PAYOUT_SCALE: u64 = 1 << 50;
 
+/// One owner's entry in a [`Window`]: its total weight, and the root and
+/// size of the tree of its shares ([`ShareTree`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowOwner {
+    pub id: OwnerId,
+    pub weight: u64,
+    pub shares_root: [u8; 32],
+    pub shares: u64,
+}
+
+impl WindowOwner {
+    fn leaf(&self) -> [u8; 32] {
+        hash_domain(
+            b"midwimble.pool.owner-leaf.v1",
+            &[
+                &self.id,
+                &self.weight.to_le_bytes(),
+                &self.shares_root,
+                &self.shares.to_le_bytes(),
+            ],
+        )
+    }
+}
+
 /// The shares a block pays: the newest accepted shares, by sequence number
-/// `start_seq..end_seq`, summed per owner.
+/// `start_seq..end_seq`, per owner, each owner's committed share by share.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Window {
     pub start_seq: u64,
     pub end_seq: u64,
-    /// Total share weight per owner, sorted by id, every weight positive.
-    pub owners: Vec<(OwnerId, u64)>,
+    /// The pool's minimum share difficulty, in leading zero bits: a share of
+    /// weight `2^e` must meet `share_bits + e`.
+    pub share_bits: u32,
+    /// Sorted by id, every weight positive.
+    pub owners: Vec<WindowOwner>,
 }
 
 impl Window {
     /// What a job commits to: the owners' Merkle root bound to how many
-    /// owners there are, their total weight and the sequence range. The count
-    /// keeps the tree's duplicated odd node from letting two lists share a
-    /// root.
+    /// owners there are, their total weight, the sequence range and the
+    /// minimum difficulty. The count keeps the tree's duplicated odd node
+    /// from letting two lists share a root.
     pub fn root(&self) -> [u8; 32] {
-        let tree = ShareMerkleTree::build(self.owners.clone());
-        let total: u128 = self.owners.iter().map(|(_, w)| *w as u128).sum();
+        let total: u128 = self.owners.iter().map(|o| o.weight as u128).sum();
         hash_domain(
-            b"midwimble.pool.window.v2",
+            b"midwimble.pool.window.v3",
             &[
-                &tree.root,
+                &merkle_root(self.owners.iter().map(WindowOwner::leaf).collect()),
                 &(self.owners.len() as u64).to_le_bytes(),
                 &total.to_le_bytes(),
                 &self.start_seq.to_le_bytes(),
                 &self.end_seq.to_le_bytes(),
+                &self.share_bits.to_le_bytes(),
             ],
         )
+    }
+
+    /// Each owner's total weight, which is what the payout rule divides.
+    pub fn weights(&self) -> Vec<(OwnerId, u64)> {
+        self.owners.iter().map(|o| (o.id, o.weight)).collect()
+    }
+
+    pub fn total(&self) -> u128 {
+        self.owners.iter().map(|o| o.weight as u128).sum()
+    }
+
+    /// The owner whose span covers point `at` of the window's weight, the
+    /// owners laid end to end in id order, and the point's offset within it.
+    pub fn locate(&self, at: u128) -> Option<(&WindowOwner, u64)> {
+        let mut start = 0u128;
+        for owner in &self.owners {
+            let end = start + owner.weight as u128;
+            if at < end {
+                return Some((owner, (at - start) as u64));
+            }
+            start = end;
+        }
+        None
     }
 }
 
@@ -408,174 +652,267 @@ pub fn payout_weights(
     Ok(weights)
 }
 
-/// A frozen [`Window`], its root, and the addresses its owner ids stand for
-/// (which only the pool knows).
+/// A frozen [`Window`], its root, and what only the pool knows about it: the
+/// addresses behind its owner ids, and each owner's shares in tree order, to
+/// answer spot checks from.
 struct WindowSnapshot {
     window: Window,
     root: [u8; 32],
     addresses: HashMap<OwnerId, StealthAddress>,
+    shares: HashMap<OwnerId, Vec<Arc<ShareRecord>>>,
 }
 
 impl WindowSnapshot {
-    fn new(window: Window, addresses: HashMap<OwnerId, StealthAddress>) -> Self {
-        let root = window.root();
-        Self {
-            window,
-            root,
-            addresses,
+    /// The window of `shares` (in any order), which cover sequence numbers
+    /// `start_seq..end_seq`, at minimum difficulty `share_bits`.
+    fn new(
+        start_seq: u64,
+        end_seq: u64,
+        share_bits: u32,
+        shares: Vec<Arc<ShareRecord>>,
+        addresses: HashMap<OwnerId, StealthAddress>,
+    ) -> Self {
+        let mut by_owner: HashMap<OwnerId, Vec<Arc<ShareRecord>>> = HashMap::new();
+        for share in shares {
+            by_owner.entry(share.owner).or_default().push(share);
         }
+        let mut owners = Vec::with_capacity(by_owner.len());
+        for (id, list) in by_owner.iter_mut() {
+            list.sort_by_key(|s| s.final_hash);
+            // Work counted twice would sit out of order in the tree, which a
+            // spot check landing on it detects; never commit to it.
+            list.dedup_by_key(|s| s.final_hash);
+            let root = ShareTree::build(list.iter().map(|s| s.node()).collect())
+                .root()
+                .expect("an owner in a window has shares");
+            owners.push(WindowOwner {
+                id: *id,
+                weight: root.weight,
+                shares_root: root.hash,
+                shares: list.len() as u64,
+            });
+        }
+        owners.sort_by_key(|o| o.id);
+        let window = Window {
+            start_seq,
+            end_seq,
+            share_bits,
+            owners,
+        };
+        Self {
+            root: window.root(),
+            window,
+            addresses,
+            shares: by_owner,
+        }
+    }
+
+    /// The pool's answer to a spot check at point `at` of this window: the
+    /// share covering it, its path in its owner's tree, and the proof of the
+    /// job it was mined on ([`verify_sample`]).
+    fn sample(&self, db: &Database, at: u128) -> Result<Value> {
+        let (owner, offset) = self
+            .window
+            .locate(at)
+            .ok_or_else(|| anyhow!("the window holds less weight than that"))?;
+        let shares = &self.shares[&owner.id];
+        let mut start = 0u64;
+        let mut index = None;
+        for (i, share) in shares.iter().enumerate() {
+            if offset - start < share.weight {
+                index = Some(i);
+                break;
+            }
+            start += share.weight;
+        }
+        let index = index.ok_or_else(|| anyhow!("no share covers that point"))?;
+        let share = &shares[index];
+        let tree = ShareTree::build(shares.iter().map(|s| s.node()).collect());
+        let proof = load_job_proof(db, share.job_id)?;
+        Ok(json!({
+            "owner": hex::encode(owner.id),
+            "index": index,
+            "share": hex::encode(bincode::serialize(share.as_ref())?),
+            "path": tree.path(index).iter().map(node_json).collect::<Vec<_>>(),
+            "job_proof": hex::encode(bincode::serialize(&proof)?),
+        }))
     }
 }
 
+fn node_json(node: &TreeNode) -> Value {
+    json!([
+        hex::encode(node.hash),
+        node.weight,
+        hex::encode(node.low),
+        hex::encode(node.high)
+    ])
+}
+
 /// How much share weight a window holds: `window_blocks` blocks' worth at
-/// `network_target`, in shares of the pool's minimum difficulty.
+/// `network_target`, in shares of the pool's minimum difficulty. Capped well
+/// inside a u64, so every owner's total weight fits one.
 fn window_size(network_target: &[u8; 32], share_bits: u32, window_blocks: u64) -> u128 {
     use primitive_types::U256;
     let target = U256::from_big_endian(network_target).max(U256::one());
     let per_block = (U256::MAX / target) >> share_bits.min(255) as usize;
     let size = per_block.saturating_mul(U256::from(window_blocks.max(1)));
-    if size > U256::from(u64::MAX) {
-        u64::MAX as u128
+    let cap = u64::MAX >> 1;
+    if size > U256::from(cap) {
+        cap as u128
     } else {
         size.as_u128().max(1)
     }
 }
 
-/// Accepted shares, oldest first, as far back as a window can still reach.
+/// Credited shares, oldest first, as far back as a window can still reach,
+/// and the addresses of their owners.
 #[derive(Default)]
 struct ShareLog {
-    /// (sequence number, owner, weight)
-    entries: VecDeque<(u64, AddrKey, u64)>,
+    entries: VecDeque<Arc<ShareRecord>>,
+    addresses: HashMap<OwnerId, StealthAddress>,
     next_seq: u64,
 }
 
 impl ShareLog {
     fn load(db: &Database) -> Result<Self> {
         let txn = db.begin_read()?;
-        let table = txn.open_table(SHARE_LOG)?;
         let mut log = Self::default();
-        for entry in table.iter()? {
+        for entry in txn.open_table(OWNERS)?.iter()? {
+            let (id, key) = entry?;
+            let id: OwnerId = id.value().try_into().context("corrupt owner id")?;
+            let key: AddrKey = key.value().try_into().context("corrupt owner address")?;
+            log.addresses.insert(id, key_addr(&key));
+        }
+        for entry in txn.open_table(SHARE_RECORDS)?.iter()? {
             let (seq, value) = entry?;
-            let value = value.value();
-            if value.len() != 104 {
-                bail!("corrupt share log entry {}", seq.value());
+            let share: ShareRecord = bincode::deserialize(value.value())
+                .with_context(|| format!("corrupt share {}", seq.value()))?;
+            if share.seq != seq.value() || !log.addresses.contains_key(&share.owner) {
+                bail!("corrupt share {}", seq.value());
             }
-            let owner: AddrKey = value[..96].try_into().expect("length checked");
-            let weight = u64::from_le_bytes(value[96..].try_into().expect("length checked"));
-            log.entries.push_back((seq.value(), owner, weight));
-            log.next_seq = seq.value() + 1;
+            log.next_seq = share.seq + 1;
+            log.entries.push_back(Arc::new(share));
         }
         Ok(log)
     }
 
-    /// Appends a share, in `db` first and then in memory, and returns its
-    /// sequence number.
-    fn append(&mut self, db: &Database, owner: &AddrKey, weight: u64) -> Result<u64> {
-        let seq = self.next_seq;
-        let mut value = [0u8; 104];
-        value[..96].copy_from_slice(owner);
-        value[96..].copy_from_slice(&weight.to_le_bytes());
+    /// Appends `share`, mined for `address`, under the next sequence number,
+    /// in `db` first and then in memory, and returns that number.
+    fn append(
+        &mut self,
+        db: &Database,
+        address: &StealthAddress,
+        mut share: ShareRecord,
+    ) -> Result<u64> {
+        share.seq = self.next_seq;
         let txn = db.begin_write()?;
-        txn.open_table(SHARE_LOG)?.insert(seq, value.as_slice())?;
+        if !self.addresses.contains_key(&share.owner) {
+            txn.open_table(OWNERS)?
+                .insert(share.owner.as_slice(), addr_key(address).as_slice())?;
+        }
+        txn.open_table(SHARE_RECORDS)?
+            .insert(share.seq, bincode::serialize(&share)?.as_slice())?;
         txn.commit()?;
-        self.entries.push_back((seq, *owner, weight));
-        self.next_seq = seq + 1;
+        self.addresses.insert(share.owner, *address);
+        self.next_seq = share.seq + 1;
+        let seq = share.seq;
+        self.entries.push_back(Arc::new(share));
         Ok(seq)
     }
 
-    /// The newest shares whose weights add up to at least `size`, or every
-    /// share if there are not that many, and the address of each owner.
-    fn window(&self, size: u128) -> (Window, HashMap<OwnerId, StealthAddress>) {
-        let mut owners: HashMap<OwnerId, u64> = HashMap::new();
-        let mut addresses = HashMap::new();
+    /// The window of the newest shares whose weights add up to at least
+    /// `size`, or of every share if there are not that many.
+    fn window(&self, size: u128, share_bits: u32) -> WindowSnapshot {
         let mut total = 0u128;
         let mut start_seq = self.next_seq;
-        for (seq, owner, weight) in self.entries.iter().rev() {
+        let mut shares = Vec::new();
+        let mut addresses = HashMap::new();
+        for share in self.entries.iter().rev() {
             if total >= size {
                 break;
             }
-            total += *weight as u128;
-            let id = owner_of(owner);
-            addresses.entry(id).or_insert_with(|| key_addr(owner));
-            let sum = owners.entry(id).or_default();
-            *sum = sum.saturating_add(*weight);
-            start_seq = *seq;
+            total += share.weight as u128;
+            start_seq = share.seq;
+            addresses.insert(share.owner, self.addresses[&share.owner]);
+            shares.push(share.clone());
         }
-        let mut owners: Vec<(OwnerId, u64)> = owners.into_iter().collect();
-        owners.sort_by_key(|a| a.0);
-        let window = Window {
-            start_seq,
-            end_seq: self.next_seq,
-            owners,
-        };
-        (window, addresses)
+        WindowSnapshot::new(start_seq, self.next_seq, share_bits, shares, addresses)
     }
 
     /// Forgets shares older than `keep_from` that are also outside the newest
-    /// `keep` weight, and returns the first sequence number kept.
-    fn prune(&mut self, keep_from: u64, keep: u128) -> u64 {
+    /// `keep` weight, and owners left with no share. Returns the first
+    /// sequence number kept and the owners left.
+    fn prune(&mut self, keep_from: u64, keep: u128) -> (u64, HashSet<OwnerId>) {
         let mut weight = 0u128;
         let mut first_kept = self.next_seq;
-        for (seq, _, w) in self.entries.iter().rev() {
-            if weight >= keep && *seq < keep_from {
+        for share in self.entries.iter().rev() {
+            if weight >= keep && share.seq < keep_from {
                 break;
             }
-            weight += *w as u128;
-            first_kept = *seq;
+            weight += share.weight as u128;
+            first_kept = share.seq;
         }
-        while self
-            .entries
-            .front()
-            .is_some_and(|(seq, _, _)| *seq < first_kept)
-        {
+        while self.entries.front().is_some_and(|s| s.seq < first_kept) {
             self.entries.pop_front();
         }
-        first_kept
+        let owners: HashSet<OwnerId> = self.entries.iter().map(|s| s.owner).collect();
+        self.addresses.retain(|id, _| owners.contains(id));
+        (first_kept, owners)
+    }
+
+    /// The oldest job a kept share was mined on.
+    fn first_job(&self) -> Option<u64> {
+        self.entries.iter().map(|s| s.job_id).min()
     }
 }
 
-/// Removes shares before `first_kept` from the log on disk.
-fn prune_share_log(db: &Database, first_kept: u64) -> Result<()> {
+/// Removes from disk the shares before `first_kept`, the proofs of jobs
+/// before `first_job`, and the addresses of owners not in `owners`.
+fn prune_db(
+    db: &Database,
+    first_kept: u64,
+    first_job: u64,
+    owners: &HashSet<OwnerId>,
+) -> Result<()> {
     let txn = db.begin_write()?;
-    txn.open_table(SHARE_LOG)?
+    txn.open_table(SHARE_RECORDS)?
         .retain_in(..first_kept, |_, _| false)?;
+    txn.open_table(JOB_PROOFS)?
+        .retain_in(..first_job, |_, _| false)?;
+    txn.open_table(OWNERS)?
+        .retain(|id, _| <OwnerId>::try_from(id).is_ok_and(|id| owners.contains(&id)))?;
     txn.commit()?;
     Ok(())
 }
 
-/// Carries the unpaid scores of the previous payout scheme into an empty
-/// share log, one share per miner weighing its score, so nobody's earned
-/// work is lost on upgrade. Clears the old table.
-fn migrate_legacy_scores(db: &Database) -> Result<usize> {
+fn store_job_proof(db: &Database, job_id: u64, proof: &JobProof) -> Result<()> {
     let txn = db.begin_write()?;
-    let moved = {
-        let mut log = txn.open_table(SHARE_LOG)?;
-        let mut legacy = txn.open_table(LEGACY_SCORES)?;
-        if log.iter()?.next().is_some() {
-            0
-        } else {
-            let mut scores: Vec<(AddrKey, u64)> = Vec::new();
-            for entry in legacy.iter()? {
-                let (key, score) = entry?;
-                if let Ok(owner) = <AddrKey>::try_from(key.value()) {
-                    if score.value() > 0 {
-                        scores.push((owner, score.value()));
-                    }
-                }
-            }
-            scores.sort();
-            for (seq, (owner, score)) in scores.iter().enumerate() {
-                let mut value = [0u8; 104];
-                value[..96].copy_from_slice(owner);
-                value[96..].copy_from_slice(&score.to_le_bytes());
-                log.insert(seq as u64, value.as_slice())?;
-            }
-            legacy.retain(|_, _| false)?;
-            scores.len()
-        }
-    };
+    txn.open_table(JOB_PROOFS)?
+        .insert(job_id, bincode::serialize(proof)?.as_slice())?;
     txn.commit()?;
-    Ok(moved)
+    Ok(())
+}
+
+fn load_job_proof(db: &Database, job_id: u64) -> Result<JobProof> {
+    let txn = db.begin_read()?;
+    let table = txn.open_table(JOB_PROOFS)?;
+    let value = table
+        .get(job_id)?
+        .ok_or_else(|| anyhow!("no proof of job {job_id}"))?;
+    Ok(bincode::deserialize(value.value())?)
+}
+
+/// Credit recorded before shares carried their proof of work (the score
+/// table of the scheme before PPLNS, and the first share log) cannot be
+/// re-checked by anyone, so a pool upgrading drops it: at most one window's
+/// worth of work. Returns how many entries went.
+fn drop_unproven_credit(db: &Database) -> Result<u64> {
+    let txn = db.begin_write()?;
+    let dropped = txn.open_table(LEGACY_SCORES)?.len()? + txn.open_table(SHARE_LOG)?.len()?;
+    txn.delete_table(LEGACY_SCORES)?;
+    txn.delete_table(SHARE_LOG)?;
+    txn.commit()?;
+    Ok(dropped)
 }
 
 /// Shares heavier than the pool's minimum difficulty count `2^extra_bits`
@@ -1014,31 +1351,51 @@ struct PoolState {
     api_public: String,
     /// Job whose block has already been submitted (one block per template).
     submitted_job: AtomicU64,
+    /// The id the next job takes.
+    next_job_id: AtomicU64,
 }
 
-/// Opens the pool's database, creating its tables, and loads the share log.
-fn open_db(path: &std::path::Path) -> Result<(Database, ShareLog)> {
+/// Opens the pool's database, creating its tables, drops credit nobody can
+/// re-check, and loads the share log. Also returns the first job id not yet
+/// used: shares and job proofs outlive a restart, so job ids must too.
+fn open_db(path: &std::path::Path) -> Result<(Database, ShareLog, u64)> {
     let db = Database::create(path)?;
+    let dropped = drop_unproven_credit(&db)?;
+    if dropped > 0 {
+        tracing::warn!(
+            "pool: dropped {dropped} entries of credit recorded without their proof of work"
+        );
+    }
     let txn = db.begin_write()?;
     {
-        txn.open_table(LEGACY_SCORES)?;
-        txn.open_table(SHARE_LOG)?;
+        txn.open_table(SHARE_RECORDS)?;
+        txn.open_table(OWNERS)?;
+        txn.open_table(JOB_PROOFS)?;
         txn.open_table(FOUND)?;
     }
     txn.commit()?;
-    let moved = migrate_legacy_scores(&db)?;
-    if moved > 0 {
-        tracing::info!("pool: carried {moved} miners' unpaid scores into the share log");
-    }
     let log = ShareLog::load(&db)?;
-    Ok((db, log))
+    let last_proof = {
+        let txn = db.begin_read()?;
+        let table = txn.open_table(JOB_PROOFS)?;
+        let last = table.last()?.map(|(id, _)| id.value());
+        last
+    };
+    let next_job_id = log
+        .entries
+        .iter()
+        .map(|s| s.job_id)
+        .chain(last_proof)
+        .max()
+        .map_or(1, |id| id + 1);
+    Ok((db, log, next_job_id))
 }
 
 /// Runs the pool until the process exits.
 pub async fn run_pool(cfg: PoolConfig, stats: Arc<PoolStats>) -> Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     fee_ppm(cfg.fee_percent)?;
-    let (db, log) = open_db(&cfg.data_dir.join("pool.redb"))?;
+    let (db, log, next_job_id) = open_db(&cfg.data_dir.join("pool.redb"))?;
     let stratum = tokio::net::TcpListener::bind(cfg.stratum_bind).await?;
     let api = tokio::net::TcpListener::bind(cfg.api_bind).await?;
     let api_public = cfg
@@ -1069,11 +1426,13 @@ pub async fn run_pool(cfg: PoolConfig, stats: Arc<PoolStats>) -> Result<()> {
         stats,
         api_public,
         submitted_job: AtomicU64::new(0),
+        next_job_id: AtomicU64::new(next_job_id),
     });
 
     let app = Router::new()
         .route("/pool/stats", get(api_stats))
         .route("/api/window", get(api_window))
+        .route("/api/sample", get(api_sample))
         .route("/api/template", get(api_template))
         .with_state(state.clone());
     tokio::spawn(async move {
@@ -1122,7 +1481,6 @@ struct Published {
 async fn job_loop(state: Arc<PoolState>) {
     let node = state.cfg.node_rpc.clone();
     let mut last_tip = String::new();
-    let mut job_id: u64 = 0;
     // Miners check that a job on a new tip pays exactly the window the jobs
     // on the previous tip froze, which they saw before the new tip existed.
     let mut published: Option<Published> = None;
@@ -1160,8 +1518,23 @@ async fn job_loop(state: Arc<PoolState>) {
                 (now.clone(), now)
             }
         };
-        match build_job(&state, job_id + 1, tip_hash, paying.clone(), next.clone()).await {
+        let job_id = state.next_job_id.load(Ordering::SeqCst);
+        match build_job(&state, job_id, tip_hash, paying.clone(), next.clone()).await {
             Ok(job) => {
+                // Anyone re-checking one of this job's shares needs its
+                // proof, for as long as the share can be paid.
+                if let Some(proof) = JobProof::of(&job.batch, job.paying.root, job.next.root) {
+                    let st = state.clone();
+                    let stored = tokio::task::spawn_blocking(move || {
+                        store_job_proof(&st.db, job_id, &proof)
+                    })
+                    .await;
+                    if let Ok(Err(e)) | Err(e) = stored.map_err(anyhow::Error::from) {
+                        tracing::warn!("pool: could not keep job {job_id}'s proof: {e:#}");
+                        continue;
+                    }
+                }
+                state.next_job_id.store(job_id + 1, Ordering::SeqCst);
                 // Copies for every connected miner in one request, before the
                 // job is announced; a miner who connects later gets its own
                 // on demand.
@@ -1176,7 +1549,6 @@ async fn job_loop(state: Arc<PoolState>) {
                     tracing::warn!("pool: could not bind the job to its miners: {e:#}");
                 }
                 let job = Arc::new(job);
-                job_id += 1;
                 last_tip = tip;
                 {
                     let mut recent = state.recent.write().await;
@@ -1206,14 +1578,23 @@ async fn job_loop(state: Arc<PoolState>) {
                     state.cfg.share_bits,
                     state.cfg.window_blocks,
                 );
-                let first_kept = state
-                    .log
-                    .lock()
-                    .expect("share log lock")
-                    .prune(keep_from, size.saturating_mul(4));
+                let (first_kept, owners, first_logged_job) = {
+                    let mut log = state.log.lock().expect("share log lock");
+                    let (first_kept, owners) = log.prune(keep_from, size.saturating_mul(4));
+                    (first_kept, owners, log.first_job())
+                };
+                // Proofs go once no kept share or recent job needs them.
+                let first_recent_job = state.recent.read().await.front().map(|j| j.job_id);
+                let first_job = first_logged_job
+                    .into_iter()
+                    .chain(first_recent_job)
+                    .min()
+                    .unwrap_or(job_id);
                 let st = state.clone();
-                let pruned =
-                    tokio::task::spawn_blocking(move || prune_share_log(&st.db, first_kept)).await;
+                let pruned = tokio::task::spawn_blocking(move || {
+                    prune_db(&st.db, first_kept, first_job, &owners)
+                })
+                .await;
                 if let Ok(Err(e)) | Err(e) = pruned.map_err(anyhow::Error::from) {
                     tracing::warn!("pool: pruning the share log failed: {e:#}");
                 }
@@ -1230,8 +1611,13 @@ fn freeze_window(state: &PoolState, network_target: &[u8; 32]) -> Arc<WindowSnap
         state.cfg.share_bits,
         state.cfg.window_blocks,
     );
-    let (window, addresses) = state.log.lock().expect("share log lock").window(size);
-    Arc::new(WindowSnapshot::new(window, addresses))
+    Arc::new(
+        state
+            .log
+            .lock()
+            .expect("share log lock")
+            .window(size, state.cfg.share_bits),
+    )
 }
 
 async fn build_job(
@@ -1246,7 +1632,7 @@ async fn build_job(
     let operator = owner_id(&state.cfg.pool_address);
     // The payouts go by owner id; only the pool knows the addresses behind
     // them, so only the node it asks for the template learns them.
-    let payouts: Vec<Value> = payout_weights(fee, &operator, &paying.window.owners, &seed)?
+    let payouts: Vec<Value> = payout_weights(fee, &operator, &paying.window.weights(), &seed)?
         .iter()
         .map(|(owner, weight)| {
             let address = if *owner == operator {
@@ -1373,9 +1759,10 @@ enum ShareOutcome {
         seq: u64,
         weight: u64,
     },
-    /// Valid, but for a job with nothing to pay: such a block has no
+    /// Valid, but credited to nobody: a job with nothing to pay has no
     /// coinbase to carry the binding, so every miner's copy is the same
-    /// header and the work cannot be tied to whoever did it.
+    /// header and the work cannot be tied to whoever did it; and a block that
+    /// misses the share target cannot be re-checked at a share's weight.
     Uncredited {
         is_block: bool,
     },
@@ -1465,15 +1852,29 @@ async fn finish_share(
             .remove(&(share.variant.mining_hash, share.nonce));
         return Ok(ShareOutcome::Invalid);
     }
-    let credited = job.batch.coinbase.is_some();
+    // Credit is for work anyone can re-check at the weight it is counted
+    // at: a block that misses the share target (only possible while blocks
+    // are easier than the pool's minimum share) is submitted, not credited.
+    let credited = job.batch.coinbase.is_some() && final_hash < share.share_target;
     let seq = if credited {
+        // Everything anyone needs to re-check the work later, with the
+        // job's proof (`JobProof`).
+        let record = ShareRecord {
+            seq: 0, // numbered by the log
+            owner: owner_of(&share.miner),
+            weight: share.weight,
+            job_id: job.job_id,
+            nonce: share.nonce,
+            final_hash,
+            auth: share.variant.miner.as_ref().map(|auth| auth.hash()),
+        };
         let st = state.clone();
-        let (miner, weight) = (share.miner, share.weight);
+        let address = key_addr(&share.miner);
         let seq = tokio::task::spawn_blocking(move || {
             st.log
                 .lock()
                 .expect("share log lock")
-                .append(&st.db, &miner, weight)
+                .append(&st.db, &address, record)
         })
         .await??;
         Some(seq)
@@ -1834,10 +2235,16 @@ fn window_json(window: &Window) -> Value {
     json!({
         "start_seq": window.start_seq,
         "end_seq": window.end_seq,
+        "share_bits": window.share_bits,
         "owners": window
             .owners
             .iter()
-            .map(|(id, w)| json!({ "id": hex::encode(id), "weight": w }))
+            .map(|o| json!({
+                "id": hex::encode(o.id),
+                "weight": o.weight,
+                "shares_root": hex::encode(o.shares_root),
+                "shares": o.shares,
+            }))
             .collect::<Vec<_>>(),
     })
 }
@@ -1861,6 +2268,34 @@ async fn api_window(State(state): State<Arc<PoolState>>, Query(q): Query<JobQuer
         "next_root": hex::encode(job.next.root),
         "commitment": hex::encode(job.commitment),
     }))
+}
+
+#[derive(Deserialize)]
+struct SampleQuery {
+    job: u64,
+    /// A point of the paid window's weight, in decimal (it can exceed a u64).
+    at: String,
+}
+
+/// A miner's spot check of job `job`'s paid window at point `at`: the share
+/// covering that point, with the proofs that it is in the committed window
+/// and is real work ([`verify_sample`]).
+async fn api_sample(
+    State(state): State<Arc<PoolState>>,
+    Query(q): Query<SampleQuery>,
+) -> Json<Value> {
+    let Some(job) = find_job(&state, Some(q.job)).await else {
+        return Json(json!({ "error": "no such job" }));
+    };
+    let Ok(at) = q.at.parse::<u128>() else {
+        return Json(json!({ "error": "bad point" }));
+    };
+    let st = state.clone();
+    match tokio::task::spawn_blocking(move || job.paying.sample(&st.db, at)).await {
+        Ok(Ok(sample)) => Json(sample),
+        Ok(Err(e)) => Json(json!({ "error": format!("{e:#}") })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
 }
 
 async fn api_template(State(state): State<Arc<PoolState>>) -> Json<Value> {
@@ -1898,9 +2333,7 @@ async fn api_stats(State(state): State<Arc<PoolState>>) -> Json<Value> {
         "height": job.as_ref().map(|j| j.height),
         "job_id": job.as_ref().map(|j| j.job_id),
         "miners": job.as_ref().map_or(0, |j| j.paying.window.owners.len()),
-        "window_weight": job.as_ref().map_or(0, |j| {
-            j.paying.window.owners.iter().map(|(_, w)| *w as u128).sum::<u128>()
-        }).to_string(),
+        "window_weight": job.as_ref().map_or(0, |j| j.paying.window.total()).to_string(),
         "fee_percent": state.cfg.fee_percent,
         "share_bits": state.cfg.share_bits,
         "share_interval_secs": state.cfg.share_interval.as_secs_f64(),
@@ -1925,28 +2358,41 @@ pub struct AuditedJob {
     /// The window the job pays, and the one it freezes for the next tip.
     pub window_root: [u8; 32],
     pub next_root: [u8; 32],
-    /// The first share sequence number the paid window covers.
-    pub window_start: u64,
+    /// The paid window itself, which spot checks sample ([`verify_sample`]).
+    pub window: Window,
 }
 
 fn parse_window(value: &Value) -> Result<Window> {
-    let owners: Vec<(OwnerId, u64)> = value["owners"]
+    let owners: Vec<WindowOwner> = value["owners"]
         .as_array()
         .ok_or_else(|| anyhow!("missing window owners"))?
         .iter()
         .map(|entry| {
-            let key = crate::core::auxpow::bytes32(&entry["id"]).context("bad owner id")?;
-            let weight = entry["weight"]
-                .as_u64()
-                .ok_or_else(|| anyhow!("missing owner weight"))?;
-            Ok((key, weight))
+            let count = |field: &str| {
+                entry[field]
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("missing owner {field}"))
+            };
+            Ok(WindowOwner {
+                id: crate::core::auxpow::bytes32(&entry["id"]).context("bad owner id")?,
+                weight: count("weight")?,
+                shares_root: crate::core::auxpow::bytes32(&entry["shares_root"])
+                    .context("bad owner shares root")?,
+                shares: count("shares")?,
+            })
         })
         .collect::<Result<_>>()?;
-    // One canonical list per window: strictly increasing keys, no empty
+    // One canonical list per window: strictly increasing ids, no empty
     // entries. Anything else could share a root with a different list.
-    if owners.windows(2).any(|w| w[0].0 >= w[1].0) || owners.iter().any(|(_, w)| *w == 0) {
+    if owners.windows(2).any(|w| w[0].id >= w[1].id)
+        || owners.iter().any(|o| o.weight == 0 || o.shares == 0)
+    {
         bail!("window owners are not a sorted list of distinct, positive entries");
     }
+    let share_bits = value["share_bits"]
+        .as_u64()
+        .and_then(|b| u32::try_from(b).ok())
+        .ok_or_else(|| anyhow!("missing minimum share difficulty"))?;
     Ok(Window {
         start_seq: value["start_seq"]
             .as_u64()
@@ -1954,6 +2400,7 @@ fn parse_window(value: &Value) -> Result<Window> {
         end_seq: value["end_seq"]
             .as_u64()
             .ok_or_else(|| anyhow!("missing window end"))?,
+        share_bits,
         owners,
     })
 }
@@ -1965,8 +2412,10 @@ fn parse_window(value: &Value) -> Result<Window> {
 ///
 /// * `window` is the pool's `/api/window` answer for the job.
 /// * `max_fee_ppm` is the miner's own limit, never a pool-supplied setting.
-/// * `my_shares` are `(sequence number, weight)` of shares the pool accepted
-///   from us: the window must credit us at least the ones inside its range.
+/// * `my_shares` are `(sequence number, weight, difficulty in bits)` of
+///   shares the pool accepted from us: the window must credit us at least
+///   the ones inside its range, each weighed by the window's committed
+///   minimum difficulty.
 ///
 /// The height comes from the pool (a batch on the wire carries none); the
 /// coinbase total pins it to the reward at that height, but only a node of
@@ -1977,7 +2426,7 @@ pub fn audit_job_with_fee_limit(
     template_hex: &str,
     window: &Value,
     max_fee_ppm: u64,
-    my_shares: &[(u64, u64)],
+    my_shares: &[(u64, u64, u32)],
 ) -> Result<AuditedJob> {
     let batch: Batch = bincode::deserialize(&hex::decode(template_hex)?)?;
     if &compute_header_hash(&batch.header()) != mining_hash {
@@ -2001,7 +2450,7 @@ pub fn audit_job_with_fee_limit(
         prev_hash: batch.prev_header_hash,
         window_root,
         next_root,
-        window_start: paying.start_seq,
+        window: paying.clone(),
     };
     let total = crate::core::types::block_reward(height)
         .checked_add(batch.body.fee()?)
@@ -2029,18 +2478,28 @@ pub fn audit_job_with_fee_limit(
     let listed = paying
         .owners
         .iter()
-        .find(|(k, _)| *k == key)
-        .map_or(0, |(_, w)| *w as u128);
-    let ours: u128 = my_shares
-        .iter()
-        .filter(|(seq, _)| (paying.start_seq..paying.end_seq).contains(seq))
-        .map(|(_, w)| *w as u128)
-        .sum();
+        .find(|o| o.id == key)
+        .map_or(0, |o| o.weight as u128);
+    let mut ours = 0u128;
+    for (seq, weight, bits) in my_shares {
+        if !(paying.start_seq..paying.end_seq).contains(seq) {
+            continue;
+        }
+        // Spot checks hold every share to the committed minimum difficulty,
+        // so ours must have been weighed by it too: a pool that committed an
+        // easier minimum than it credits us at could count its own shares at
+        // a discount.
+        let fair = 1u64 << bits.saturating_sub(paying.share_bits).min(MAX_WEIGHT_BITS);
+        if *weight != fair {
+            bail!("the pool credited our share {seq} at {weight}, but the committed minimum difficulty makes it {fair}");
+        }
+        ours += *weight as u128;
+    }
     if listed < ours {
         bail!("the window credits us {listed} but our accepted shares in it weigh {ours}");
     }
     let seed = draw_seed(&batch.prev_header_hash, &window_root);
-    let weights = payout_weights(fee, &operator, &paying.owners, &seed)?;
+    let weights = payout_weights(fee, &operator, &paying.weights(), &seed)?;
     let expected = crate::core::template::split_by_weight(total, &weights)?
         .iter()
         .filter(|(owner, _)| *owner == key)
@@ -2108,6 +2567,77 @@ pub fn check_window_chain(last: Option<&AuditedJob>, job: &AuditedJob) -> Result
     Ok(())
 }
 
+/// Spot-checks a window we audited, at point `at` of its weight, against
+/// the pool's `/api/sample` answer: the share covering that point must be in
+/// the committed window, in order among its owner's shares, and be real
+/// proof of work, on its owner's own copy of a job, at the difficulty its
+/// weight claims.
+///
+/// A window padded with shares nobody mined, or with real work counted
+/// twice, fails a check that lands on the padding, and a check lands on any
+/// part of the window in proportion to its weight. Each check recomputes one
+/// share's proof of work.
+pub fn verify_sample(window: &Window, at: u128, sample: &Value) -> Result<()> {
+    let (owner, offset) = window
+        .locate(at)
+        .ok_or_else(|| anyhow!("the sampled point lies beyond the window"))?;
+    if crate::core::auxpow::bytes32(&sample["owner"]).ok() != Some(owner.id) {
+        bail!("the pool answered a spot check with another owner's share");
+    }
+    let share: ShareRecord = bincode::deserialize(&hex::decode(
+        sample["share"]
+            .as_str()
+            .ok_or_else(|| anyhow!("the pool answered a spot check without a share"))?,
+    )?)?;
+    let index = sample["index"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("missing share index"))?;
+    let path: Vec<TreeNode> = sample["path"]
+        .as_array()
+        .ok_or_else(|| anyhow!("missing share path"))?
+        .iter()
+        .map(|node| {
+            Ok(TreeNode {
+                hash: crate::core::auxpow::bytes32(&node[0])?,
+                weight: node[1].as_u64().ok_or_else(|| anyhow!("bad node weight"))?,
+                low: crate::core::auxpow::bytes32(&node[2])?,
+                high: crate::core::auxpow::bytes32(&node[3])?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    let (root, start) = fold_share_path(share.node(), index, owner.shares, &path)
+        .ok_or_else(|| anyhow!("the sampled share's path does not hold: its owner's shares are out of order, counted twice, or not what the window says"))?;
+    if root.hash != owner.shares_root || root.weight != owner.weight {
+        bail!("the sampled share is not in the committed window");
+    }
+    if share.owner != owner.id {
+        bail!("the sampled share belongs to someone else");
+    }
+    if offset < start || offset - start >= share.weight {
+        bail!("the pool answered with a share that does not cover the sampled point");
+    }
+    if !(window.start_seq..window.end_seq).contains(&share.seq) {
+        bail!("the sampled share lies outside the window's range");
+    }
+    let extra_bits = share.weight.trailing_zeros();
+    if !share.weight.is_power_of_two() || extra_bits > MAX_WEIGHT_BITS {
+        bail!("the sampled share claims a weight no difficulty gives");
+    }
+    let proof: JobProof =
+        bincode::deserialize(&hex::decode(sample["job_proof"].as_str().ok_or_else(
+            || anyhow!("the pool answered a spot check without a job proof"),
+        )?)?)?;
+    let mining_hash = proof.mining_hash(&owner.id, share.auth.as_ref());
+    let final_hash = crate::core::extension::create_extension(mining_hash, share.nonce).final_hash;
+    if final_hash != share.final_hash {
+        bail!("the sampled share is not proof of work on its owner's copy of a job");
+    }
+    if final_hash >= target_from_leading_zero_bits(window.share_bits + extra_bits) {
+        bail!("the sampled share is lighter than the weight it is counted at");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct PoolMinerConfig {
     pub pool: String,
@@ -2116,6 +2646,8 @@ pub struct PoolMinerConfig {
     pub view: ViewKey,
     pub worker: String,
     pub threads: usize,
+    /// Shares of each newly paid window to re-check ([`verify_sample`]).
+    pub spot_checks: usize,
 }
 
 #[derive(Default, Debug)]
@@ -2125,6 +2657,8 @@ pub struct PoolMinerStats {
     pub audits_failed: AtomicU64,
     pub shares_sent: AtomicU64,
     pub shares_accepted: AtomicU64,
+    pub spot_checks_passed: AtomicU64,
+    pub spot_checks_failed: AtomicU64,
     pub hashes: Arc<AtomicU64>,
 }
 
@@ -2187,10 +2721,17 @@ pub async fn run_pool_miner_with_fee_percent(
     let mut next_id = 2u64;
     let mut ticker = tokio::time::interval(Duration::from_millis(200));
     let max_fee_ppm = fee_ppm(max_fee_percent)?;
-    // (sequence number, weight) of our shares the pool accepted, which every
-    // window covering them must credit to us.
-    let mut my_shares: VecDeque<(u64, u64)> = VecDeque::new();
+    // (sequence number, weight, difficulty) of our shares the pool accepted,
+    // which every window covering them must credit to us in full.
+    let mut my_shares: VecDeque<(u64, u64, u32)> = VecDeque::new();
+    // The difficulty we were given for recent jobs, and for each share
+    // awaiting the pool's answer, by message id.
+    let mut job_bits: VecDeque<(u64, u32)> = VecDeque::new();
+    let mut submitted: HashMap<u64, u32> = HashMap::new();
     let mut last_audit: Option<AuditedJob> = None;
+    // Spot checks run beside mining, once for each newly paid window.
+    let (spot_tx, mut spot_rx) = tokio::sync::mpsc::channel::<Result<usize>>(4);
+    let mut last_checked: Option<[u8; 32]> = None;
     loop {
         tokio::select! {
             line = lines.next_line() => {
@@ -2201,10 +2742,13 @@ pub async fn run_pool_miner_with_fee_percent(
                     continue;
                 }
                 if msg["method"] != "mining.notify" {
+                    let bits = msg["id"].as_u64().and_then(|id| submitted.remove(&id));
                     if msg["result"] == true {
                         stats.shares_accepted.fetch_add(1, Ordering::Relaxed);
-                        if let (Some(seq), Some(weight)) = (msg["seq"].as_u64(), msg["weight"].as_u64()) {
-                            my_shares.push_back((seq, weight));
+                        if let (Some(seq), Some(weight), Some(bits)) =
+                            (msg["seq"].as_u64(), msg["weight"].as_u64(), bits)
+                        {
+                            my_shares.push_back((seq, weight, bits));
                         }
                     }
                     continue;
@@ -2224,10 +2768,14 @@ pub async fn run_pool_miner_with_fee_percent(
                 let share_target = crate::core::auxpow::bytes32(&p[3])?;
                 let network_target = crate::core::auxpow::bytes32(&p[4])?;
                 stats.jobs.fetch_add(1, Ordering::Relaxed);
+                job_bits.push_back((job_id, crate::core::types::count_leading_zeros(&share_target)));
+                while job_bits.len() > 16 {
+                    job_bits.pop_front();
+                }
 
                 let (api2, view) = (api.clone(), cfg.view.clone());
                 let th = template_hex.clone();
-                let shares: Vec<(u64, u64)> = my_shares.iter().copied().collect();
+                let shares: Vec<(u64, u64, u32)> = my_shares.iter().copied().collect();
                 let audit = tokio::task::spawn_blocking(move || -> Result<AuditedJob> {
                     let window = RpcClient::new(api2).get(&format!("/api/window?job={job_id}"))?;
                     if window["job_id"].as_u64() != Some(job_id) {
@@ -2249,8 +2797,28 @@ pub async fn run_pool_miner_with_fee_percent(
                 // Shares before the paid window are behind later windows too,
                 // unless blocks get easier and windows longer; forgetting
                 // them then only makes the check above more lenient.
-                while my_shares.front().is_some_and(|(seq, _)| *seq < audited.window_start) {
+                while my_shares.front().is_some_and(|(seq, _, _)| *seq < audited.window.start_seq) {
                     my_shares.pop_front();
+                }
+                let total = audited.window.total();
+                if cfg.spot_checks > 0 && total > 0 && last_checked != Some(audited.window_root) {
+                    last_checked = Some(audited.window_root);
+                    let (api2, window, checks, tx) =
+                        (api.clone(), audited.window.clone(), cfg.spot_checks, spot_tx.clone());
+                    tokio::task::spawn_blocking(move || {
+                        let client = RpcClient::new(api2);
+                        let checked = (0..checks).try_fold(0usize, |done, _| -> Result<usize> {
+                            // Our own randomness, drawn after the pool committed.
+                            let at = rand::random::<u128>() % total;
+                            let sample = client.get(&format!("/api/sample?job={job_id}&at={at}"))?;
+                            if let Some(e) = sample.get("error") {
+                                bail!("the pool refused a spot check: {e}");
+                            }
+                            verify_sample(&window, at, &sample)?;
+                            Ok(done + 1)
+                        });
+                        let _ = tx.blocking_send(checked);
+                    });
                 }
                 last_audit = Some(audited);
 
@@ -2271,10 +2839,23 @@ pub async fn run_pool_miner_with_fee_percent(
             }
             Some((job_id, nonce)) = share_rx.recv() => {
                 let submit = json!({ "id": next_id, "method": "mining.submit", "params": [address, job_id, nonce] });
+                if let Some((_, bits)) = job_bits.iter().find(|(id, _)| *id == job_id) {
+                    submitted.insert(next_id, *bits);
+                }
                 next_id += 1;
                 stats.shares_sent.fetch_add(1, Ordering::Relaxed);
                 write.write_all((submit.to_string() + "\n").as_bytes()).await?;
             }
+            Some(checked) = spot_rx.recv() => match checked {
+                Ok(n) => {
+                    stats.spot_checks_passed.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    stats.spot_checks_failed.fetch_add(1, Ordering::Relaxed);
+                    cancel.store(true, Ordering::Relaxed);
+                    bail!("spot check failed, disconnecting: {e:#}");
+                }
+            },
             _ = ticker.tick() => {
                 if stop.load(Ordering::Relaxed) {
                     cancel.store(true, Ordering::Relaxed);
@@ -2294,7 +2875,7 @@ mod tests {
     /// A pool whose minimum share difficulty is `share_bits`: 0 makes every
     /// share valid, 256 makes none valid.
     fn test_state(dir: &std::path::Path, share_bits: u32) -> Arc<PoolState> {
-        let (db, log) = open_db(&dir.join("pool.redb")).unwrap();
+        let (db, log, next_job_id) = open_db(&dir.join("pool.redb")).unwrap();
         Arc::new(PoolState {
             cfg: PoolConfig {
                 pool_address: WalletKeys::random().address(),
@@ -2322,6 +2903,7 @@ mod tests {
             stats: Arc::default(),
             api_public: String::new(),
             submitted_job: AtomicU64::new(0),
+            next_job_id: AtomicU64::new(next_job_id),
         })
     }
 
@@ -2355,7 +2937,7 @@ mod tests {
         batch: Batch,
         copy: impl Fn(&AddrKey) -> [u8; 32],
     ) -> Arc<Job> {
-        let empty = Arc::new(WindowSnapshot::new(Window::default(), HashMap::new()));
+        let empty = Arc::new(WindowSnapshot::new(0, 0, 0, Vec::new(), HashMap::new()));
         let commitment = hash_domain(b"test commitment", &[&job_id.to_le_bytes()]);
         let variants = miners
             .iter()
@@ -2390,9 +2972,22 @@ mod tests {
         let log = state.log.lock().unwrap();
         log.entries
             .iter()
-            .filter(|(_, owner, _)| owner == miner)
-            .map(|(_, _, w)| *w)
+            .filter(|s| s.owner == owner_of(miner))
+            .map(|s| s.weight)
             .sum()
+    }
+
+    /// A share record of `owner` with the given numbers and a made-up hash.
+    fn record(seq: u64, owner: OwnerId, weight: u64) -> ShareRecord {
+        ShareRecord {
+            seq,
+            owner,
+            weight,
+            job_id: 1,
+            nonce: seq,
+            final_hash: hash_domain(b"test share", &[&seq.to_le_bytes()]),
+            auth: None,
+        }
     }
 
     fn task(proven: bool) -> VerifyTask {
@@ -2560,36 +3155,56 @@ mod tests {
     fn a_window_is_the_newest_shares_until_it_is_full() {
         let mut log = ShareLog::default();
         for (i, w) in [5u64, 1, 2, 3, 4].iter().enumerate() {
+            let owner = owner_of(&key(i as u32 % 2));
+            log.addresses.insert(owner, key_addr(&key(i as u32 % 2)));
             log.entries
-                .push_back((10 + i as u64, key(i as u32 % 2), *w));
+                .push_back(Arc::new(record(10 + i as u64, owner, *w)));
         }
         log.next_seq = 15;
-        let (w, addresses) = log.window(6);
+        let snapshot = log.window(6, 12);
+        let w = &snapshot.window;
         // The newest shares: 4, 3 (7 >= 6), each owner named by its id.
-        assert_eq!((w.start_seq, w.end_seq), (13, 15));
+        assert_eq!((w.start_seq, w.end_seq, w.share_bits), (13, 15, 12));
         let mut want = vec![(owner_of(&key(0)), 4), (owner_of(&key(1)), 3)];
         want.sort();
-        assert_eq!(w.owners, want);
-        assert_eq!(addresses[&owner_of(&key(1))], key_addr(&key(1)));
-        assert_eq!(log.window(1_000).0.start_seq, 10);
+        assert_eq!(w.weights(), want);
+        assert!(w.owners.iter().all(|o| o.shares == 1));
+        assert_eq!(snapshot.addresses[&owner_of(&key(1))], key_addr(&key(1)));
+        assert_eq!(log.window(1_000, 12).window.start_seq, 10);
         // Pruning keeps the newest weight and anything a window still uses.
-        assert_eq!(log.prune(12, 3), 12);
-        assert_eq!(log.entries.front().unwrap().0, 12);
+        let (first_kept, owners) = log.prune(12, 3);
+        assert_eq!(first_kept, 12);
+        assert_eq!(log.entries.front().unwrap().seq, 12);
+        assert_eq!(owners.len(), 2);
     }
 
     #[test]
-    fn a_window_root_binds_its_owners_and_range() {
+    fn a_window_root_binds_its_owners_shares_range_and_difficulty() {
+        let owner = |i: u32, weight: u64| WindowOwner {
+            id: id(i),
+            weight,
+            shares_root: [i as u8; 32],
+            shares: 1,
+        };
         let w = Window {
             start_seq: 3,
             end_seq: 9,
-            owners: vec![(id(0), 4), (id(1), 2), (id(2), 1)],
+            share_bits: 12,
+            owners: vec![owner(0, 4), owner(1, 2), owner(2, 1)],
         };
         let mut moved = w.clone();
         moved.start_seq = 4;
         let mut padded = w.clone();
-        padded.owners.push((id(2), 1));
-        assert_ne!(w.root(), moved.root());
-        assert_ne!(w.root(), padded.root());
+        padded.owners.push(owner(2, 1));
+        let mut easier = w.clone();
+        easier.share_bits = 11;
+        let mut other_shares = w.clone();
+        other_shares.owners[1].shares_root = [9; 32];
+        let mut more_shares = w.clone();
+        more_shares.owners[1].shares = 2;
+        for changed in [moved, padded, easier, other_shares, more_shares] {
+            assert_ne!(w.root(), changed.root());
+        }
         assert_eq!(w.root(), w.clone().root());
     }
 
@@ -2600,7 +3215,7 @@ mod tests {
         let target = target_from_leading_zero_bits(20);
         assert_eq!(window_size(&target, 12, 2), 2 * 256);
         assert_eq!(window_size(&[0xff; 32], 12, 2), 1);
-        assert_eq!(window_size(&[0; 32], 0, 2), u64::MAX as u128);
+        assert_eq!(window_size(&[0; 32], 0, 2), (u64::MAX >> 1) as u128);
     }
 
     #[test]
@@ -2632,7 +3247,7 @@ mod tests {
             prev_hash: [prev; 32],
             window_root: [paying; 32],
             next_root: [next; 32],
-            window_start: 0,
+            window: Window::default(),
         };
         assert!(check_window_chain(None, &job(1, 1, 2)).is_ok());
         assert!(check_window_chain(Some(&job(1, 1, 2)), &job(1, 1, 2)).is_ok());
@@ -2643,7 +3258,7 @@ mod tests {
     }
 
     #[test]
-    fn unpaid_scores_carry_over_into_the_share_log() {
+    fn credit_without_proof_of_work_is_dropped_on_upgrade() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.redb");
         {
@@ -2652,17 +3267,25 @@ mod tests {
             {
                 let mut t = txn.open_table(LEGACY_SCORES).unwrap();
                 t.insert(key(1).as_slice(), 7).unwrap();
-                t.insert(key(2).as_slice(), 0).unwrap();
-                t.insert(key(3).as_slice(), 2).unwrap();
+                let mut t = txn.open_table(SHARE_LOG).unwrap();
+                t.insert(0, [0u8; 104].as_slice()).unwrap();
             }
             txn.commit().unwrap();
         }
-        let (db, log) = open_db(&path).unwrap();
-        let entries: Vec<(AddrKey, u64)> = log.entries.iter().map(|(_, k, w)| (*k, *w)).collect();
-        assert_eq!(entries, vec![(key(1), 7), (key(3), 2)]);
+        let (db, log, next_job_id) = open_db(&path).unwrap();
+        assert!(log.entries.is_empty());
+        assert_eq!(next_job_id, 1);
+        // Shares with their proofs, and job ids, survive a restart.
+        let mut log = log;
+        let address = WalletKeys::random().address();
+        let mut share = record(0, owner_id(&address), 2);
+        share.job_id = 41;
+        log.append(&db, &address, share).unwrap();
         drop((db, log));
-        let (_, again) = open_db(&path).unwrap();
-        assert_eq!(again.entries.len(), 2);
+        let (_, again, next_job_id) = open_db(&path).unwrap();
+        assert_eq!(again.entries.len(), 1);
+        assert_eq!(again.addresses[&owner_id(&address)], address);
+        assert_eq!(next_job_id, 42);
     }
 
     // ── Verification and admission ──────────────────────────────────────────
@@ -2783,7 +3406,7 @@ mod tests {
             .unwrap()
             .entries
             .iter()
-            .map(|e| e.0)
+            .map(|e| e.seq)
             .collect();
         seqs.sort();
         assert_eq!(seqs, (0..40).collect::<Vec<_>>());
@@ -2969,6 +3592,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_block_that_misses_the_share_target_is_credited_to_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        // No hash meets a 256-bit share target, but every hash is a block:
+        // blocks easier than the pool's minimum share, as on a test chain.
+        let state = test_state(dir.path(), 256);
+        let job = Arc::try_unwrap(test_job(1, &[key(1)])).ok().unwrap();
+        *state.current.write().await = Some(Arc::new(Job {
+            network_target: [0xff; 32],
+            ..job
+        }));
+        assert_eq!(
+            process_share(state.clone(), key(1), 1, 3, true, 256)
+                .await
+                .unwrap(),
+            ShareOutcome::Uncredited { is_block: true }
+        );
+        // Submitted, not banned, and not counted at a weight its hash does
+        // not meet.
+        assert_eq!(credited(&state, &key(1)), 0);
+        let ip = ip_key("127.0.0.1".parse().unwrap());
+        assert!(!state.bans.is_banned(ip, Instant::now()));
+    }
+
+    #[tokio::test]
     async fn work_on_a_job_with_nothing_to_pay_is_credited_to_nobody() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(dir.path(), 0);
@@ -3007,24 +3654,315 @@ mod tests {
     }
 
     #[test]
-    fn proofs_verify_for_every_leaf() {
-        let leaves: Vec<(OwnerId, u64)> = (0..7u8).map(|i| ([i; 32], 10 + i as u64)).collect();
-        let tree = ShareMerkleTree::build(leaves.clone());
-        for (k, s) in &leaves {
-            let (idx, proof) = tree.proof(k).unwrap();
-            assert_eq!(fold_proof(score_leaf(k, *s), idx, &proof), tree.root);
-            assert_ne!(fold_proof(score_leaf(k, s + 1), idx, &proof), tree.root);
+    fn share_tree_paths_prove_each_share_its_place_and_their_order() {
+        for n in 1..=9u64 {
+            let mut leaves: Vec<TreeNode> =
+                (0..n).map(|i| record(i, id(1), 1 + i % 3).node()).collect();
+            leaves.sort_by_key(|l| l.low);
+            let tree = ShareTree::build(leaves.clone());
+            let root = tree.root().unwrap();
+            assert_eq!(root.weight, leaves.iter().map(|l| l.weight).sum::<u64>());
+            let mut start = 0;
+            for (i, leaf) in leaves.iter().enumerate() {
+                let path = tree.path(i);
+                assert_eq!(
+                    fold_share_path(*leaf, i as u64, n, &path),
+                    Some((root, start))
+                );
+                start += leaf.weight;
+                // Another weight or place does not reach the root.
+                let mut heavier = *leaf;
+                heavier.weight += 1;
+                let reaches = |leaf, index| {
+                    fold_share_path(leaf, index, n, &path).is_some_and(|(r, _)| r == root)
+                };
+                assert!(!reaches(heavier, i as u64));
+                assert!(n == 1 || !reaches(*leaf, (i as u64 + 1) % n));
+                assert_eq!(fold_share_path(*leaf, n, n, &path), None);
+            }
+        }
+        // The same work twice: whichever copy a check lands on, the order
+        // breaks on the way up.
+        let mut twice: Vec<TreeNode> = (0..4).map(|i| record(i, id(1), 1).node()).collect();
+        twice.sort_by_key(|l| l.low);
+        twice.insert(2, twice[1]);
+        let tree = ShareTree::build(twice.clone());
+        for i in [1, 2] {
+            assert_eq!(fold_share_path(twice[i], i as u64, 5, &tree.path(i)), None);
+        }
+    }
+
+    /// Shares mined on `proof`'s copies: one per `(owner, weight)`, each
+    /// meeting `bits` plus its weight's extra bits.
+    fn mined_shares(proof: &JobProof, wanted: &[(OwnerId, u64)], bits: u32) -> Vec<ShareRecord> {
+        let mut nonce = 0u64;
+        wanted
+            .iter()
+            .enumerate()
+            .map(|(seq, (owner, weight))| {
+                let mining_hash = proof.mining_hash(owner, None);
+                let target = target_from_leading_zero_bits(bits + weight.trailing_zeros());
+                loop {
+                    nonce += 1;
+                    let final_hash =
+                        crate::core::extension::create_extension(mining_hash, nonce).final_hash;
+                    if final_hash < target {
+                        return ShareRecord {
+                            seq: seq as u64,
+                            owner: *owner,
+                            weight: *weight,
+                            job_id: 7,
+                            nonce,
+                            final_hash,
+                            auth: None,
+                        };
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// A window committed exactly as listed, out of order or twice-counted
+    /// shares included: what a lying pool could publish.
+    fn as_published(share_bits: u32, owners: Vec<(OwnerId, Vec<ShareRecord>)>) -> WindowSnapshot {
+        let mut window = Window {
+            start_seq: 0,
+            end_seq: 100,
+            share_bits,
+            owners: Vec::new(),
+        };
+        let mut shares = HashMap::new();
+        for (owner, list) in owners {
+            let root = ShareTree::build(list.iter().map(|s| s.node()).collect())
+                .root()
+                .unwrap();
+            window.owners.push(WindowOwner {
+                id: owner,
+                weight: root.weight,
+                shares_root: root.hash,
+                shares: list.len() as u64,
+            });
+            shares.insert(owner, list.into_iter().map(Arc::new).collect());
+        }
+        window.owners.sort_by_key(|o| o.id);
+        WindowSnapshot {
+            root: window.root(),
+            window,
+            addresses: HashMap::new(),
+            shares,
+        }
+    }
+
+    /// How many points of `snapshot`'s window fail a spot check.
+    fn failing_points(db: &Database, snapshot: &WindowSnapshot) -> u128 {
+        (0..snapshot.window.total())
+            .filter(|at| {
+                let sample = snapshot.sample(db, *at).unwrap();
+                verify_sample(&snapshot.window, *at, &sample).is_err()
+            })
+            .count() as u128
+    }
+
+    #[test]
+    fn spot_checks_pass_real_work_and_catch_padding() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _, _) = open_db(&dir.path().join("pool.redb")).unwrap();
+        let proof = JobProof::of(&paying_batch(), [1; 32], [2; 32]).unwrap();
+        store_job_proof(&db, 7, &proof).unwrap();
+        let (a, b) = (id(1), id(2));
+        let bits = 2;
+        let real = mined_shares(&proof, &[(a, 1), (a, 4), (b, 2), (a, 1), (b, 1)], bits);
+
+        // The pool's own window of real work passes every check.
+        let honest = WindowSnapshot::new(
+            0,
+            5,
+            bits,
+            real.iter().cloned().map(Arc::new).collect(),
+            HashMap::new(),
+        );
+        assert_eq!(honest.window.total(), 9);
+        assert_eq!(failing_points(&db, &honest), 0);
+        let sample = honest.sample(&db, 3).unwrap();
+        // A reply for the wrong point, or doctored, fails.
+        assert!(verify_sample(&honest.window, 8, &sample).is_err());
+        let mut doctored = sample.clone();
+        doctored["index"] = json!((sample["index"].as_u64().unwrap() + 1) % 3);
+        assert!(verify_sample(&honest.window, 3, &doctored).is_err());
+
+        let of = |owner: OwnerId| -> Vec<ShareRecord> {
+            let mut list: Vec<ShareRecord> =
+                real.iter().filter(|s| s.owner == owner).cloned().collect();
+            list.sort_by_key(|s| s.final_hash);
+            list
+        };
+        // A share nobody mined, of weight 2: caught at both of its points,
+        // and only there.
+        let mut padded = of(a);
+        let mut fake = record(50, a, 2);
+        fake.job_id = 7;
+        fake.final_hash = [0; 32];
+        padded.insert(0, fake);
+        let snapshot = as_published(bits, vec![(a, padded), (b, of(b))]);
+        assert_eq!(failing_points(&db, &snapshot), 2);
+        // Real work counted twice: caught at both copies.
+        let mut twice = of(b);
+        let mut copy = twice[0].clone();
+        copy.seq = 60;
+        let doubled = copy.weight as u128;
+        twice.insert(1, copy);
+        let snapshot = as_published(bits, vec![(a, of(a)), (b, twice)]);
+        assert_eq!(failing_points(&db, &snapshot), 2 * doubled);
+        // Someone else's work under another owner's name.
+        let mut stolen = of(a);
+        stolen.iter_mut().for_each(|s| s.owner = b);
+        let snapshot = as_published(bits, vec![(a, of(a)), (b, stolen)]);
+        assert_eq!(failing_points(&db, &snapshot), 6);
+        // Real work counted at more than its difficulty earns.
+        let mut inflated = of(b);
+        let light = inflated.iter().position(|s| s.weight == 1).unwrap();
+        inflated[light].weight = 1 << 20;
+        let snapshot = as_published(bits, vec![(a, of(a)), (b, inflated.clone())]);
+        let lighter = (0..snapshot.window.total())
+            .step_by(1 << 16)
+            .filter(|at| {
+                verify_sample(&snapshot.window, *at, &snapshot.sample(&db, *at).unwrap()).is_err()
+            })
+            .count();
+        assert!(lighter >= 15, "{lighter}");
+        // An easier minimum than the work was mined at is caught by the
+        // miners' own credits ([`audit_job_with_fee_limit`]); a harder one
+        // makes real work fail here.
+        let harder = WindowSnapshot::new(
+            0,
+            5,
+            bits + 8,
+            real.iter().cloned().map(Arc::new).collect(),
+            HashMap::new(),
+        );
+        assert!(failing_points(&db, &harder) > 0);
+    }
+
+    /// Checks that the proof of the job on `base` gives, for two owners, the
+    /// mining hash of the node's own copy (`template::rebind`).
+    fn proof_matches_the_nodes_copies(
+        base: &crate::core::template::BlockTemplate,
+        signer: Option<&crate::core::bond::MinerBond>,
+    ) {
+        let (paying_root, next_root) = ([1; 32], [2; 32]);
+        let commitment = job_commitment(&paying_root, &next_root);
+        let proof = JobProof::of(&base.batch, paying_root, next_root).unwrap();
+        for owner in [id(4), id(5)] {
+            let copy = crate::core::template::rebind(base, bind_extra(&commitment, &owner), signer)
+                .unwrap();
+            let auth = copy.batch.miner.as_ref().map(|a| a.hash());
+            assert_eq!(proof.mining_hash(&owner, auth.as_ref()), copy.mining_hash);
         }
     }
 
     #[test]
-    fn audit_catches_a_lying_pool() {
+    fn a_job_proof_recomputes_every_copys_mining_hash() {
+        let (state, ts, bond) = bonded_chain();
+        let me = WalletKeys::random().address();
+        // Unsigned copies too, where blocks may still be unsigned.
+        let unsigned = (state.height < crate::core::bond::BONDED_MINING_FROM).then_some(None);
+        for signer in std::iter::once(Some(&bond)).chain(unsigned) {
+            let (base, _) = crate::core::template::build_template_bonded(
+                &state,
+                &ts,
+                &[],
+                &[(me, 1)],
+                [3; 32],
+                None,
+                signer,
+            )
+            .unwrap();
+            assert_eq!(base.batch.miner.is_some(), signer.is_some());
+            proof_matches_the_nodes_copies(&base, signer);
+        }
+        // No coinbase: nothing to credit, nothing to prove.
+        assert!(JobProof::of(Batch::genesis(), [0; 32], [0; 32]).is_none());
+    }
+
+    /// Test builds only: a registration needs midstate headers mined at the
+    /// short test extension.
+    #[cfg(feature = "fast-mining")]
+    #[test]
+    fn a_job_proof_covers_a_bond_registering_in_its_block() {
+        use crate::core::bond::{
+            devnet_registration, est_midstate_height, MinerBond, MAX_BOND_HORIZON,
+        };
+        let (state, ts, _) = bonded_chain();
+        // A bond not yet on chain: its first block carries its registration.
+        let secret = curve25519_dalek::scalar::Scalar::from_bytes_mod_order([9; 32]);
+        let key = curve25519_dalek::ristretto::RistrettoPoint::mul_base(&secret)
+            .compress()
+            .to_bytes();
+        let now = crate::core::state::current_timestamp();
+        let registration = devnet_registration(
+            key,
+            est_midstate_height(now) + MAX_BOND_HORIZON / 2,
+            [9; 32],
+            &state.target,
+        );
+        let registering = MinerBond {
+            co_bonds: Vec::new(),
+            secret,
+            bond_id: registration.bond_id(),
+            registration: Some(registration),
+        };
+        let me = WalletKeys::random().address();
+        let (base, _) = crate::core::template::build_template_bonded(
+            &state,
+            &ts,
+            &[],
+            &[(me, 1)],
+            [3; 32],
+            None,
+            Some(&registering),
+        )
+        .unwrap();
+        assert!(!base.batch.registrations.is_empty());
+        proof_matches_the_nodes_copies(&base, Some(&registering));
+    }
+
+    /// A chain one block past genesis with a pool's bond in its state, and
+    /// that bond: production builds require every block to be authorised by
+    /// one (`core::bond::BONDED_MINING_FROM`), and registering it would mean
+    /// mining real midstate headers, so it is put straight into the state.
+    fn bonded_chain() -> (
+        crate::core::types::State,
+        Vec<u64>,
+        crate::core::bond::MinerBond,
+    ) {
         use crate::core::bond::{
             est_midstate_height, BondEntry, MinerBond, MIN_MINING_BOND, MIN_REMAINING_BOND_LOCK,
         };
-        use crate::core::state::apply_batch;
+        use crate::core::types::{hash, State};
+        let mut state = State::genesis();
+        crate::core::state::apply_batch(&mut state, Batch::genesis(), &[]).unwrap();
+        let bond = MinerBond {
+            co_bonds: Vec::new(),
+            secret: curve25519_dalek::scalar::Scalar::from_bytes_mod_order(hash(b"pool audit")),
+            bond_id: hash(b"pool audit bond"),
+            registration: None,
+        };
+        let now = crate::core::state::current_timestamp();
+        state.bonds.insert(
+            bond.bond_id,
+            BondEntry {
+                mining_key: bond.mining_key(),
+                value: MIN_MINING_BOND,
+                bonded_until: est_midstate_height(now) + MIN_REMAINING_BOND_LOCK + 1_440,
+            },
+        );
+        (state, vec![Batch::genesis().timestamp], bond)
+    }
+
+    #[test]
+    fn audit_catches_a_lying_pool() {
         use crate::core::template::{build_template_bonded, split_by_weight};
-        use crate::core::types::{block_reward, hash, State, HALVING_INTERVAL};
+        use crate::core::types::{block_reward, hash, HALVING_INTERVAL};
         let my_keys = WalletKeys::random();
         let me = my_keys.address();
         let view = my_keys.view_only();
@@ -3038,37 +3976,20 @@ mod tests {
         let to_addresses = |weights: Vec<(OwnerId, u64)>| -> Vec<(StealthAddress, u64)> {
             weights.into_iter().map(|(id, w)| (book[&id], w)).collect()
         };
-        let mut state = State::genesis();
-        apply_batch(&mut state, Batch::genesis(), &[]).unwrap();
-        let ts = vec![Batch::genesis().timestamp];
-
-        // Production builds require every block to be authorised by a bond
-        // (`core::bond::BONDED_MINING_FROM`). Registering one here would mean
-        // mining real midstate headers, so the bond is put straight into the
-        // state instead: a template needs nothing else.
-        let bond = MinerBond {
-            co_bonds: Vec::new(),
-            secret: curve25519_dalek::scalar::Scalar::from_bytes_mod_order(hash(b"pool audit")),
-            bond_id: hash(b"pool audit bond"),
-            registration: None,
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        state.bonds.insert(
-            bond.bond_id,
-            BondEntry {
-                mining_key: bond.mining_key(),
-                value: MIN_MINING_BOND,
-                bonded_until: est_midstate_height(now) + MIN_REMAINING_BOND_LOCK + 1_440,
-            },
-        );
+        let (state, ts, bond) = bonded_chain();
         let fee = fee_ppm(1.0).unwrap();
-        let mut owners = vec![(owner_id(&me), 5), (owner_id(&other), 3)];
-        owners.sort();
+        let owner = |address: &StealthAddress, weight: u64| WindowOwner {
+            id: owner_id(address),
+            weight,
+            shares_root: hash(&owner_id(address)),
+            shares: 1,
+        };
+        let mut owners = vec![owner(&me, 5), owner(&other, 3)];
+        owners.sort_by_key(|o| o.id);
         let window = Window {
             start_seq: 100,
             end_seq: 110,
+            share_bits: 12,
             owners,
         };
         let next_root = hash(b"next window");
@@ -3094,17 +4015,23 @@ mod tests {
         };
         let honest = |window: &Window| {
             let seed = draw_seed(&state.header_hash, &window.root());
-            to_addresses(payout_weights(fee, &owner_id(&pool), &window.owners, &seed).unwrap())
+            to_addresses(payout_weights(fee, &owner_id(&pool), &window.weights(), &seed).unwrap())
         };
-        let audit =
-            |tpl: &crate::core::template::BlockTemplate, api: &Value, shares: &[(u64, u64)]| {
-                let hex = hex::encode(bincode::serialize(&tpl.batch).unwrap());
-                audit_job_with_fee_limit(&view, &tpl.mining_hash, &hex, api, 20_000, shares)
-            };
+        let audit = |tpl: &crate::core::template::BlockTemplate,
+                     api: &Value,
+                     shares: &[(u64, u64, u32)]| {
+            let hex = hex::encode(bincode::serialize(&tpl.batch).unwrap());
+            audit_job_with_fee_limit(&view, &tpl.mining_hash, &hex, api, 20_000, shares)
+        };
 
         let (tpl, api) = job(&window, &honest(&window), state.height, fee, &me);
-        let audited = audit(&tpl, &api, &[(101, 2), (105, 3), (90, 7)]).unwrap();
+        let audited = audit(&tpl, &api, &[(101, 2, 13), (105, 2, 13), (90, 8, 15)]).unwrap();
         assert_eq!(audited.window_root, window.root());
+        assert_eq!(audited.window, window);
+        // Our share weighed by a minimum difficulty other than the committed
+        // one: the pool could be counting its own shares at a discount.
+        let err = audit(&tpl, &api, &[(101, 2, 12)]).unwrap_err().to_string();
+        assert!(err.contains("committed minimum difficulty"), "{err}");
         assert_eq!(audited.prev_hash, state.header_hash);
         // The window names owners only by id.
         assert!(!api.to_string().contains(&me.encode()));
@@ -3154,20 +4081,26 @@ mod tests {
         // A fee above our limit, even if the coinbase matches it.
         let greedy = {
             let seed = draw_seed(&state.header_hash, &window.root());
-            to_addresses(payout_weights(50_000, &owner_id(&pool), &window.owners, &seed).unwrap())
+            to_addresses(
+                payout_weights(50_000, &owner_id(&pool), &window.weights(), &seed).unwrap(),
+            )
         };
         let (t, a) = job(&window, &greedy, state.height, 50_000, &me);
         assert!(audit(&t, &a, &[]).is_err());
         // A later era claimed, every miner paid what that height would give.
+        // (With production parameters the chain starts slowly, so a later
+        // era pays more than block 1 and there is nothing to skim.)
         let claimed = HALVING_INTERVAL;
-        let shrunk = split_by_weight(block_reward(claimed), &honest(&window)).unwrap();
-        let to_miners: Vec<(StealthAddress, u64)> =
-            shrunk.into_iter().filter(|(a, _)| *a != pool).collect();
         let real = block_reward(state.height);
-        let mut skim = vec![(pool, real - to_miners.iter().map(|(_, v)| v).sum::<u64>())];
-        skim.extend(to_miners);
-        let (t, a) = job(&window, &skim, claimed, fee, &me);
-        assert!(audit(&t, &a, &[]).is_err());
+        if block_reward(claimed) < real {
+            let shrunk = split_by_weight(block_reward(claimed), &honest(&window)).unwrap();
+            let to_miners: Vec<(StealthAddress, u64)> =
+                shrunk.into_iter().filter(|(a, _)| *a != pool).collect();
+            let mut skim = vec![(pool, real - to_miners.iter().map(|(_, v)| v).sum::<u64>())];
+            skim.extend(to_miners);
+            let (t, a) = job(&window, &skim, claimed, fee, &me);
+            assert!(audit(&t, &a, &[]).is_err());
+        }
         // A published window other than the committed one.
         let mut forged = api.clone();
         forged["window"]["owners"][0]["weight"] = json!(9);
@@ -3186,12 +4119,12 @@ mod tests {
         // A window that leaves us out: honest-looking on its own, caught by
         // the shares the pool told us it accepted.
         let mut without = window.clone();
-        without.owners.retain(|(k, _)| *k != owner_id(&me));
+        without.owners.retain(|o| o.id != owner_id(&me));
         let (t, a) = job(&without, &honest(&without), state.height, fee, &me);
         assert!(audit(&t, &a, &[]).is_ok());
-        assert!(audit(&t, &a, &[(104, 1)]).is_err());
+        assert!(audit(&t, &a, &[(104, 1, 12)]).is_err());
         // Shares outside the window's range do not count against it.
-        assert!(audit(&t, &a, &[(99, 1), (110, 1)]).is_ok());
+        assert!(audit(&t, &a, &[(99, 1, 12), (110, 1, 12)]).is_ok());
         // A template that is not the job.
         let hex = hex::encode(bincode::serialize(&tpl.batch).unwrap());
         assert!(audit_job(&view, &[0; 32], &hex, &api).is_err());

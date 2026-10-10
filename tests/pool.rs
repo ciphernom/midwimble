@@ -93,8 +93,15 @@ async fn pool_pays_auditing_miners() {
             view: keys.view_only(),
             worker: name.to_string(),
             threads: 1,
+            spot_checks: 4,
         };
-        tokio::spawn(run_pool_miner(cfg, stop.clone(), stats.clone()));
+        let (stop, stats2) = (stop.clone(), stats.clone());
+        tokio::spawn(async move {
+            // A miner stops at its first failed audit or spot check; say why.
+            if let Err(e) = run_pool_miner(cfg, stop, stats2).await {
+                eprintln!("{name}: {e:#}");
+            }
+        });
         miners.push(stats);
     }
 
@@ -112,6 +119,10 @@ async fn pool_pays_auditing_miners() {
         assert!(m.audits_passed.load(Ordering::Relaxed) >= 2, "{m:?}");
         assert_eq!(m.audits_failed.load(Ordering::Relaxed), 0, "{m:?}");
         assert!(m.shares_accepted.load(Ordering::Relaxed) > 0, "{m:?}");
+        // Each miner re-checked shares of the windows it was paid from,
+        // its own and the other's, and every one was real work.
+        assert!(m.spot_checks_passed.load(Ordering::Relaxed) >= 4, "{m:?}");
+        assert_eq!(m.spot_checks_failed.load(Ordering::Relaxed), 0, "{m:?}");
     }
     assert!(pool_stats.blocks_found.load(Ordering::Relaxed) >= 5);
 

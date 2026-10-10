@@ -166,6 +166,10 @@ enum Cmd {
         /// Refuse pool jobs advertising more than this fee percentage.
         #[arg(long, default_value_t = 1.0)]
         max_fee: f64,
+        /// Shares of each newly paid window to re-check: a window padded
+        /// with x% of fake weight fails each check with probability x%.
+        #[arg(long, default_value_t = 4)]
+        spot_checks: usize,
     },
     /// List GPUs and run the miner's shader self-test.
     GpuInfo,
@@ -869,6 +873,7 @@ fn run(cli: Cli) -> Result<()> {
             threads,
             backend,
             max_fee,
+            spot_checks,
         } => {
             tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::INFO)
@@ -887,6 +892,7 @@ fn run(cli: Cli) -> Result<()> {
                 view: midwimble::core::mw::ViewKey::decode(&view_key)?,
                 worker,
                 threads,
+                spot_checks,
             };
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             {
