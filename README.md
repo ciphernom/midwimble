@@ -122,6 +122,10 @@ recovery design.
   recomputes that share's proof of work on its owner's own copy of the job.
   Weight nobody mined, or real work counted twice, fails a check that lands
   on it.
+- **TLS:** `pool --stratum-tls 0.0.0.0:3334 --tls-cert cert.pem --tls-key
+  key.pem` adds a TLS listener and prints the certificate's SHA-256; miners
+  connect to `stratum+tls://host:3334`, pinning a self-signed certificate
+  with `--tls-pin <sha256>` or relying on a web root authority otherwise.
 - **Verification:** each connection's difficulty aims at one share per 15 s,
   with shares weighted by difficulty. Shares queue rather than being dropped;
   connections that have proven work are verified first, in SIMD batches; an
@@ -259,6 +263,7 @@ midwimble merge-mine --midstate-rpc 127.0.0.1:8545 --midstate-address <hex> \
 midwimble pool --address <operator address> --stratum 0.0.0.0:3333 --api 0.0.0.0:8081
 MIDWIMBLE_VIEW_KEY="$(midwimble wallet view-key)" \
     midwimble pool-mine --pool stratum+tcp://host:3333   # the view key never leaves the miner
+midwimble pool-mine --pool stratum+tls://host:3334 --tls-pin <sha256> --node 127.0.0.1:9434
 
 # anchoring checkpoints in midstate
 midwimble anchor --midstate-rpc 127.0.0.1:8545 --depth 6

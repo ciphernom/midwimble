@@ -5,7 +5,8 @@
 use midwimble::core::mw::{scan_output, StealthAddress, WalletKeys};
 use midwimble::node::{Node, NodeConfig, NodeHandle};
 use midwimble::pool::{
-    run_pool, run_pool_miner, PoolConfig, PoolMinerConfig, PoolMinerStats, PoolStats,
+    certificate_fingerprint, run_pool, run_pool_miner, PoolConfig, PoolMinerConfig, PoolMinerStats,
+    PoolStats, StratumTls,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -64,7 +65,14 @@ async fn pool_pays_auditing_miners() {
 
     let operator = WalletKeys::random();
     let stratum_port = free_port();
+    let tls_port = free_port();
     let api_port = free_port();
+    // A self-signed certificate for the pool's TLS listener.
+    let rcgen::CertifiedKey { cert, key_pair } =
+        rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+    let (cert_chain, private_key) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+    std::fs::write(&cert_chain, cert.pem()).unwrap();
+    std::fs::write(&private_key, key_pair.serialize_pem()).unwrap();
     let pool_stats = Arc::new(PoolStats::default());
     let cfg = PoolConfig {
         pool_address: operator.address(),
@@ -78,6 +86,11 @@ async fn pool_pays_auditing_miners() {
         window_blocks: 2,
         data_dir: dir.path().join("pool"),
         poll_interval: Duration::from_millis(200),
+        stratum_tls: Some(StratumTls {
+            bind: format!("127.0.0.1:{tls_port}").parse().unwrap(),
+            cert_chain,
+            private_key,
+        }),
     };
     tokio::spawn(run_pool(cfg, pool_stats.clone()));
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -88,8 +101,13 @@ async fn pool_pays_auditing_miners() {
     let mut miners = Vec::new();
     for (name, keys) in [("alice", &alice), ("bob", &bob)] {
         let stats = Arc::new(PoolMinerStats::default());
+        // Alice mines over plain TCP, Bob over TLS, pinning the certificate.
+        let pool = match name {
+            "alice" => format!("stratum+tcp://127.0.0.1:{stratum_port}"),
+            _ => format!("stratum+tls://127.0.0.1:{tls_port}"),
+        };
         let cfg = PoolMinerConfig {
-            pool: format!("stratum+tcp://127.0.0.1:{stratum_port}"),
+            pool,
             view: keys.view_only(),
             worker: name.to_string(),
             threads: 1,
@@ -97,6 +115,7 @@ async fn pool_pays_auditing_miners() {
             // Alice watches the chain with the node too, so a pool holding
             // back tips would be caught; this one never does.
             node: (name == "alice").then(|| rpc.clone()),
+            tls_pin: (name == "bob").then(|| certificate_fingerprint(cert.der())),
         };
         let (stop, stats2) = (stop.clone(), stats.clone());
         tokio::spawn(async move {

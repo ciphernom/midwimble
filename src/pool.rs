@@ -75,7 +75,9 @@
 //! * Connections are capped per address and in total, and a message longer
 //!   than [`MAX_LINE`] bytes closes the connection.
 //!
-//! Wire format (JSON lines over TCP):
+//! Wire format (JSON lines over TCP, or over TLS on the pool's optional TLS
+//! listener: `stratum+tls://`, with the certificate pinned or chaining to a
+//! web root authority):
 //!
 //! ```text
 //! → {"id":1,"method":"mining.authorize","params":[address, worker]}
@@ -118,7 +120,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, oneshot, RwLock};
 
 /// One coinbase output is the pool fee; the rest pay miners.
@@ -1275,6 +1277,17 @@ pub struct PoolConfig {
     pub window_blocks: u64,
     pub data_dir: PathBuf,
     pub poll_interval: Duration,
+    /// A second Stratum listener that speaks TLS, if any.
+    pub stratum_tls: Option<StratumTls>,
+}
+
+/// Stratum over TLS: where to listen, and the certificate to present.
+#[derive(Clone, Debug)]
+pub struct StratumTls {
+    pub bind: SocketAddr,
+    /// PEM files: the certificate chain, leaf first, and its private key.
+    pub cert_chain: PathBuf,
+    pub private_key: PathBuf,
 }
 
 struct Job {
@@ -1408,6 +1421,19 @@ pub async fn run_pool(cfg: PoolConfig, stats: Arc<PoolStats>) -> Result<()> {
         stratum.local_addr()?,
         api.local_addr()?
     );
+    let stratum_tls = match &cfg.stratum_tls {
+        Some(tls) => {
+            let (acceptor, fingerprint) = tls_acceptor(&tls.cert_chain, &tls.private_key)?;
+            let listener = tokio::net::TcpListener::bind(tls.bind).await?;
+            tracing::info!(
+                "pool: stratum over TLS on {}, certificate SHA-256 {} (miners can pin it with --tls-pin)",
+                listener.local_addr()?,
+                hex::encode(fingerprint)
+            );
+            Some((listener, acceptor))
+        }
+        None => None,
+    };
     let (notifier, _) = broadcast::channel(32);
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -1443,9 +1469,23 @@ pub async fn run_pool(cfg: PoolConfig, stats: Arc<PoolStats>) -> Result<()> {
     });
 
     tokio::spawn(job_loop(state.clone()));
+    if let Some((listener, acceptor)) = stratum_tls {
+        tokio::spawn(serve_stratum(state.clone(), listener, Some(acceptor)));
+    }
+    serve_stratum(state, stratum, None).await
+}
 
+/// How long a connection has to finish its TLS handshake.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Serves miners connecting to `listener`, over TLS if `tls` is given.
+async fn serve_stratum(
+    state: Arc<PoolState>,
+    listener: tokio::net::TcpListener,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) -> Result<()> {
     loop {
-        let (socket, peer) = match stratum.accept().await {
+        let (socket, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(e) => {
                 // Out of file descriptors, say: wait instead of exiting.
@@ -1462,14 +1502,172 @@ pub async fn run_pool(cfg: PoolConfig, stats: Arc<PoolStats>) -> Result<()> {
             tracing::debug!("pool: refused {peer}: too many connections");
             continue;
         };
-        let st = state.clone();
+        let (st, tls) = (state.clone(), tls.clone());
         tokio::spawn(async move {
             let _admitted = admitted;
-            if let Err(e) = handle_miner(socket, peer, st).await {
+            let served = match tls {
+                None => handle_miner(socket, peer, st).await,
+                Some(acceptor) => {
+                    match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(socket)).await
+                    {
+                        Ok(Ok(stream)) => handle_miner(stream, peer, st).await,
+                        Ok(Err(e)) => Err(anyhow!("TLS handshake failed: {e}")),
+                        Err(_) => Err(anyhow!("TLS handshake timed out")),
+                    }
+                }
+            };
+            if let Err(e) = served {
                 tracing::debug!("pool: miner {} disconnected: {:#}", peer, e);
             }
         });
     }
+}
+
+// ── TLS ─────────────────────────────────────────────────────────────────────
+
+fn tls_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// SHA-256 of a DER certificate: what a miner pins with `--tls-pin`.
+pub fn certificate_fingerprint(der: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(der).into()
+}
+
+/// The pool's TLS acceptor for a PEM certificate chain and key, and the
+/// fingerprint of the leaf certificate.
+fn tls_acceptor(
+    cert_chain: &std::path::Path,
+    private_key: &std::path::Path,
+) -> Result<(tokio_rustls::TlsAcceptor, [u8; 32])> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_chain)
+        .and_then(|certs| certs.collect())
+        .map_err(|e| anyhow!("reading {}: {e:?}", cert_chain.display()))?;
+    let leaf = certs
+        .first()
+        .ok_or_else(|| anyhow!("{} holds no certificate", cert_chain.display()))?;
+    let fingerprint = certificate_fingerprint(leaf);
+    let key = PrivateKeyDer::from_pem_file(private_key)
+        .map_err(|e| anyhow!("reading {}: {e:?}", private_key.display()))?;
+    let config = rustls::ServerConfig::builder_with_provider(tls_provider())
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    Ok((
+        tokio_rustls::TlsAcceptor::from(Arc::new(config)),
+        fingerprint,
+    ))
+}
+
+/// Accepts exactly the server certificate whose SHA-256 is `pin`, for pools
+/// with a self-signed certificate. The handshake's signatures are still
+/// checked, so only the holder of that certificate's key gets through.
+#[derive(Debug)]
+struct PinnedCertificate {
+    pin: [u8; 32],
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCertificate {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if certificate_fingerprint(end_entity) == self.pin {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "the pool's certificate is not the pinned one".into(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// A connection to a pool, plain or TLS.
+trait PoolStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> PoolStream for T {}
+
+/// Connects to a pool at `host:port`, `stratum+tcp://host:port`, or over TLS
+/// at `stratum+tls://host:port` (or `stratum+ssl://`). Over TLS the pool's
+/// certificate must be the one `pin` names, if given, or else chain to the
+/// web's root authorities for `host`.
+async fn connect_pool(url: &str, pin: Option<[u8; 32]>) -> Result<Box<dyn PoolStream>> {
+    let tls_addr = url
+        .strip_prefix("stratum+tls://")
+        .or_else(|| url.strip_prefix("stratum+ssl://"));
+    let addr = tls_addr.unwrap_or_else(|| url.trim_start_matches("stratum+tcp://"));
+    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    if tls_addr.is_none() {
+        return Ok(Box::new(tcp));
+    }
+    let host = addr
+        .rsplit_once(':')
+        .map_or(addr, |(host, _)| host)
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| anyhow!("bad pool host {host}: {e}"))?;
+    let builder = rustls::ClientConfig::builder_with_provider(tls_provider())
+        .with_safe_default_protocol_versions()?;
+    let config = match pin {
+        Some(pin) => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedCertificate {
+                pin,
+                provider: tls_provider(),
+            }))
+            .with_no_client_auth(),
+        None => builder
+            .with_root_certificates(rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            })
+            .with_no_client_auth(),
+    };
+    let stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(name, tcp)
+        .await?;
+    Ok(Box::new(stream))
 }
 
 /// The windows of the last published job.
@@ -2080,13 +2278,12 @@ impl Difficulty {
 /// notifications keep flowing, but nothing more is read from the miner until
 /// it finishes: a busy pool slows a connection down instead of dropping its
 /// shares.
-async fn handle_miner(
-    socket: tokio::net::TcpStream,
-    peer: SocketAddr,
-    state: Arc<PoolState>,
-) -> Result<()> {
+async fn handle_miner<S>(socket: S, peer: SocketAddr, state: Arc<PoolState>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
     let ip = ip_key(peer.ip());
-    let (read, mut write) = socket.into_split();
+    let (read, mut write) = tokio::io::split(socket);
     let mut lines = LineReader::new(read, MAX_LINE);
     let mut jobs = state.notifier.subscribe();
     let mut authorized: Option<AddrKey> = None;
@@ -2713,6 +2910,9 @@ pub struct PoolMinerConfig {
     /// RPC address of a node of our own, to catch a pool holding back new
     /// tips ([`TipWatch`]).
     pub node: Option<String>,
+    /// Over TLS, the SHA-256 of the pool's certificate, for a self-signed
+    /// one; without it the certificate must chain to a web root authority.
+    pub tls_pin: Option<[u8; 32]>,
 }
 
 #[derive(Default, Debug)]
@@ -2770,9 +2970,8 @@ pub async fn run_pool_miner_with_fee_percent(
     stats: Arc<PoolMinerStats>,
     max_fee_percent: f64,
 ) -> Result<()> {
-    let stream =
-        tokio::net::TcpStream::connect(cfg.pool.trim_start_matches("stratum+tcp://")).await?;
-    let (read, mut write) = stream.into_split();
+    let stream = connect_pool(&cfg.pool, cfg.tls_pin).await?;
+    let (read, mut write) = tokio::io::split(stream);
     let mut lines = BufReader::new(read).lines();
     let address = cfg.view.address().encode();
     let hello = json!({ "id": 1, "method": "mining.authorize", "params": [address, cfg.worker] });
@@ -2987,6 +3186,7 @@ mod tests {
                 window_blocks: 2,
                 data_dir: dir.to_path_buf(),
                 poll_interval: Duration::from_secs(1),
+                stratum_tls: None,
             },
             db,
             current: RwLock::new(None),
@@ -3490,6 +3690,54 @@ mod tests {
         assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("world"));
         tx.write_all(&[b'x'; 40]).await.unwrap();
         assert!(lines.next_line().await.is_err());
+    }
+
+    /// A self-signed certificate for 127.0.0.1 and localhost, written as PEM
+    /// files into `dir`, and its fingerprint.
+    fn test_certificate(dir: &std::path::Path) -> (PathBuf, PathBuf, [u8; 32]) {
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".into(), "localhost".into()])
+                .unwrap();
+        let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+        (cert_path, key_path, certificate_fingerprint(cert.der()))
+    }
+
+    #[tokio::test]
+    async fn miners_reach_a_tls_pool_only_through_its_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key, pin) = test_certificate(dir.path());
+        let (acceptor, fingerprint) = tls_acceptor(&cert, &key).unwrap();
+        assert_eq!(fingerprint, pin);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut stream) = acceptor.accept(socket).await {
+                        let _ = stream.write_all(b"hello\n").await;
+                        let _ = stream.shutdown().await;
+                    }
+                });
+            }
+        });
+        let url = format!("stratum+tls://{addr}");
+        // The pinned certificate: through, and the stream works.
+        let stream = connect_pool(&url, Some(pin)).await.unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).await.unwrap();
+        assert_eq!(line, "hello\n");
+        // Any other pin, or no pin for a certificate no root authority
+        // signed: refused before a byte of Stratum.
+        let mut other = pin;
+        other[0] ^= 1;
+        assert!(connect_pool(&url, Some(other)).await.is_err());
+        assert!(connect_pool(&url, None).await.is_err());
+        // Plain TCP is still plain TCP.
+        assert!(connect_pool(&addr.to_string(), None).await.is_ok());
     }
 
     #[tokio::test]

@@ -146,6 +146,16 @@ enum Cmd {
         window_blocks: u64,
         #[arg(long, default_value = "./pool-data")]
         data_dir: PathBuf,
+        /// Also serve Stratum over TLS here (e.g. 0.0.0.0:3334), with the
+        /// certificate chain and key in --tls-cert and --tls-key (PEM).
+        #[arg(long, requires_all = ["tls_cert", "tls_key"])]
+        stratum_tls: Option<String>,
+        /// PEM certificate chain for --stratum-tls, leaf first.
+        #[arg(long)]
+        tls_cert: Option<PathBuf>,
+        /// PEM private key of --tls-cert's leaf certificate.
+        #[arg(long)]
+        tls_key: Option<PathBuf>,
     },
     /// Mine for a pool, auditing every job before hashing on it.
     PoolMine {
@@ -176,6 +186,10 @@ enum Cmd {
         /// draw.
         #[arg(long)]
         node: Option<String>,
+        /// For a `stratum+tls://` pool with a self-signed certificate: its
+        /// SHA-256 in hex, as the pool prints at startup.
+        #[arg(long)]
+        tls_pin: Option<String>,
     },
     /// List GPUs and run the miner's shader self-test.
     GpuInfo,
@@ -279,6 +293,13 @@ enum WalletCmd {
         #[arg(long)]
         fee: Option<String>,
     },
+}
+
+/// A pool certificate's SHA-256, as `pool` prints it, for `--tls-pin`.
+fn tls_pin_from_hex(pin: &str) -> Result<[u8; 32]> {
+    hex::decode(pin.trim())?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("--tls-pin is a 32-byte SHA-256 in hex"))
 }
 
 fn password() -> Result<String> {
@@ -849,10 +870,24 @@ fn run(cli: Cli) -> Result<()> {
             share_interval,
             window_blocks,
             data_dir,
+            stratum_tls,
+            tls_cert,
+            tls_key,
         } => {
             tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::INFO)
                 .init();
+            let stratum_tls = match (stratum_tls, tls_cert, tls_key) {
+                (Some(bind), Some(cert_chain), Some(private_key)) => {
+                    Some(midwimble::pool::StratumTls {
+                        bind: bind.parse()?,
+                        cert_chain,
+                        private_key,
+                    })
+                }
+                (None, _, _) => None,
+                _ => bail!("--stratum-tls needs --tls-cert and --tls-key"),
+            };
             if !share_interval.is_finite() || share_interval <= 0.0 {
                 bail!("--share-interval must be a positive number of seconds");
             }
@@ -868,6 +903,7 @@ fn run(cli: Cli) -> Result<()> {
                 window_blocks,
                 data_dir,
                 poll_interval: std::time::Duration::from_secs(1),
+                stratum_tls,
             };
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(midwimble::pool::run_pool(cfg, Default::default()))
@@ -881,6 +917,7 @@ fn run(cli: Cli) -> Result<()> {
             max_fee,
             spot_checks,
             node,
+            tls_pin,
         } => {
             tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::INFO)
@@ -894,6 +931,10 @@ fn run(cli: Cli) -> Result<()> {
                     )
                 })?,
             };
+            let tls_pin = match tls_pin {
+                Some(pin) => Some(tls_pin_from_hex(&pin)?),
+                None => None,
+            };
             let cfg = midwimble::pool::PoolMinerConfig {
                 pool,
                 view: midwimble::core::mw::ViewKey::decode(&view_key)?,
@@ -901,6 +942,7 @@ fn run(cli: Cli) -> Result<()> {
                 threads,
                 spot_checks,
                 node,
+                tls_pin,
             };
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             {
