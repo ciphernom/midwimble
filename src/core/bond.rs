@@ -12,6 +12,9 @@
 //! (`check_miner_authorization`, from `BONDED_MINING_FROM`), and fork choice
 //! caps how much work any one bond's blocks add (`credit_work`), so a
 //! producer's capacity scales with the bonds behind it, co-bonds included.
+//! Fork choice also caps the work any one block adds, at a quarter above the
+//! lowest block of the week before (`cap_work`), so hashrate alone cannot
+//! stand in for bonds.
 
 use super::anchor::{header_pow_ok, HeaderLink};
 use super::auxpow::midstate_coin_id;
@@ -814,6 +817,26 @@ pub const CAP_K: usize = 360;
 #[cfg(feature = "fast-mining")]
 pub const CAP_K: usize = 4;
 pub const OVER_CAP_WORK_DIVISOR: u128 = 1024;
+/// Fork choice credits a block with at most a quarter more than the lowest
+/// work among its chain's previous `WORK_CAP_WINDOW` blocks (`cap_work`).
+///
+/// The per-bond cap counts blocks, not work. Without this, an attacker with
+/// `r` times the honest hashrate could let ASERT raise its private chain's
+/// difficulty, which takes hours, and then fill each quota slot with `r` times
+/// the work of an honest block: a day-long rewrite would need about `1/r` of
+/// the bonds. A fork younger than the window inherits its floor from the
+/// history it shares with the honest chain, so extra hashrate buys it no
+/// weight: outweighing the honest chain takes more full-weight blocks, and so
+/// more bonds. Honest growth faster than a quarter in a window is credited
+/// late, and alike on every branch that shares the window.
+#[cfg(not(feature = "fast-mining"))]
+pub const WORK_CAP_WINDOW: usize = 7 * 24 * 60;
+/// Test and devnet builds use four signer windows, so a test can reach the
+/// cap and see a low block leave the window.
+#[cfg(feature = "fast-mining")]
+pub const WORK_CAP_WINDOW: usize = 4 * CAP_WINDOW;
+/// The cap is the window's lowest work plus `1 / WORK_CAP_HEADROOM` of it.
+pub const WORK_CAP_HEADROOM: u128 = 4;
 /// How far past the block's estimated midstate height a registration may lock
 /// its coin, so a forged registration expires instead of holding a quota slot
 /// forever.
@@ -828,16 +851,18 @@ pub fn signer_cap(bonds: &im::HashMap<[u8; 32], BondEntry>, block_timestamp: u64
     CAP_WINDOW.div_ceil(eligible.clamp(1, CAP_K))
 }
 
-/// Records a block's signer in the fork-choice window and returns the work the
-/// block adds to its chain's weight: all of it while the bond has signed at
-/// most `signer_cap` of the last `CAP_WINDOW` blocks, this one included, and a
-/// sliver beyond that (never zero, so a longer chain is always a heavier one).
+/// Records a block in the fork-choice windows and returns the work it adds to
+/// its chain's weight: its work as far as [`cap_work`] allows, all of that
+/// while the bond has signed at most `signer_cap` of the last `CAP_WINDOW`
+/// blocks, this one included, and a sliver beyond (never zero, so a longer
+/// chain is always a heavier one). `state.height` is the block's own height.
 pub fn credit_work(
     state: &mut super::types::State,
     signer: Option<[u8; 32]>,
     work: u128,
     block_timestamp: u64,
 ) -> u128 {
+    let work = cap_work(&mut state.work_floor, state.height, work);
     credit_in_window(
         &mut state.recent_signers,
         &mut state.signer_counts,
@@ -848,8 +873,39 @@ pub fn credit_work(
     )
 }
 
-/// [`credit_work`] on a bare window. Storage replays blocks onto its own
-/// records and must weigh each one exactly as the node did.
+/// The work fork choice may credit the block at `height`: at most the lowest
+/// work among the previous `WORK_CAP_WINDOW` blocks plus a quarter of it.
+/// Then adds the block's own work to the window.
+///
+/// `floor` holds `(height, work)` pairs from the window, oldest first, with
+/// work strictly rising: each is a block no later block has undercut, so the
+/// front is the window's minimum and every update is amortised O(1). It is
+/// left holding exactly the window the next block will see, so a window
+/// rebuilt from stored blocks is identical. An empty window (before genesis)
+/// caps nothing. Storage replays blocks through this on its own copy and must
+/// weigh each one exactly as the node did.
+pub fn cap_work(floor: &mut im::Vector<(u64, u128)>, height: u64, work: u128) -> u128 {
+    fn keep_window_of(floor: &mut im::Vector<(u64, u128)>, height: u64) {
+        let oldest = height.saturating_sub(WORK_CAP_WINDOW as u64);
+        while floor.front().is_some_and(|&(h, _)| h < oldest) {
+            floor.pop_front();
+        }
+    }
+    keep_window_of(floor, height);
+    let credited = match floor.front() {
+        Some(&(_, low)) => work.min(low.saturating_add(low / WORK_CAP_HEADROOM)),
+        None => work,
+    };
+    while floor.back().is_some_and(|&(_, w)| w >= work) {
+        floor.pop_back();
+    }
+    floor.push_back((height, work));
+    keep_window_of(floor, height + 1);
+    credited
+}
+
+/// The per-bond half of [`credit_work`], on a bare window. Storage replays
+/// blocks onto its own records and must weigh each one exactly as the node did.
 pub fn credit_in_window(
     recent: &mut im::Vector<Option<[u8; 32]>>,
     counts: &mut im::HashMap<[u8; 32], u32>,
@@ -895,7 +951,28 @@ pub fn rebuild_signer_window(
     state.recent_signers = im::Vector::new();
     state.signer_counts = im::HashMap::new();
     for signer in signers {
-        credit_work(state, signer, 0, 0);
+        credit_in_window(
+            &mut state.recent_signers,
+            &mut state.signer_counts,
+            &state.bonds,
+            signer,
+            0,
+            0,
+        );
+    }
+}
+
+/// Rebuilds the work window from the `(height, work)` of the blocks before
+/// `state`, oldest first (storage does this after loading or rewinding). A
+/// block left out, such as one below a snapshot's base, can only raise the
+/// floor: it loosens this node's weighting, never validity.
+pub fn rebuild_work_floor(
+    state: &mut super::types::State,
+    works: impl IntoIterator<Item = (u64, u128)>,
+) {
+    state.work_floor = im::Vector::new();
+    for (height, work) in works {
+        cap_work(&mut state.work_floor, height, work);
     }
 }
 
@@ -1024,6 +1101,102 @@ mod cap_tests {
         rebuild_signer_window(&mut rebuilt, signers);
         assert_eq!(rebuilt.recent_signers, state.recent_signers);
         assert_eq!(rebuilt.signer_counts, state.signer_counts);
+    }
+
+    /// Appends `n` blocks of `work` to `state`, signed in turn by `signers`,
+    /// keeping the books `apply_batch` keeps.
+    fn extend(state: &mut super::super::types::State, signers: &[[u8; 32]], n: usize, work: u128) {
+        for i in 0..n {
+            let credited = credit_work(state, Some(signers[i % signers.len()]), work, 0);
+            state.depth += work;
+            state.capped += work - credited;
+            state.height += 1;
+        }
+    }
+
+    #[test]
+    fn a_low_block_caps_credit_for_exactly_one_window() {
+        let mut floor = im::Vector::new();
+        let work = 1u128 << 40;
+        assert_eq!(cap_work(&mut floor, 0, work), work, "an empty window caps nothing");
+        for h in 1..10 {
+            assert_eq!(cap_work(&mut floor, h, work), work);
+        }
+        // A quarter over the floor is the most a block can count for.
+        assert_eq!(cap_work(&mut floor, 10, 4 * work), work + work / 4);
+        // One block at half the work...
+        assert_eq!(cap_work(&mut floor, 11, work / 2), work / 2);
+        // ...caps every block after it while it is in the window, and no longer.
+        let window = WORK_CAP_WINDOW as u64;
+        for h in 12..12 + window {
+            assert_eq!(cap_work(&mut floor, h, work), work / 2 + work / 8, "height {h}");
+        }
+        assert_eq!(cap_work(&mut floor, 12 + window, work), work);
+    }
+
+    #[test]
+    fn the_floor_is_the_lowest_work_of_the_window_before() {
+        // Work wandering within a factor of two, over two windows and more.
+        let n = 2 * WORK_CAP_WINDOW + 50;
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let works: Vec<u128> = (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (1u128 << 40) + u128::from(x % 4096) * (1 << 28)
+            })
+            .collect();
+        let mut floor = im::Vector::new();
+        for (h, &work) in works.iter().enumerate() {
+            let credited = cap_work(&mut floor, h as u64, work);
+            if h % 7 == 0 || h + 8 > n {
+                let low = works[h.saturating_sub(WORK_CAP_WINDOW)..h].iter().min();
+                let expected = low.map_or(work, |&l| work.min(l + l / WORK_CAP_HEADROOM));
+                assert_eq!(credited, expected, "height {h}");
+            }
+        }
+        // The window rebuilt from stored blocks (a restart) is the same window.
+        let mut state = super::super::types::State::genesis();
+        rebuild_work_floor(&mut state, (n - WORK_CAP_WINDOW..n).map(|h| (h as u64, works[h])));
+        assert_eq!(state.work_floor, floor);
+    }
+
+    /// What the per-bond cap alone missed. It counts blocks, so an attacker
+    /// with ten times the honest hashrate could let difficulty climb tenfold
+    /// and sign a day with a fifth of the honest bonds: each of its four
+    /// blocks a bond a day would carry ten blocks' work. Against the work cap
+    /// it loses. A chain with more full-weight blocks still wins, and that
+    /// takes bonds.
+    #[test]
+    fn hashrate_cannot_stand_in_for_bonds() {
+        let d = 1u128 << 40;
+        let honest: Vec<[u8; 32]> = (0..CAP_K).map(bond_id).collect();
+        let few: Vec<[u8; 32]> = (CAP_K..CAP_K + CAP_K.div_ceil(5)).map(bond_id).collect();
+        let many: Vec<[u8; 32]> = (2 * CAP_K..3 * CAP_K + 1).map(bond_id).collect();
+        let mut shared = super::super::types::State::genesis();
+        for id in honest.iter().chain(&few).chain(&many) {
+            shared.bonds.insert(*id, eligible_bond());
+        }
+        let share = CAP_WINDOW / CAP_K;
+        assert_eq!(signer_cap(&shared.bonds, 0), share);
+
+        // A week of history at honest difficulty, every block within its share.
+        extend(&mut shared, &honest, WORK_CAP_WINDOW, d);
+        assert_eq!(shared.capped, 0);
+        let mut honest_day = shared.clone();
+        extend(&mut honest_day, &honest, CAP_WINDOW, d);
+        assert_eq!(honest_day.capped, 0, "the honest day counts in full");
+
+        let mut rich = shared.clone();
+        extend(&mut rich, &few, CAP_WINDOW, 10 * d);
+        let slots = (share * few.len()) as u128;
+        assert!(slots * 10 * d > CAP_WINDOW as u128 * d, "by block count alone it would win");
+        assert!(rich.weight() < honest_day.weight(), "ten times the hashrate buys no weight");
+
+        let mut bonded = shared.clone();
+        extend(&mut bonded, &many, CAP_WINDOW + 1, d);
+        assert!(bonded.weight() > honest_day.weight(), "more full-weight blocks still win");
     }
 
     #[test]

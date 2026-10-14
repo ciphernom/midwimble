@@ -167,6 +167,8 @@ deterministic from midwimble's chain alone.
 | `REGISTRATION_WORK_BLOCKS` | 1,440 | A day, in blocks of the registering block's target. |
 | `REGISTRATION_MIN_HEADERS` | 60 | Caps any one header at 1/60 of the requirement. |
 | `REGISTRATION_MAX_HEADERS` | 4,000 | Bounds size (144 bytes a header) and verification cost. |
+| `CAP_WINDOW`, `CAP_K` | 1,440 blocks, 360 | Four full-weight blocks a bond a day (the per-bond cap, below). |
+| `WORK_CAP_WINDOW` | 10,080 blocks (7 days) | No block counts for more than a quarter above the lowest of the week before it (the work cap, below). |
 
 ## How much work a registration needs
 
@@ -286,8 +288,10 @@ pay, but add only 1/1024 of their work. So:
 
 - the chain never stalls: a lone producer can always extend it, and a longer
   chain is always a heavier one;
-- to outweigh the honest chain, an attacker needs more bonds than the honest
-  network has, each with the hashrate to fill its quota;
+- to outweigh the honest chain, an attacker needs more full-weight blocks
+  than it, so bonds of its own for every block it replaces, as well as more
+  hashrate than the honest miners. More hashrate cannot stand in for bonds:
+  that takes the work cap, below;
 - the cap counts *registered, eligible* bonds, not recent signers. On an
   attacker's private chain the attacker is the only signer, so a cap measured
   by signers would lift exactly where it is needed;
@@ -301,7 +305,38 @@ While the network has fewer than 360 eligible bonds, they share the window
 equally, and a lone producer is uncapped. The window is the last 1,440 blocks,
 the new one included. It is not part of the state root: nodes rebuild it from
 their stored blocks. Cumulative work, which checkpoints and anchors measure, is
-unchanged; fork choice compares it less the work the cap withheld.
+unchanged; fork choice compares it less the work the caps withheld.
+
+### The work cap
+
+The per-bond cap counts blocks, not work, so on its own it let hashrate stand
+in for bonds. An attacker with `r` times the honest hashrate lets ASERT raise
+its private chain's difficulty, which takes hours, and then each of its quota
+slots carries `r` times an honest block's work. A day-long rewrite needed
+about `1/r` of the bonds.
+
+So fork choice also caps each block's work (`bond::cap_work`): a block counts
+for at most a quarter more than the lowest-work block among the 10,080 before
+it (`WORK_CAP_WINDOW`, a week). A fork younger than that inherits the floor
+from the history it shares with the honest chain, so the difficulty it climbs
+to buys it no weight, and outweighing the honest chain takes more full-weight
+blocks, which takes bonds. The bonds an attacker needs, simulated with these
+rules (4-hour ASERT half-life, an attacker that uses its quota greedily),
+by the attacker's hashrate as a multiple of the honest miners':
+
+| Bonds to rewrite | about 1× | 2× | 10× | 100× |
+|---|---|---|---|---|
+| an hour, without the work cap | 15 | 15 | 14 | 13 |
+| an hour, with it | 15 | 15 | 14 | 14 |
+| a day, without the work cap | 343 | 170 | 36 | 3 |
+| a day, with it | 343 | 234 | 146 | 127 |
+
+Honest difficulty that rises more than a quarter within a week is credited
+late, alike on every branch that shares the window, so it never decides
+between honest branches; the cap only ever lowers a block's credit, never to
+zero. The window is rebuilt from the stored headers, like the signer window. A
+node started from a snapshot holds fewer headers below its base, which can
+only raise its floor: it loosens that node's weighting, never validity.
 
 A registration must lock at least `MIN_MINING_BOND`, and no further than a year
 (`MAX_BOND_HORIZON`) past the block's estimated midstate height, so a forged

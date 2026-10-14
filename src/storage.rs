@@ -53,8 +53,10 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// Each block's signer (bond id; empty if unsigned). Never pruned: the
 /// fork-choice window needs signers after their bodies are gone.
 const SIGNERS: TableDefinition<u64, &[u8]> = TableDefinition::new("signers");
-/// Work the per-bond cap has withheld, as of each block. A missing entry is
-/// 0: no block stored before the cap existed was capped.
+/// Work fork choice has withheld (the work cap and the per-bond cap), summed
+/// to each block. A missing entry is 0. An entry written before a cap existed
+/// leaves that cap out, which is harmless: fork choice only compares branches
+/// that share every entry below the point where they part.
 const CAPPED: TableDefinition<u64, &[u8]> = TableDefinition::new("capped");
 const SYNC_HEADERS: TableDefinition<u64, &[u8]> = TableDefinition::new("sync_headers");
 const PEERS: TableDefinition<&str, &[u8]> = TableDefinition::new("peers");
@@ -214,6 +216,22 @@ fn signer_from_log(bytes: &[u8]) -> Option<[u8; 32]> {
 fn signer_of_block(bytes: &[u8]) -> Result<Option<[u8; 32]>> {
     let batch: Batch = bincode::deserialize(bytes)?;
     Ok(batch.miner.map(|m| m.bond_id))
+}
+
+/// `(height, work)` of each stored header in `range`, oldest first: what the
+/// fork-choice work window (`bond::cap_work`) is rebuilt from. A height with no
+/// header, below a snapshot's base, is left out.
+fn header_works(
+    headers: &impl ReadableTable<u64, &'static [u8]>,
+    range: std::ops::Range<u64>,
+) -> Result<Vec<(u64, u128)>> {
+    let mut out = Vec::with_capacity(range.end.saturating_sub(range.start) as usize);
+    for entry in headers.range(range)? {
+        let (k, v) = entry?;
+        let header: BatchHeader = bincode::deserialize(v.value())?;
+        out.push((k.value(), calculate_work(&header.target)));
+    }
+    Ok(out)
 }
 
 fn load_header_range(
@@ -412,6 +430,7 @@ impl Storage {
             bonds: meta.bonds.clone(),
             recent_signers: Default::default(),
             signer_counts: Default::default(),
+            work_floor: Default::default(),
             capped: 0,
             utxos,
             utxo_set: UtxoAccumulator::from_canonical_coins(leaves, true),
@@ -437,7 +456,7 @@ impl Storage {
             .chain_mmr
             .append(&tip_header.extension.final_hash, true);
         state.capped = self.capped_before(state.height)?;
-        self.rebuild_signer_window(&mut state)?;
+        self.rebuild_fork_choice_windows(&mut state)?;
         Ok(Some(state))
     }
 
@@ -486,14 +505,16 @@ impl Storage {
         }
         state.chain_mmr = current.chain_mmr.truncated(height);
         state.capped = self.capped_before(height)?;
-        self.rebuild_signer_window(&mut state)?;
+        self.rebuild_fork_choice_windows(&mut state)?;
         Ok(state)
     }
 
-    /// Refills the fork-choice window (`bond::credit_work`) from the signers
-    /// of the stored blocks just below `state`. A pruned block counts as
-    /// unsigned, which can only loosen this node's weighting, never validity.
-    fn rebuild_signer_window(&self, state: &mut State) -> Result<()> {
+    /// Refills the fork-choice windows (`bond::credit_work`) from the stored
+    /// blocks just below `state`: signers from the signer log, work from the
+    /// headers. A pruned block counts as unsigned, and a block with no header
+    /// (below a snapshot's base) drops out of the work window. Either can only
+    /// loosen this node's weighting, never validity.
+    fn rebuild_fork_choice_windows(&self, state: &mut State) -> Result<()> {
         let end = state.height;
         let start = end.saturating_sub(crate::core::bond::CAP_WINDOW as u64);
         let txn = self.db.begin_read()?;
@@ -510,10 +531,13 @@ impl Storage {
             });
         }
         crate::core::bond::rebuild_signer_window(state, signers);
+        let floor_start = end.saturating_sub(crate::core::bond::WORK_CAP_WINDOW as u64);
+        let works = header_works(&txn.open_table(HEADERS)?, floor_start..end)?;
+        crate::core::bond::rebuild_work_floor(state, works);
         Ok(())
     }
 
-    /// Work the per-bond cap withheld from blocks `0..height`.
+    /// Work fork choice withheld from blocks `0..height`.
     fn capped_before(&self, height: u64) -> Result<u128> {
         let Some(last) = height.checked_sub(1) else {
             return Ok(0);
@@ -612,7 +636,7 @@ impl Storage {
                 meta = undo.prev;
             }
 
-            // The fork-choice window below the first new block, rebuilt as the
+            // The fork-choice windows below the first new block, rebuilt as the
             // node rebuilds its own, so each block is weighed as the node did.
             let mut recent: im::Vector<Option<[u8; 32]>> = im::Vector::new();
             let mut counts: im::HashMap<[u8; 32], u32> = im::HashMap::new();
@@ -626,6 +650,12 @@ impl Storage {
                     },
                 };
                 crate::core::bond::credit_in_window(&mut recent, &mut counts, &meta.bonds, signer, 0, 0);
+            }
+            let mut floor: im::Vector<(u64, u128)> = im::Vector::new();
+            let floor_start =
+                first_height.saturating_sub(crate::core::bond::WORK_CAP_WINDOW as u64);
+            for (h, work) in header_works(&headers, floor_start..first_height)? {
+                crate::core::bond::cap_work(&mut floor, h, work);
             }
             let mut capped: u128 = match first_height.checked_sub(1) {
                 Some(last) => match capped_table.get(last)? {
@@ -732,12 +762,13 @@ impl Storage {
                 let next = meta.advance(batch)?;
                 let signer = batch.miner.as_ref().map(|auth| auth.bond_id);
                 let work = calculate_work(&batch.target);
+                let creditable = crate::core::bond::cap_work(&mut floor, height, work);
                 let credited = crate::core::bond::credit_in_window(
                     &mut recent,
                     &mut counts,
                     &next.bonds,
                     signer,
-                    work,
+                    creditable,
                     batch.timestamp,
                 );
                 capped = capped.saturating_add(work - credited);
@@ -1138,15 +1169,28 @@ mod tests {
         to: &StealthAddress,
         bond: &crate::core::bond::MinerBond,
     ) {
+        // On schedule, so difficulty holds at the genesis target and a
+        // block's work is large enough for the cap to withhold most of it.
+        let on_schedule = crate::core::types::GENESIS_TIMESTAMP + 60 * state.height;
+        mine_signed_at(storage, state, ts, to, bond, on_schedule);
+    }
+
+    /// [`mine_signed`], stamped `timestamp`.
+    fn mine_signed_at(
+        storage: &Storage,
+        state: &mut State,
+        ts: &mut Vec<u64>,
+        to: &StealthAddress,
+        bond: &crate::core::bond::MinerBond,
+        timestamp: u64,
+    ) {
         let (template, _) = crate::core::template::build_template_bonded(
             state,
             ts,
             &[],
             &[(to.clone(), 1)],
             [0; 32],
-            // On schedule, so difficulty holds at the genesis target and a
-            // block's work is large enough for the cap to withhold most of it.
-            Some(crate::core::types::GENESIS_TIMESTAMP + 60 * state.height),
+            Some(timestamp),
             Some(bond),
         )
         .unwrap();
@@ -1216,6 +1260,57 @@ mod tests {
         }
         mine_signed(&storage, &mut loaded, &mut ts, &to, &b);
         mine_signed(&storage, &mut loaded, &mut ts, &to, &a);
+    }
+
+    /// One cheap block (its parent stamped four hours late, which doubles
+    /// the next target) caps every block after it at a quarter above its work
+    /// until it leaves the work window. Storage replays the same weight the
+    /// node computed, and a restart or a rewind restores it.
+    #[test]
+    fn storage_weighs_the_work_cap_exactly_as_the_node_does() {
+        use crate::core::bond::{WORK_CAP_HEADROOM, WORK_CAP_WINDOW};
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut state, mut ts) = fresh(dir.path());
+        let to = WalletKeys::random().address();
+        let bond = devnet_bond(b"work cap", &state.target);
+        // Enough blocks that the timestamp floor is a median, so the block
+        // after the late one may go back on schedule.
+        for _ in 0..12 {
+            mine_signed(&storage, &mut state, &mut ts, &to, &bond);
+        }
+        assert_eq!(state.capped, 0, "steady difficulty is never capped");
+        let full = calculate_work(&state.target);
+        let late = crate::core::types::GENESIS_TIMESTAMP + 60 * state.height + 4 * 3600;
+        mine_signed_at(&storage, &mut state, &mut ts, &to, &bond, late);
+        let cheap = calculate_work(&state.target);
+        let cap = cheap + cheap / WORK_CAP_HEADROOM;
+        assert!(cap < full, "the cheap block ({cheap}) caps a full one ({full})");
+        mine_signed(&storage, &mut state, &mut ts, &to, &bond);
+        assert_eq!(calculate_work(&state.target), full, "back on schedule");
+
+        let before = state.capped;
+        let mut history = Vec::new();
+        for _ in 0..WORK_CAP_WINDOW {
+            mine_signed(&storage, &mut state, &mut ts, &to, &bond);
+            history.push((state.height, state.capped));
+        }
+        assert_eq!(state.capped - before, (full - cap) * WORK_CAP_WINDOW as u128);
+        let after = state.capped;
+        mine_signed(&storage, &mut state, &mut ts, &to, &bond);
+        assert_eq!(state.capped, after, "the cheap block has left the window");
+        drop(storage);
+
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut loaded = storage.load_state().unwrap().unwrap();
+        assert_eq!((loaded.depth, loaded.capped), (state.depth, state.capped));
+        assert_eq!(loaded.work_floor, state.work_floor);
+        for &(height, capped) in &history {
+            assert_eq!(storage.state_at(&loaded, height).unwrap().capped, capped, "height {height}");
+        }
+        let rewound = storage.state_at(&loaded, history[0].0).unwrap();
+        assert_eq!(rewound.work_floor.front().map(|&(_, w)| w), Some(cheap));
+        mine_signed(&storage, &mut loaded, &mut ts, &to, &bond);
+        assert_eq!(loaded.capped, after);
     }
 
     fn mine(

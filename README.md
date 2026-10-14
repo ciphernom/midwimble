@@ -35,7 +35,10 @@ recovery design.
 - **Difficulty and time:** ASERT with a 4-hour half-life and a 60-second target.
   Timestamps must beat the median of the last 11 blocks and may be at most 15
   minutes ahead.
-- **Fork choice:** cumulative work, tie-broken by the lower midstate.
+- **Fork choice:** cumulative work, less what two caps withhold, tie-broken by
+  the lower midstate. Each bond's blocks count in full up to its share of the
+  day (four blocks once 360 bonds are eligible), and no block counts for more
+  than a quarter above the lowest of the week before it (`docs/BONDED_POW.md`).
 - **State root:** covers the UTXO set, the kernel set, the chain MMR, the
   running excess sum, the total offset and the supply.
 

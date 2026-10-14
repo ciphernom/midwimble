@@ -146,6 +146,7 @@ start from, so the cap does not depend on trusting whoever served it.
 | Halving | every 2,100,000 blocks | Bitcoin's era length |
 | Bonded mining | from block 1 | minimum bond 16 gMDS (2^34 units), a launch parameter |
 | Bond eligibility | more than 30 days of lock left | judged on midwimble's clock, 7-day margin |
+| Fork choice | 4 full-weight blocks a bond a day; no block counts above 1.25× the week's lowest | weight, never validity |
 | Registration | a day of work above the proof | no header counts for more than 1/60 |
 | Anchor evidence | 1,000 midstate confirmations, 2^19 a header | about an hour of midstate's network to forge |
 | Finality | 100 blocks after an anchored checkpoint | fixed for everyone |

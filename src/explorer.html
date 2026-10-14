@@ -399,7 +399,7 @@ function bondTable(r) {
         num(b.blocks_signed),
       ];
     }), [5]),
-    h("div", { class: "note" }, "Fork choice counts a bond's blocks at full weight up to its cap over the last " + num(w.size) + " blocks; past the cap they stay valid and pay, but add 1/1024 of their work. The cap is an equal share among eligible bonds, never below 1/20."));
+    h("div", { class: "note" }, "Fork choice counts a bond's blocks at full weight up to its cap over the last " + num(w.size) + " blocks; past the cap they stay valid and pay, but add 1/1024 of their work. The cap is an equal share among eligible bonds, never below 1/360. No block counts for more than a quarter above the lowest-work block of the week before it."));
 }
 
 async function bondsPage() {

@@ -556,8 +556,8 @@ pub struct State {
     pub supply: u64,
     /// Cumulative proof-of-work: what checkpoints and anchors measure.
     pub depth: u128,
-    /// The part of `depth` fork choice leaves out: the work the per-bond cap
-    /// withheld from over-cap blocks (`bond::credit_work`). See [`State::weight`].
+    /// The part of `depth` fork choice leaves out: the work the work cap and
+    /// the per-bond cap withheld (`bond::credit_work`). See [`State::weight`].
     #[serde(default)]
     pub capped: u128,
     /// Target the next block must meet.
@@ -580,11 +580,17 @@ pub struct State {
     pub recent_signers: im::Vector<Option<[u8; 32]>>,
     #[serde(skip)]
     pub signer_counts: im::HashMap<[u8; 32], u32>,
+    /// The low points of the last `bond::WORK_CAP_WINDOW` blocks' work, as
+    /// `(height, work)` with work strictly rising, so the front is the
+    /// window's minimum (`bond::cap_work`). Like the signer window, not in the
+    /// state root: storage rebuilds it from the stored headers.
+    #[serde(skip)]
+    pub work_floor: im::Vector<(u64, u128)>,
 }
 
 impl State {
-    /// What fork choice compares: cumulative work, less what the per-bond
-    /// cap withheld.
+    /// What fork choice compares: cumulative work, less what the work cap and
+    /// the per-bond cap withheld.
     pub fn weight(&self) -> u128 {
         self.depth.saturating_sub(self.capped)
     }
@@ -607,6 +613,7 @@ impl State {
             bonds: im::HashMap::new(),
             recent_signers: Default::default(),
             signer_counts: Default::default(),
+            work_floor: Default::default(),
             capped: 0,
             utxos: im::HashMap::new(),
             utxo_set: UtxoAccumulator::new(),
