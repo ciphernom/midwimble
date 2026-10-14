@@ -11,7 +11,7 @@ testnet runs from early October until the code is frozen for that.
 Almost nothing, by design. Testnet coins are worthless and the chain is thrown
 away when it ends. Mining needs a bond, and bonds are real MDS on midstate
 mainnet — but the testnet's bond is 2^24 units, about 0.016 gMDS, locked for
-two days. Mainnet's is 16 gMDS for thirty.
+two days. Mainnet's is 128 gMDS for thirty.
 
 That trade is deliberate: the bonded path is the newest code in the project, so
 it should be exercised by many people, which means it has to be cheap to try.

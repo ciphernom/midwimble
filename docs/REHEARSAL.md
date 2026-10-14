@@ -21,7 +21,7 @@ It needs:
 - your midstate wallet;
 - cargo;
 - about two hours;
-- 16 gMDS you are happy to lock for about 36 days.
+- 128 gMDS you are happy to lock for about 36 days.
 
 ## What happens
 
@@ -37,8 +37,8 @@ It needs:
    it back with `midstate wallet spend-script`. This proves your owner key and
    wallet can open a bond lock. The one unrecoverable mistake, using an address
    instead of a public key as the owner key, fails here for almost nothing
-   rather than later for 16 gMDS.
-4. **Bond.** You lock 16 gMDS at the bond address for the minimum term plus a
+   rather than later for 128 gMDS.
+4. **Bond.** You lock 128 gMDS at the bond address for the minimum term plus a
    day. The script asks before this step.
 5. **Registration.** `midwimble bond register` takes the proof from your node,
    then re-runs every five minutes until a day of work at the rehearsal

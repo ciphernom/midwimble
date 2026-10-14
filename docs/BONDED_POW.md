@@ -161,7 +161,7 @@ deterministic from midwimble's chain alone.
 
 | Constant | Value | Reason |
 |---|---|---|
-| `MIN_MINING_BOND` | 2^34 units (16 gMDS) | About 11 days of revenue for a miner with 0.1% of midstate's hashrate: real capital, within an enthusiast's reach. Must be a power of two. A launch parameter (`--min-bond`): a testnet uses 2^24, since nobody will lock real money to test someone else's chain, and the bonded path is exercised just as well by a trivial coin. |
+| `MIN_MINING_BOND` | 2^37 units (128 gMDS) | About 9 days of revenue for a miner with 1% of midstate's hashrate (three months at 0.1%): real capital, within a committed miner's reach. It puts 32 gMDS behind every block that counts in full, so once 360 bonds are eligible a day of blocks is backed by 46,080 gMDS. Must be a power of two. A launch parameter (`--min-bond`): a testnet uses 2^24, since nobody will lock real money to test someone else's chain, and the bonded path is exercised just as well by a trivial coin. |
 | `MIN_REMAINING_BOND_LOCK` | 43,200 blocks (30 days) | The effective unbonding delay. Also a launch parameter (`--bond-lock-days`); a testnet uses two days so testers' coins come back quickly. |
 | `CLOCK_MARGIN` | 10,080 blocks (7 days) | Covers midstate running ahead of its schedule. |
 | `REGISTRATION_WORK_BLOCKS` | 1,440 | A day, in blocks of the registering block's target. |
@@ -244,7 +244,7 @@ midwimble bond address --file bond.json --owner-pk <public key> --until <midstat
 #   prints the bond script and the midstate address to lock the coin at
 
 midstate wallet send --to <bond address>:<value>
-#   value: one power of two, at least 2^34 units (16 gMDS). The wallet prints
+#   value: one power of two, at least 2^37 units (128 gMDS). The wallet prints
 #   every output paid to others:  -> <address>:<value>  salt <hex>  coin <hex>
 
 midwimble bond register --file bond.json --owner-pk <key> --until <height> \
@@ -330,6 +330,10 @@ by the attacker's hashrate as a multiple of the honest miners':
 | an hour, with it | 15 | 15 | 14 | 14 |
 | a day, without the work cap | 343 | 170 | 36 | 3 |
 | a day, with it | 343 | 234 | 146 | 127 |
+
+At 128 gMDS a bond, an hour's rewrite takes about 1,920 gMDS of the attacker's
+own bonds, and a day's at least 16,256 gMDS even with a hundred times the
+honest hashrate.
 
 Honest difficulty that rises more than a quarter within a week is credited
 late, alike on every branch that shares the window, so it never decides

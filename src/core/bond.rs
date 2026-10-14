@@ -39,8 +39,8 @@ const OP_CHECKTIMEVERIFY: u8 = 0x33;
 const MIDSTATE_V2_ACTIVATION_HEIGHT: u64 = 100_000;
 const MIDSTATE_V4_ACTIVATION_HEIGHT: u64 = 163_675;
 
-/// Smallest bond that grants eligibility, in midstate base units: 2^34
-/// (16 gMDS) on mainnet. A launch parameter, so a testnet can set it low
+/// Smallest bond that grants eligibility, in midstate base units: 2^37
+/// (128 gMDS) on mainnet. A launch parameter, so a testnet can set it low
 /// enough that testers risk nothing (`types::LAUNCH_MIN_MINING_BOND`).
 pub const MIN_MINING_BOND: u64 = super::types::LAUNCH_MIN_MINING_BOND;
 

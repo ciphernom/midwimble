@@ -8,7 +8,7 @@ block producer does on launch day, checking every step:
   2. Build       production midwimble, anchored to real Bitcoin and midstate
   3. Exit drill  lock a small coin in a bond script and spend it back, proving
                  your owner key opens the lock before real money goes behind it
-  4. Bond        lock 16 gMDS for the minimum term, on midstate mainnet
+  4. Bond        lock 128 gMDS for the minimum term, on midstate mainnet
   5. Register    prove the bond from your midstate node, then wait for a day of
                  work at the rehearsal difficulty (about 75 midstate blocks)
   6. Mine        a producer and a peer: block 1 registers the bond, every block
@@ -37,7 +37,7 @@ import urllib.request
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
 # Consensus values this plans around (src/core/bond.rs).
-MIN_MINING_BOND = 1 << 34  # 16 gMDS
+MIN_MINING_BOND = 1 << 37  # 128 gMDS
 MIN_REMAINING_BOND_LOCK = 43_200  # 30 days of midstate blocks
 CLOCK_MARGIN = 10_080  # 7 days
 MIDSTATE_GENESIS_TIMESTAMP = 1_772_274_770

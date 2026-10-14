@@ -170,9 +170,9 @@ def main() -> None:
                     help="share of midstate's hashrate expected to mine midwimble at launch "
                          "(default 0.25: bonded mining from block 1 means only MDS holders mine "
                          "at first)")
-    ap.add_argument("--min-bond", type=int, default=1 << 34,
+    ap.add_argument("--min-bond", type=int, default=1 << 37,
                     help="smallest mining bond, in midstate base units; a power of two "
-                         "(default 2^34 = 16 gMDS)")
+                         "(default 2^37 = 128 gMDS)")
     ap.add_argument("--bond-lock-days", type=int, default=30,
                     help="how long a bond must still be locked to mine (default 30)")
     ap.add_argument("--testnet", action="store_true",
@@ -186,7 +186,7 @@ def main() -> None:
     if a.testnet:
         if a.magic == "MIDWIMBLE_MAINNET_V1":
             a.magic = "MIDWIMBLE_TESTNET_V1"
-        if a.min_bond == 1 << 34:
+        if a.min_bond == 1 << 37:
             a.min_bond = 1 << 24
         if a.bond_lock_days == 30:
             a.bond_lock_days = 2
