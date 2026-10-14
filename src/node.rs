@@ -56,10 +56,10 @@ use crate::network::{Message, Network, NetworkEvent, MAX_GETBATCHES_COUNT, MAX_G
 use crate::storage::FinalityInfo;
 use crate::storage::Storage;
 use crate::sync::{
-    headers_work, verify_header_chain_with, BlockSync, Chunk, HeaderSync, InFlight, SyncSession,
-    SyncStats, BATCH_LOOKAHEAD_BLOCKS, BATCH_REQUEST_TIMEOUT_SECS, HEADERS_PER_REQUEST,
-    INITIAL_STEP_BACK, MAX_BATCH_REQUESTS_IN_FLIGHT, MAX_BUFFER_BYTES, MAX_QUEUED_HEADER_CHUNKS,
-    MAX_REORG_DEPTH, SYNC_TIMEOUT_SECS,
+    headers_work, verify_header_chain_with, BlockSync, Chunk, HeaderSync, InFlight, Judgement,
+    LighterChains, SyncSession, SyncStats, BATCH_LOOKAHEAD_BLOCKS, BATCH_REQUEST_TIMEOUT_SECS,
+    HEADERS_PER_REQUEST, INITIAL_STEP_BACK, MAX_BATCH_REQUESTS_IN_FLIGHT, MAX_BUFFER_BYTES,
+    MAX_QUEUED_HEADER_CHUNKS, MAX_REORG_DEPTH, SYNC_TIMEOUT_SECS,
 };
 use anyhow::{anyhow, Context as _, Result};
 use libp2p::identity::Keypair;
@@ -411,6 +411,9 @@ pub struct Node {
     sync: Option<SyncSession>,
     next_session_id: u64,
     sync_stats: SyncStats,
+    /// Peers whose chain was judged no heavier than ours, not to sync from
+    /// again until it could have caught up.
+    lighter: LighterChains,
     batch_sources: HashSet<PeerId>,
     miner: Miner,
     mined_rx: mpsc::UnboundedReceiver<MinedBlock>,
@@ -540,6 +543,7 @@ impl Node {
             sync: None,
             next_session_id: 1,
             sync_stats: SyncStats::default(),
+            lighter: LighterChains::default(),
             batch_sources: HashSet::new(),
             miner,
             mined_rx,
@@ -862,9 +866,13 @@ impl Node {
                 let info = self.state_info();
                 self.respond(channel, info);
             }
-            Message::StateInfo { height, depth, .. } => {
+            Message::StateInfo {
+                height,
+                depth,
+                mw_midstate,
+            } => {
                 self.ack(channel);
-                self.on_state_info(peer, height, depth);
+                self.on_state_info(peer, height, depth, mw_midstate);
             }
             Message::GetHeaders {
                 start_height,
@@ -1462,8 +1470,12 @@ impl Node {
 
     // ── Sync: sessions ──────────────────────────────────────────────────
 
-    fn on_state_info(&mut self, peer: PeerId, height: u64, depth: u128) {
+    fn on_state_info(&mut self, peer: PeerId, height: u64, depth: u128, tip: [u8; 32]) {
         self.peer_tips.insert(peer, (height, depth));
+        if tip == self.state.mw_midstate {
+            // On our chain now: whatever we judged of it before is moot.
+            self.lighter.forget(&peer);
+        }
         if let Some(s) = self.sync.as_mut() {
             if s.peer == peer {
                 s.peer_height = s.peer_height.max(height);
@@ -1473,9 +1485,21 @@ impl Node {
             self.schedule_batch_requests();
             return;
         }
-        if depth > self.state.depth {
-            self.start_sync(peer, height, depth, INITIAL_STEP_BACK, true);
+        if depth <= self.state.depth {
+            return;
         }
+        // Deeper is not heavier. A chain we already found no heavier than
+        // ours is not fetched and verified again until it could be.
+        let our_weight = self.state.weight();
+        if !self.lighter.worth_syncing(&peer, depth, tip, our_weight, Instant::now()) {
+            self.sync_stats.lighter_skipped += 1;
+            tracing::debug!(
+                "Not syncing from {}: its chain was no heavier than ours and cannot have caught up",
+                peer
+            );
+            return;
+        }
+        self.start_sync(peer, height, depth, INITIAL_STEP_BACK, true);
     }
 
     /// Verified headers on disk that extend our tip:
@@ -1555,6 +1579,7 @@ impl Node {
                     verified_to: last.height + 1,
                     their_work: work,
                     our_work: 0,
+                    fork_depth: self.state.depth,
                     queue: VecDeque::new(),
                     verifying: false,
                     next_fetch: last.height,
@@ -1582,6 +1607,7 @@ impl Node {
                     verified_to: start,
                     their_work: 0,
                     our_work: 0,
+                    fork_depth: 0,
                     queue: VecDeque::new(),
                     verifying: false,
                     next_fetch: start,
@@ -1605,6 +1631,7 @@ impl Node {
             peer,
             peer_height: height,
             peer_depth: depth,
+            claimed_depth: depth,
             step_back,
             last_progress: Instant::now(),
             headers,
@@ -1679,24 +1706,58 @@ impl Node {
     fn maybe_finish_sync(&mut self) {
         enum Verdict {
             Wait,
-            Abort(&'static str),
+            /// The peer's chain was no heavier than ours, and what it showed.
+            Abort(&'static str, PeerId, Judgement),
             Done(PeerId),
         }
+        let (our_depth, our_weight) = (self.state.depth, self.state.weight());
         let verdict = match self.sync.as_ref() {
             None => return,
             Some(s) => {
                 let h = &s.headers;
+                // The chain the peer served. A peer that announced more work
+                // than that is not heard again for a while.
+                let judged = |tip: Option<[u8; 32]>, depth: u128, deficit: u128| Judgement {
+                    tip,
+                    depth,
+                    deficit,
+                    our_weight,
+                    ignored: s.claimed_depth > depth,
+                };
+                let served_tip = h.tip.as_ref().map(|t| t.post_tx_midstate);
+                let served_depth = h.fork_depth.saturating_add(h.their_work);
                 if !(h.done && h.queue.is_empty() && !h.verifying && !h.fetch_in_flight) {
                     Verdict::Wait
                 } else {
                     match &s.blocks {
-                        None if h.fork.is_none() => Verdict::Abort("peer has nothing new"),
-                        None => Verdict::Abort("peer chain is not heavier"),
+                        // Its chain is part of ours.
+                        None if h.fork.is_none() => Verdict::Abort(
+                            "peer has nothing new",
+                            s.peer,
+                            judged(None, our_depth, 0),
+                        ),
+                        None => Verdict::Abort(
+                            "peer chain is not heavier",
+                            s.peer,
+                            judged(served_tip, served_depth, 0),
+                        ),
                         Some(b) if b.applying || b.rebuilding || b.cursor < h.verified_to => {
                             Verdict::Wait
                         }
                         Some(b) if !b.committed => {
-                            Verdict::Abort("downloaded chain did not end up heavier")
+                            let judgement = match &b.candidate {
+                                Some(c) => judged(
+                                    Some(c.mw_midstate),
+                                    c.depth,
+                                    our_weight.saturating_sub(c.weight()),
+                                ),
+                                None => judged(served_tip, served_depth, 0),
+                            };
+                            Verdict::Abort(
+                                "downloaded chain did not end up heavier",
+                                s.peer,
+                                judgement,
+                            )
                         }
                         Some(_) => Verdict::Done(s.peer),
                     }
@@ -1705,11 +1766,19 @@ impl Node {
         };
         match verdict {
             Verdict::Wait => {}
-            Verdict::Abort(reason) => {
+            Verdict::Abort(reason, peer, judgement) => {
+                self.lighter.judged(peer, judgement, Instant::now());
+                if judgement.ignored {
+                    tracing::info!(
+                        "{} announced more work than its chain has; not believing it for a while",
+                        peer
+                    );
+                }
                 let _ = self.storage.clear_sync_headers();
                 self.abort_sync(reason);
             }
             Verdict::Done(peer) => {
+                self.lighter.forget(&peer);
                 tracing::info!(
                     "Sync with {} complete at height {}",
                     peer,
@@ -1767,7 +1836,12 @@ impl Node {
                 self.maybe_finish_sync();
             }
             HeaderStep::Ban(reason) => self.ban_peer(peer, reason),
-            HeaderStep::Abort(reason) => self.abort_sync(reason),
+            HeaderStep::Abort(reason) => {
+                // It served no chain we could adopt: asking again soon would
+                // only repeat the work.
+                self.lighter.judged(peer, Judgement::ignored(), Instant::now());
+                self.abort_sync(reason)
+            }
             HeaderStep::Restart {
                 step_back: new_step,
                 allow_resume,
@@ -1943,11 +2017,15 @@ impl Node {
                     s.headers.verified_to = last_height;
                     if last_height >= our_len {
                         s.headers.fork = Some(our_len);
+                        s.headers.fork_depth = self.state.depth;
                     }
                     Vec::new()
                 }
                 Some(fork) => {
                     if our_len - fork > MAX_REORG_DEPTH || fork < self.finality.floor() {
+                        // A chain we can never adopt, and it only falls
+                        // further behind as ours grows.
+                        self.lighter.judged(s.peer, Judgement::ignored(), Instant::now());
                         self.sync = Some(s);
                         let _ = self.storage.clear_sync_headers();
                         self.abort_sync(
@@ -1969,6 +2047,7 @@ impl Node {
                             .load_headers(fork, our_len - fork)
                             .unwrap_or_default(),
                     );
+                    s.headers.fork_depth = self.state.depth.saturating_sub(s.headers.our_work);
                     chunk.into_iter().filter(|x| x.height >= fork).collect()
                 }
             }
