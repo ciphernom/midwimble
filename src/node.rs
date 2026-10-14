@@ -56,9 +56,10 @@ use crate::network::{Message, Network, NetworkEvent, MAX_GETBATCHES_COUNT, MAX_G
 use crate::storage::FinalityInfo;
 use crate::storage::Storage;
 use crate::sync::{
-    headers_work, verify_header_chain, BlockSync, Chunk, HeaderSync, InFlight, SyncSession,
-    SyncStats, BATCH_LOOKAHEAD_BLOCKS, BATCH_REQUEST_TIMEOUT_SECS, INITIAL_STEP_BACK,
-    MAX_BATCH_REQUESTS_IN_FLIGHT, MAX_BUFFER_BYTES, MAX_QUEUED_HEADER_CHUNKS, MAX_REORG_DEPTH,
+    headers_work, verify_header_chain_with, BlockSync, Chunk, HeaderSync, InFlight, SyncSession,
+    SyncStats, BATCH_LOOKAHEAD_BLOCKS, BATCH_REQUEST_TIMEOUT_SECS, HEADERS_PER_REQUEST,
+    INITIAL_STEP_BACK, MAX_BATCH_REQUESTS_IN_FLIGHT, MAX_BUFFER_BYTES, MAX_QUEUED_HEADER_CHUNKS,
+    MAX_REORG_DEPTH, SYNC_TIMEOUT_SECS,
 };
 use anyhow::{anyhow, Context as _, Result};
 use libp2p::identity::Keypair;
@@ -116,6 +117,13 @@ pub struct NodeConfig {
     /// The mining bond this node signs its templates with (`core/bond.rs`).
     /// Required to mine from `bond::BONDED_MINING_FROM`.
     pub mining_bond: Option<crate::core::bond::MinerBond>,
+    /// A sync session whose peer sends nothing for this long is dropped.
+    /// Time this node spends verifying and applying does not count.
+    pub sync_timeout: Duration,
+    /// Test builds only: extra time each synced header takes to verify,
+    /// standing in for a slow machine.
+    #[cfg(feature = "fast-mining")]
+    pub header_verify_delay: Duration,
 }
 
 impl NodeConfig {
@@ -137,6 +145,9 @@ impl NodeConfig {
             anchors_file: None,
             checkpoint: None,
             bootstrap_timeout: Duration::from_secs(600),
+            sync_timeout: Duration::from_secs(SYNC_TIMEOUT_SECS),
+            #[cfg(feature = "fast-mining")]
+            header_verify_delay: Duration::ZERO,
         }
     }
 }
@@ -1598,6 +1609,7 @@ impl Node {
             last_progress: Instant::now(),
             headers,
             blocks: None,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         self.miner.stop();
         self.request_headers();
@@ -1640,7 +1652,7 @@ impl Node {
 
     fn check_sync_timeouts(&mut self) {
         let Some(s) = self.sync.as_mut() else { return };
-        if s.timed_out() {
+        if s.timed_out(self.config.sync_timeout) {
             self.abort_sync("timed out");
             return;
         }
@@ -1730,7 +1742,7 @@ impl Node {
             peer,
             Message::GetHeaders {
                 start_height: start,
-                count: MAX_GETHEADERS_COUNT,
+                count: HEADERS_PER_REQUEST,
             },
         );
     }
@@ -1769,7 +1781,7 @@ impl Node {
     /// Checks a header chunk's labels and linkage and queues it for
     /// verification.
     fn examine_headers(&mut self, s: &mut SyncSession, mut chunk: Vec<BatchHeader>) -> HeaderStep {
-        let full = chunk.len() as u64 == MAX_GETHEADERS_COUNT;
+        let full = chunk.len() as u64 == HEADERS_PER_REQUEST;
         let h = &mut s.headers;
         if let Some(expected) = h.expect_overlap.take() {
             // Resuming: the peer must still have the last header we verified.
@@ -1859,9 +1871,15 @@ impl Node {
         s.headers.verifying = true;
         let prior: Vec<u64> = s.headers.window.iter().copied().collect();
         let deferred = s.headers.fetch_deferred;
-        let (id, tx) = (s.id, self.internal_tx.clone());
+        let (id, tx, cancel) = (s.id, self.internal_tx.clone(), s.cancel.clone());
+        #[cfg(feature = "fast-mining")]
+        let delay = self.config.header_verify_delay;
         tokio::task::spawn_blocking(move || {
-            let result = verify_header_chain(&chunk, &prior, true);
+            let result = verify_header_chain_with(&chunk, &prior, true, |_headers| {
+                #[cfg(feature = "fast-mining")]
+                std::thread::sleep(delay * _headers as u32);
+                !cancel.load(std::sync::atomic::Ordering::Relaxed)
+            });
             let _ = tx.send(Internal::HeadersVerified {
                 session: id,
                 chunk,
@@ -2028,6 +2046,7 @@ impl Node {
         }
         match result {
             Ok(state) => {
+                s.last_progress = Instant::now();
                 if let Some(b) = s.blocks.as_mut() {
                     b.rebuilding = false;
                     b.candidate = Some(state);
@@ -2183,7 +2202,7 @@ impl Node {
 
     fn try_apply_next(&mut self) {
         let Some(s) = self.sync.as_mut() else { return };
-        let id = s.id;
+        let (id, cancel) = (s.id, s.cancel.clone());
         let Some(b) = s.blocks.as_mut() else { return };
         if b.applying || b.candidate.is_none() {
             return;
@@ -2218,6 +2237,10 @@ impl Node {
             let mut applied = Vec::new();
             let mut error = None;
             for (batch, header) in chunk.batches.into_iter().zip(chunk.headers) {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    error = Some("sync session ended".into());
+                    break;
+                }
                 if let Err(e) = apply_batch_skip_pow(
                     &mut state,
                     &batch,
@@ -2271,8 +2294,8 @@ impl Node {
             let first = b.cursor;
             b.cursor += applied.len() as u64;
             b.timestamps = new_ts.clone();
+            s.last_progress = Instant::now();
             if !applied.is_empty() {
-                s.last_progress = Instant::now();
                 self.sync_stats.batch_chunks_applied += 1;
                 self.batch_sources.insert(source);
             }

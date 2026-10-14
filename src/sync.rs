@@ -6,6 +6,13 @@
 //! walks `Headers → Batches`. Midstate's pipelined rebuild, prefetch buffers
 //! and on-disk resume are left out; the session here is the simple core of
 //! that design, and the node drives it (see `node.rs`).
+//!
+//! A session is dropped when its peer goes quiet, but never for the time
+//! this node spends on its own work: a header's proof of work is a million
+//! sequential hashes, so a chunk of headers can take minutes to verify on a
+//! one-core machine, and that machine must still be able to sync
+//! ([`SyncSession::timed_out`]). A dropped session stops its background
+//! work, so retries do not pile up on the CPU.
 
 use crate::core::simd_mining::{pow_seed, verify_pow_batch};
 use crate::core::state::{calculate_target, calculate_work, current_timestamp, validate_timestamp};
@@ -15,9 +22,23 @@ use anyhow::{bail, Result};
 use libp2p::PeerId;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+/// A session whose peer sends nothing for this long is dropped (the default
+/// for `NodeConfig::sync_timeout`). Our own work does not count.
 pub const SYNC_TIMEOUT_SECS: u64 = 45;
+/// The longest our own work on a session may run before the session is
+/// dropped anyway: verifying one header chunk, deriving the fork state, or
+/// applying one chunk of blocks. That work is bounded and takes well under
+/// this even on slow hardware, so only a stuck task should reach it.
+pub const LOCAL_WORK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Headers asked for at a time. A chunk is verified in one go, so this also
+/// bounds that work (about 25 s on one core with AVX2) and what a session
+/// that ends early throws away. Peers serve any count up to
+/// `MAX_GETHEADERS_COUNT`.
+pub const HEADERS_PER_REQUEST: u64 = 1_000;
 /// Refuse to reorganise away more than this many blocks.
 pub const MAX_REORG_DEPTH: u64 = 1_000;
 /// How far below our tip a new session starts asking for headers.
@@ -33,6 +54,18 @@ pub fn verify_header_chain(
     headers: &[BatchHeader],
     prior_timestamps: &[u64],
     check_pow: bool,
+) -> Result<()> {
+    verify_header_chain_with(headers, prior_timestamps, check_pow, |_| true)
+}
+
+/// [`verify_header_chain`], checking proof of work a piece at a time. Before
+/// each piece, `proceed` is told how many headers it holds; returning `false`
+/// abandons the verification, which then fails.
+pub fn verify_header_chain_with(
+    headers: &[BatchHeader],
+    prior_timestamps: &[u64],
+    check_pow: bool,
+    mut proceed: impl FnMut(usize) -> bool,
 ) -> Result<()> {
     let Some(first) = headers.first() else {
         return Ok(());
@@ -109,17 +142,25 @@ pub fn verify_header_chain(
                 }
             }
         }
-        let bad = jobs.par_chunks(lanes).find_map_any(|chunk| {
-            let seeds: Vec<[u8; 32]> = chunk.iter().map(|j| j.1).collect();
-            let finals = verify_pow_batch(&seeds);
-            chunk
-                .iter()
-                .zip(finals)
-                .find(|(j, f)| *f != j.2)
-                .map(|(j, _)| j.0)
-        });
-        if let Some(height) = bad {
-            bail!("proof of work invalid at height {}", height);
+        // Pieces wide enough to keep every thread busy, small enough that an
+        // abandoned verification stops within seconds.
+        let piece = (lanes * rayon::current_num_threads() * 4).max(128);
+        for piece in jobs.chunks(piece) {
+            if !proceed(piece.len()) {
+                bail!("header verification abandoned");
+            }
+            let bad = piece.par_chunks(lanes).find_map_any(|chunk| {
+                let seeds: Vec<[u8; 32]> = chunk.iter().map(|j| j.1).collect();
+                let finals = verify_pow_batch(&seeds);
+                chunk
+                    .iter()
+                    .zip(finals)
+                    .find(|(j, f)| *f != j.2)
+                    .map(|(j, _)| j.0)
+            });
+            if let Some(height) = bad {
+                bail!("proof of work invalid at height {}", height);
+            }
         }
     }
     Ok(())
@@ -238,15 +279,47 @@ pub struct SyncSession {
     pub peer_height: u64,
     pub peer_depth: u128,
     pub step_back: u64,
+    /// When the peer last sent something useful, or our own work on the
+    /// session last finished.
     pub last_progress: Instant,
     pub headers: HeaderSync,
     /// Starts once verified headers outweigh our chain from the fork.
     pub blocks: Option<BlockSync>,
+    /// Set when the session ends, however it ends, so that its background
+    /// work stops instead of competing with the next session's.
+    pub cancel: Arc<AtomicBool>,
 }
 
 impl SyncSession {
-    pub fn timed_out(&self) -> bool {
-        self.last_progress.elapsed().as_secs() > SYNC_TIMEOUT_SECS
+    /// Whether to drop the session: its peer has sent nothing for `idle`.
+    ///
+    /// Time spent on our own work does not count against the peer: a header
+    /// chunk can take minutes to verify on one core, and timing out partway
+    /// through would restart the same chunk forever. That work has its own,
+    /// much longer limit ([`LOCAL_WORK_TIMEOUT`]) in case a task is stuck.
+    pub fn timed_out(&self, idle: Duration) -> bool {
+        let limit = if self.busy() {
+            LOCAL_WORK_TIMEOUT
+        } else {
+            idle
+        };
+        self.last_progress.elapsed() > limit
+    }
+
+    /// Whether this node is working on the session: verifying headers,
+    /// deriving the fork state or applying blocks.
+    pub fn busy(&self) -> bool {
+        self.headers.verifying
+            || self
+                .blocks
+                .as_ref()
+                .is_some_and(|b| b.applying || b.rebuilding)
+    }
+}
+
+impl Drop for SyncSession {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
     }
 }
 
@@ -312,5 +385,79 @@ mod tests {
         let mut easier = hs.clone();
         easier[2].target = [0x01; 32];
         assert!(verify_header_chain(&easier, &[], false).is_err());
+    }
+
+    #[test]
+    fn verification_reports_its_pieces_and_can_be_abandoned() {
+        let hs = headers(6);
+        let mut seen = 0;
+        verify_header_chain_with(&hs, &[], true, |n| {
+            seen += n;
+            true
+        })
+        .unwrap();
+        assert_eq!(seen, 6, "every header but genesis goes through a piece");
+        let err = verify_header_chain_with(&hs, &[], true, |_| false).unwrap_err();
+        assert!(err.to_string().contains("abandoned"), "{err:#}");
+    }
+
+    fn session(verifying: bool, blocks: Option<BlockSync>, quiet_for: Duration) -> SyncSession {
+        SyncSession {
+            id: 1,
+            peer: PeerId::random(),
+            peer_height: 100,
+            peer_depth: 100,
+            step_back: INITIAL_STEP_BACK,
+            last_progress: Instant::now() - quiet_for,
+            headers: HeaderSync {
+                start: 0,
+                fork: None,
+                tip: None,
+                window: VecDeque::new(),
+                verified_to: 0,
+                their_work: 0,
+                our_work: 0,
+                queue: VecDeque::new(),
+                verifying,
+                next_fetch: 0,
+                fetch_in_flight: false,
+                fetch_deferred: false,
+                done: false,
+                expect_overlap: None,
+                resumed: false,
+            },
+            blocks,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn our_own_slow_work_does_not_time_out_a_session() {
+        let idle = Duration::from_secs(SYNC_TIMEOUT_SECS);
+        let minute = Duration::from_secs(60);
+        // A quiet peer is dropped.
+        assert!(session(false, None, minute).timed_out(idle));
+        assert!(!session(false, None, Duration::ZERO).timed_out(idle));
+        // A minute spent verifying headers, applying blocks or deriving the
+        // fork state is ours, not the peer's.
+        assert!(!session(true, None, minute).timed_out(idle));
+        let mut applying = BlockSync::new(0, VecDeque::new(), true);
+        applying.applying = true;
+        assert!(!session(false, Some(applying), minute).timed_out(idle));
+        let mut rebuilding = BlockSync::new(0, VecDeque::new(), false);
+        rebuilding.rebuilding = true;
+        assert!(!session(false, Some(rebuilding), minute).timed_out(idle));
+        // A stuck task still ends the session eventually.
+        let stuck = LOCAL_WORK_TIMEOUT + minute;
+        assert!(session(true, None, stuck).timed_out(idle));
+    }
+
+    #[test]
+    fn a_dropped_session_cancels_its_work() {
+        let s = session(true, None, Duration::ZERO);
+        let cancel = s.cancel.clone();
+        assert!(!cancel.load(Ordering::Relaxed));
+        drop(s);
+        assert!(cancel.load(Ordering::Relaxed));
     }
 }

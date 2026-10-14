@@ -45,6 +45,21 @@ impl TestNode {
         reuse: Option<std::sync::Arc<tempfile::TempDir>>,
         batch_bytes: Option<usize>,
     ) -> Self {
+        Self::start_tuned(mine_to, peers, pace, reuse, |config| {
+            if let Some(bytes) = batch_bytes {
+                config.batch_response_bytes = bytes;
+            }
+        })
+        .await
+    }
+
+    async fn start_tuned(
+        mine_to: Option<StealthAddress>,
+        peers: Vec<String>,
+        pace: Duration,
+        reuse: Option<std::sync::Arc<tempfile::TempDir>>,
+        tune: impl FnOnce(&mut NodeConfig),
+    ) -> Self {
         init_logging();
         let dir = reuse.unwrap_or_else(|| std::sync::Arc::new(tempfile::tempdir().unwrap()));
         let mut config = NodeConfig::new(dir.path(), "/ip4/127.0.0.1/tcp/0".parse().unwrap());
@@ -54,9 +69,7 @@ impl TestNode {
         config.poll_interval = Duration::from_millis(500);
         config.stem_timeout = Duration::from_secs(1);
         config.min_block_interval = pace;
-        if let Some(bytes) = batch_bytes {
-            config.batch_response_bytes = bytes;
-        }
+        tune(&mut config);
         let (node, handle) = Node::new(config).await.unwrap();
         let task = tokio::spawn(node.run());
         Self { handle, dir, task }
@@ -236,6 +249,36 @@ async fn late_joiner_syncs_headers_first_and_survives_restart() {
     assert_eq!(d2.handle.state().state_root(), sa.state_root());
 
     d2.stop().await;
+    a.stop().await;
+}
+
+/// A node that takes longer to verify a header chunk than its peers get to go
+/// quiet still syncs: verifying is its own work, not a silent peer. It used
+/// to time out partway through every chunk and start the same chunk again,
+/// forever, which is what a one-core seed did on the testnet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_verifier_still_syncs() {
+    let miner = WalletKeys::random();
+    let a = TestNode::start_with(Some(miner.address()), vec![], Duration::ZERO, None).await;
+    wait_until("A to mine 40 blocks", 120, || a.height() > 40).await;
+    a.handle.set_mining(None);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let tip = a.tip();
+
+    // D needs about 4 s to verify A's headers, and drops a quiet peer after 2.
+    let peers = vec![a.dial_addr().await];
+    let d = TestNode::start_tuned(None, peers, Duration::from_millis(250), None, |config| {
+        config.sync_timeout = Duration::from_secs(2);
+        config.header_verify_delay = Duration::from_millis(100);
+    })
+    .await;
+    wait_until("D to sync", 60, || d.tip() == tip).await;
+    let stats = d.stats();
+    assert_eq!(stats.sessions, 1, "the session never timed out: {stats:?}");
+    assert!(stats.header_chunks_verified >= 1, "{stats:?}");
+    d.handle.state().verify_supply().unwrap();
+
+    d.stop().await;
     a.stop().await;
 }
 
