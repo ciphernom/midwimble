@@ -297,7 +297,7 @@ fn broken_binding_cannot_inflate_a_claim() {
         kernel_excess_sum: IDENTITY,
         total_kernel_offset: [0; 32],
         supply: 1_000_000_000,
-        bonds_root: midwimble::core::types::bonds_root(&Default::default()),
+        bonds_root: midwimble::core::bond::BondSet::default().root(),
     };
     let checkpoint = Checkpoint {
         version: 1,

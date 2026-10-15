@@ -101,7 +101,8 @@ fn next_halving(height: u64) -> Option<u64> {
     (crate::core::types::block_reward(next) > 0).then_some(next)
 }
 
-/// The registered mining bonds, and whether each could authorise a block now.
+/// The registered mining bonds that can still sign (expired ones leave the
+/// set), and whether each could authorise a block now.
 async fn bonds(AxState(node): AxState<NodeHandle>) -> Json<Value> {
     let state = node.state();
     let now = std::time::SystemTime::now()

@@ -670,6 +670,91 @@ impl TestChain {
     fn make_bonded_block(&self, bond: &MinerBond, payout: &StealthAddress) -> Result<Batch> {
         Ok(self.bonded_template(bond, payout)?.mine_blocking())
     }
+
+    fn bonded_block_at(
+        &self,
+        bond: &MinerBond,
+        payout: &StealthAddress,
+        timestamp: u64,
+    ) -> Result<Batch> {
+        Ok(build_template_bonded(
+            &self.state,
+            &self.timestamps,
+            &[],
+            &[(*payout, 1u64)],
+            [0u8; 32],
+            Some(timestamp),
+            Some(bond),
+        )?
+        .0
+        .mine_blocking())
+    }
+}
+
+/// A bond whose lock has run down leaves the set, and with it the state
+/// root, at the first block whose earliest possible timestamp it cannot sign
+/// at. Templates and validation agree on it, the diff says so, and the bond
+/// cannot be registered again.
+#[test]
+fn expired_bonds_leave_the_bond_set() {
+    let mut chain = TestChain::new();
+    let payout = TestWallet::new().address();
+    let t0 = now();
+    let lasting = bonded_miner(&chain, b"lasting", locked_long());
+    // Eligible for blocks stamped up to about t0 + 300.
+    let brief = bonded_miner(
+        &chain,
+        b"brief",
+        est_midstate_height(t0 + 300) + MIN_REMAINING_BOND_LOCK,
+    );
+    chain
+        .apply(chain.bonded_block_at(&lasting, &payout, t0 + 60).unwrap())
+        .unwrap();
+    chain
+        .apply(chain.bonded_block_at(&brief, &payout, t0 + 120).unwrap())
+        .unwrap();
+    assert_eq!(
+        chain.state.effects.bonds_added,
+        vec![(brief.bond_id, brief.registration.as_ref().unwrap().entry())]
+    );
+    chain
+        .apply(chain.bonded_block_at(&lasting, &payout, t0 + 240).unwrap())
+        .unwrap();
+    chain
+        .apply(chain.bonded_block_at(&lasting, &payout, t0 + 400).unwrap())
+        .unwrap();
+    assert!(
+        chain.state.bonds.contains_key(&brief.bond_id),
+        "still eligible at t0 + 241, the earliest that block could carry"
+    );
+    assert!(chain.state.effects.bonds_removed.is_empty());
+
+    // The next block cannot be stamped before t0 + 401: the bond is gone.
+    let root_before = chain.state.bonds.root();
+    chain
+        .apply(chain.bonded_block_at(&lasting, &payout, t0 + 500).unwrap())
+        .unwrap();
+    assert!(!chain.state.bonds.contains_key(&brief.bond_id));
+    assert!(chain.state.bonds.contains_key(&lasting.bond_id));
+    let removed: Vec<[u8; 32]> = chain
+        .state
+        .effects
+        .bonds_removed
+        .iter()
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(removed, vec![brief.bond_id]);
+    assert_ne!(chain.state.bonds.root(), root_before);
+    assert_eq!(
+        chain.state.root_parts().bonds_root,
+        chain.state.bonds.root()
+    );
+
+    // It cannot sign, and it cannot come back.
+    let err = chain
+        .bonded_block_at(&brief, &payout, t0 + 600)
+        .unwrap_err();
+    assert!(err.to_string().contains("not eligible"), "{err}");
 }
 
 #[test]
@@ -684,13 +769,19 @@ fn a_bonded_miner_registers_in_its_first_block_and_mines_on() {
     assert_eq!(first.registrations.len(), 1);
     assert_eq!(first.miner.as_ref().unwrap().bond_id, bond.bond_id);
     chain.apply(first).unwrap();
-    assert_eq!(chain.state.bonds[&bond.bond_id].mining_key, bond.mining_key());
+    assert_eq!(
+        chain.state.bonds.get(&bond.bond_id).unwrap().mining_key,
+        bond.mining_key()
+    );
 
     // After that the chain has it, and blocks carry only the signature.
     let second = chain.make_bonded_block(&bond, &payout).unwrap();
     assert!(second.registrations.is_empty());
     chain.apply(second).unwrap();
-    assert_eq!(chain.state.root_parts().bonds_root, bonds_root(&chain.state.bonds));
+    assert_eq!(
+        chain.state.root_parts().bonds_root,
+        chain.state.bonds.root()
+    );
 }
 
 #[test]

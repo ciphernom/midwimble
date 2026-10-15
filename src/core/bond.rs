@@ -18,7 +18,7 @@
 
 use super::anchor::{header_pow_ok, HeaderLink};
 use super::auxpow::midstate_coin_id;
-use super::mmr::{verify_utxo_proof, UtxoProof};
+use super::mmr::{verify_utxo_proof, UtxoAccumulator, UtxoProof};
 use super::state::calculate_work;
 use super::mw::crypto::{schnorr_sign, schnorr_verify, SchnorrSig};
 use super::types::{
@@ -429,6 +429,142 @@ impl BondEntry {
     }
 }
 
+/// The leaf a bond contributes to the bond set's commitment: every field of
+/// its entry, under its id.
+pub fn bond_leaf(id: &[u8; 32], entry: &BondEntry) -> [u8; 32] {
+    hash_domain(
+        b"midwimble.bond-leaf.v1",
+        &[
+            id,
+            &entry.mining_key,
+            &entry.value.to_le_bytes(),
+            &entry.bonded_until.to_le_bytes(),
+        ],
+    )
+}
+
+/// The registered bonds, by bond id, with a sparse Merkle commitment kept up
+/// to date as bonds come and go, so the state root never re-sorts the set.
+///
+/// The set holds only bonds that can still authorise a block: before each
+/// block is applied, bonds no longer eligible at the earliest timestamp it
+/// (or any later block) may carry are removed ([`BondSet::prune_expired`]).
+/// Serialised as its entries alone; the commitment is rebuilt on load.
+#[derive(Clone, Debug, Default)]
+pub struct BondSet {
+    entries: im::HashMap<[u8; 32], BondEntry>,
+    leaves: UtxoAccumulator,
+}
+
+impl PartialEq for BondSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Eq for BondSet {}
+
+impl Serialize for BondSet {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut entries: Vec<(&[u8; 32], &BondEntry)> = self.entries.iter().collect();
+        entries.sort_by_key(|(id, _)| **id);
+        entries.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for BondSet {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let entries = Vec::<([u8; 32], BondEntry)>::deserialize(d)?;
+        let len = entries.len();
+        let set: BondSet = entries.into_iter().collect();
+        if set.len() != len {
+            return Err(serde::de::Error::custom("duplicate bond id"));
+        }
+        Ok(set)
+    }
+}
+
+impl FromIterator<([u8; 32], BondEntry)> for BondSet {
+    fn from_iter<I: IntoIterator<Item = ([u8; 32], BondEntry)>>(iter: I) -> Self {
+        let mut set = BondSet::default();
+        for (id, entry) in iter {
+            set.insert(id, entry);
+        }
+        set
+    }
+}
+
+impl BondSet {
+    pub fn get(&self, id: &[u8; 32]) -> Option<&BondEntry> {
+        self.entries.get(id)
+    }
+
+    pub fn contains_key(&self, id: &[u8; 32]) -> bool {
+        self.entries.contains_key(id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8; 32], &BondEntry)> {
+        self.entries.iter()
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self.entries.keys()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &BondEntry> {
+        self.entries.values()
+    }
+
+    /// Adds or replaces a bond, returning the entry it replaced.
+    pub fn insert(&mut self, id: [u8; 32], entry: BondEntry) -> Option<BondEntry> {
+        let old = self.entries.insert(id, entry);
+        if let Some(old) = &old {
+            self.leaves.remove(&bond_leaf(&id, old), true);
+        }
+        self.leaves.insert(bond_leaf(&id, &entry), true);
+        old
+    }
+
+    pub fn remove(&mut self, id: &[u8; 32]) -> Option<BondEntry> {
+        let old = self.entries.remove(id)?;
+        self.leaves.remove(&bond_leaf(id, &old), true);
+        Some(old)
+    }
+
+    /// The commitment the state root carries.
+    pub fn root(&self) -> [u8; 32] {
+        self.leaves.root(true)
+    }
+
+    /// Removes every bond that is not eligible at `earliest_timestamp`, the
+    /// smallest timestamp the next block may carry, and returns them in id
+    /// order. Timestamps must exceed the median of the last eleven, and that
+    /// median never falls, so no later block on this chain could be
+    /// authorised by them either: removing them changes nothing but the size
+    /// of the set.
+    pub fn prune_expired(&mut self, earliest_timestamp: u64) -> Vec<([u8; 32], BondEntry)> {
+        let mut expired: Vec<([u8; 32], BondEntry)> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| !e.eligible_at(earliest_timestamp))
+            .map(|(id, e)| (*id, *e))
+            .collect();
+        expired.sort_by_key(|(id, _)| *id);
+        for (id, _) in &expired {
+            self.remove(id);
+        }
+        expired
+    }
+}
+
 impl BondRegistration {
     /// The bond's id: its midstate coin id.
     pub fn bond_id(&self) -> [u8; 32] {
@@ -493,7 +629,7 @@ pub fn authorization_message(prev_midstate: &[u8; 32], batch: &Batch) -> [u8; 32
 /// Checks `batch`'s authorisation against the bond set, which already
 /// includes any registration the block itself carries.
 pub fn check_miner_authorization(
-    bonds: &im::HashMap<[u8; 32], BondEntry>,
+    bonds: &BondSet,
     prev_midstate: &[u8; 32],
     batch: &Batch,
 ) -> Result<()> {
@@ -555,7 +691,7 @@ impl MinerBond {
     /// quota left (`signer_cap`), the producer's own on ties.
     pub fn choose_signer(
         &self,
-        bonds: &im::HashMap<[u8; 32], BondEntry>,
+        bonds: &BondSet,
         counts: &im::HashMap<[u8; 32], u32>,
         block_timestamp: u64,
     ) -> [u8; 32] {
@@ -846,7 +982,7 @@ pub const MAX_BOND_HORIZON: u64 = 365 * 24 * 60;
 /// the bonds eligible at `block_timestamp`, never below `1 / CAP_K`. Counting
 /// registered bonds rather than recent signers keeps an attacker's private
 /// chain, where only the attacker signs, under the same cap.
-pub fn signer_cap(bonds: &im::HashMap<[u8; 32], BondEntry>, block_timestamp: u64) -> usize {
+pub fn signer_cap(bonds: &BondSet, block_timestamp: u64) -> usize {
     let eligible = bonds.values().filter(|e| e.eligible_at(block_timestamp)).count();
     CAP_WINDOW.div_ceil(eligible.clamp(1, CAP_K))
 }
@@ -909,7 +1045,7 @@ pub fn cap_work(floor: &mut im::Vector<(u64, u128)>, height: u64, work: u128) ->
 pub fn credit_in_window(
     recent: &mut im::Vector<Option<[u8; 32]>>,
     counts: &mut im::HashMap<[u8; 32], u32>,
-    bonds: &im::HashMap<[u8; 32], BondEntry>,
+    bonds: &BondSet,
     signer: Option<[u8; 32]>,
     work: u128,
     block_timestamp: u64,
@@ -978,9 +1114,11 @@ pub fn rebuild_work_floor(
 
 /// The cheap, stateful checks on a block's registrations, run before any
 /// header's proof of work: not already registered, at least the minimum bond,
-/// and locked no further out than `MAX_BOND_HORIZON`.
+/// eligible at the block's time (a bond that could never sign is not worth
+/// the space, and one already pruned could otherwise come back), and locked
+/// no further out than `MAX_BOND_HORIZON`.
 pub fn precheck_registrations(
-    bonds: &im::HashMap<[u8; 32], BondEntry>,
+    bonds: &BondSet,
     registrations: &[BondRegistration],
     block_timestamp: u64,
 ) -> Result<()> {
@@ -1007,6 +1145,12 @@ pub fn precheck_registrations(
                 horizon
             );
         }
+        if !entry.eligible_at(block_timestamp) {
+            bail!(
+                "bond {} is not eligible at this block's time: its lock ends too soon",
+                hex::encode(id)
+            );
+        }
     }
     Ok(())
 }
@@ -1028,7 +1172,7 @@ mod cap_tests {
 
     #[test]
     fn cap_is_an_equal_share_never_below_one_kth() {
-        let mut bonds = im::HashMap::new();
+        let mut bonds = BondSet::default();
         assert_eq!(signer_cap(&bonds, 0), CAP_WINDOW, "a lone producer is uncapped");
         for i in 0..3 {
             bonds.insert(bond_id(i), eligible_bond());
@@ -1041,7 +1185,7 @@ mod cap_tests {
         assert_eq!(CAP_WINDOW % CAP_K, 0, "K divides the window, so the cap is exact");
 
         // Expired and undersized bonds do not dilute the cap.
-        let mut few = im::HashMap::new();
+        let mut few = BondSet::default();
         few.insert([1; 32], eligible_bond());
         few.insert([2; 32], BondEntry { bonded_until: 0, ..eligible_bond() });
         few.insert([3; 32], BondEntry { value: MIN_MINING_BOND / 2, ..eligible_bond() });
@@ -1199,6 +1343,108 @@ mod cap_tests {
         assert!(bonded.weight() > honest_day.weight(), "more full-weight blocks still win");
     }
 
+    /// The commitment depends on the set alone, however it was reached, and
+    /// pruning removes exactly the bonds that can no longer sign.
+    #[test]
+    fn the_bond_set_commits_to_its_entries_and_prunes_expired_bonds() {
+        let t = 1_800_000_000;
+        let lasting = |i: usize| {
+            (
+                bond_id(i),
+                BondEntry {
+                    bonded_until: u64::MAX,
+                    ..eligible_bond()
+                },
+            )
+        };
+        let ending = |i: usize, until: u64| {
+            (
+                bond_id(i),
+                BondEntry {
+                    bonded_until: until,
+                    ..eligible_bond()
+                },
+            )
+        };
+        let edge = est_midstate_height(t) + MIN_REMAINING_BOND_LOCK;
+        let mut set: BondSet = (0..20).map(lasting).collect();
+        let reversed: BondSet = (0..20).rev().map(lasting).collect();
+        assert_eq!(set.root(), reversed.root());
+        let before = set.root();
+        set.insert(ending(100, edge).0, ending(100, edge).1);
+        set.insert(ending(101, edge - 1).0, ending(101, edge - 1).1);
+        assert_ne!(set.root(), before);
+        // Replacing an entry replaces its leaf.
+        let mut replaced = set.clone();
+        replaced.insert(
+            bond_id(0),
+            BondEntry {
+                value: MIN_MINING_BOND * 2,
+                ..eligible_bond()
+            },
+        );
+        assert_ne!(replaced.root(), set.root());
+        replaced.insert(bond_id(0), lasting(0).1);
+        assert_eq!(replaced.root(), set.root());
+
+        // At `t` the bond ending at the edge still signs; the one before it
+        // cannot, now or ever again.
+        let pruned = set.prune_expired(t);
+        assert_eq!(pruned, vec![ending(101, edge - 1)]);
+        assert!(set.contains_key(&bond_id(100)));
+        let pruned = set.prune_expired(t + 60);
+        assert_eq!(pruned, vec![ending(100, edge)]);
+        assert_eq!(set.len(), 20);
+        assert_eq!(
+            set.root(),
+            reversed.root(),
+            "back to the lasting bonds alone"
+        );
+
+        // Round trip: entries only, commitment rebuilt.
+        let bytes = bincode::serialize(&set).unwrap();
+        let back: BondSet = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back, set);
+        assert_eq!(back.root(), set.root());
+        let twice = bincode::serialize(&vec![lasting(1), lasting(1)]).unwrap();
+        assert!(bincode::deserialize::<BondSet>(&twice).is_err());
+    }
+
+    #[test]
+    fn registrations_must_be_eligible_when_made() {
+        let t = 1_800_000_000;
+        let reg = |until: u64| BondRegistration {
+            proof: BondProof {
+                coin: BondCoin {
+                    script: BondScript {
+                        mining_key: [1; 32],
+                        bonded_until: until,
+                        owner_pk: [2; 32],
+                    },
+                    value: MIN_MINING_BOND,
+                    salt: [3; 32],
+                },
+                midstate_height: 300_000,
+                roots: MidstateRoots {
+                    coins: [0; 32],
+                    commitments: [0; 32],
+                    chain_mmr: [0; 32],
+                    burned_wots: None,
+                },
+                smt: UtxoAccumulator::from_set([[0; 32]], true)
+                    .prove(&[0; 32], true)
+                    .unwrap(),
+            },
+            prev_header_hash: [0; 32],
+            headers: vec![],
+        };
+        let edge = est_midstate_height(t) + MIN_REMAINING_BOND_LOCK;
+        let none = BondSet::default();
+        precheck_registrations(&none, &[reg(edge)], t).unwrap();
+        let err = precheck_registrations(&none, &[reg(edge - 1)], t).unwrap_err();
+        assert!(err.to_string().contains("not eligible"), "{err}");
+    }
+
     #[test]
     fn a_producer_signs_with_the_bond_that_has_the_most_quota_left() {
         let mut producer = MinerBond {
@@ -1211,7 +1457,7 @@ mod cap_tests {
             ],
         };
         let mine = BondEntry { mining_key: producer.mining_key(), ..eligible_bond() };
-        let mut bonds = im::HashMap::new();
+        let mut bonds = BondSet::default();
         bonds.insert([1; 32], mine);
         bonds.insert([2; 32], mine);
         // Registered, but naming someone else's key: never this producer's to sign.

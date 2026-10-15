@@ -239,6 +239,13 @@ pub fn build_template_bonded(
     }
     let timestamp = timestamp
         .unwrap_or_else(|| current_timestamp().max(min_next_timestamp(previous_timestamps)));
+    // Bonds that can no longer sign leave the set before the block is built,
+    // exactly as `apply_batch` removes them.
+    let mut pruned = state.clone();
+    pruned
+        .bonds
+        .prune_expired(min_next_timestamp(previous_timestamps));
+    let state = &pruned;
     let mut registrations: Vec<BondRegistration> = match bond {
         Some(b) if !state.bonds.contains_key(&b.bond_id) => match &b.registration {
             Some(registration) => {

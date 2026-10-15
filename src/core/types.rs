@@ -18,7 +18,7 @@
 //! because there are no Commit transactions, so fork choice is plain
 //! cumulative proof-of-work.
 
-use super::bond::{BondEntry, BondRegistration, MinerAuth};
+use super::bond::{BondEntry, BondRegistration, BondSet, MinerAuth};
 use super::auxpow::AuxPow;
 use super::mmr::{MerkleMountainRange, UtxoAccumulator};
 use super::mw::crypto::{self, Point32, Scalar32, IDENTITY};
@@ -512,7 +512,7 @@ pub struct StateRootParts {
     pub kernel_excess_sum: Point32,
     pub total_kernel_offset: Scalar32,
     pub supply: u64,
-    /// Commitment to the registered bond set ([`bonds_root`]).
+    /// Commitment to the registered bond set ([`BondSet::root`]).
     pub bonds_root: [u8; 32],
 }
 
@@ -569,9 +569,10 @@ pub struct State {
     pub chain_mmr: MerkleMountainRange,
     /// `extension.final_hash` of the tip.
     pub header_hash: [u8; 32],
-    /// Registered mining bonds, by bond id (`core/bond.rs`).
+    /// Registered mining bonds that can still sign, by bond id
+    /// (`core/bond.rs`).
     #[serde(default)]
-    pub bonds: im::HashMap<[u8; 32], BondEntry>,
+    pub bonds: BondSet,
     /// Signers of the last `bond::CAP_WINDOW` blocks, oldest first (`None`
     /// for an unsigned block), and how many of them each bond signed. Not in
     /// the state root: it only weights fork choice (`bond::credit_work`), and
@@ -586,6 +587,21 @@ pub struct State {
     /// state root: storage rebuilds it from the stored headers.
     #[serde(skip)]
     pub work_floor: im::Vector<(u64, u128)>,
+    /// What the last applied block changed in the parts of the state storage
+    /// keeps diffs of rather than recomputing (see [`BlockEffects`]).
+    #[serde(skip)]
+    pub effects: std::sync::Arc<BlockEffects>,
+}
+
+/// What applying one block changed in the bond set: the diff storage
+/// persists and undoes, so the set is never copied whole.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockEffects {
+    /// Bonds the block registered.
+    pub bonds_added: Vec<([u8; 32], BondEntry)>,
+    /// Bonds removed before or by the block (no longer able to sign), as
+    /// they were.
+    pub bonds_removed: Vec<([u8; 32], BondEntry)>,
 }
 
 impl State {
@@ -610,10 +626,11 @@ impl State {
         );
         Self {
             mw_midstate: initial,
-            bonds: im::HashMap::new(),
+            bonds: BondSet::default(),
             recent_signers: Default::default(),
             signer_counts: Default::default(),
             work_floor: Default::default(),
+            effects: Default::default(),
             capped: 0,
             utxos: im::HashMap::new(),
             utxo_set: UtxoAccumulator::new(),
@@ -653,7 +670,7 @@ impl State {
     pub fn root_parts(&self) -> StateRootParts {
         StateRootParts {
             utxo_root: self.utxo_set.root(true),
-            bonds_root: bonds_root(&self.bonds),
+            bonds_root: self.bonds.root(),
             kernel_root: self.kernels.root(true),
             chain_mmr_root: self.chain_mmr.root(true),
             kernel_excess_sum: self.kernel_excess_sum,
@@ -822,22 +839,6 @@ pub fn fold_block(prev_midstate: &[u8; 32], batch: &Batch) -> [u8; 32] {
 pub fn registrations_hash(registrations: &[BondRegistration]) -> [u8; 32] {
     let bytes = bincode::serialize(registrations).expect("registrations serialize");
     hash_domain(b"midwimble.registrations.v1", &[&bytes])
-}
-
-/// Commitment to the registered bond set: every entry, in bond-id order.
-pub fn bonds_root(bonds: &im::HashMap<[u8; 32], BondEntry>) -> [u8; 32] {
-    let mut ids: Vec<&[u8; 32]> = bonds.keys().collect();
-    ids.sort();
-    let mut h = blake3::Hasher::new();
-    h.update(b"midwimble.bonds.v1");
-    for id in ids {
-        let e = &bonds[id];
-        h.update(id);
-        h.update(&e.mining_key);
-        h.update(&e.value.to_le_bytes());
-        h.update(&e.bonded_until.to_le_bytes());
-    }
-    *h.finalize().as_bytes()
 }
 
 impl Batch {

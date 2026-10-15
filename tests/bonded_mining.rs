@@ -89,9 +89,25 @@ async fn a_bonded_producer_mines_and_a_peer_validates_every_block() {
 
     // The peer validated every block, registration and signatures included,
     // and arrived at the same bond set.
-    assert_eq!(peer.handle.state().bonds[&bond.bond_id].mining_key, mining_key);
-    let blocks = peer.handle.storage().load_batches(1, 5, usize::MAX).unwrap();
-    assert_eq!(blocks[0].registrations.len(), 1, "block 1 registers its producer's bond");
+    assert_eq!(
+        peer.handle
+            .state()
+            .bonds
+            .get(&bond.bond_id)
+            .unwrap()
+            .mining_key,
+        mining_key
+    );
+    let blocks = peer
+        .handle
+        .storage()
+        .load_batches(1, 5, usize::MAX)
+        .unwrap();
+    assert_eq!(
+        blocks[0].registrations.len(),
+        1,
+        "block 1 registers its producer's bond"
+    );
     assert!(blocks[1..].iter().all(|b| b.registrations.is_empty()));
     for block in &blocks {
         assert_eq!(block.miner.as_ref().expect("signed").bond_id, bond.bond_id);

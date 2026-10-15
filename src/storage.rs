@@ -20,6 +20,7 @@
 //! | `output_groups` | group id | `StoredGroup` |
 //! | `group_members` | commitment | `(group id, index)` of an unspent output |
 //! | `undo` | height | [`BlockUndo`] |
+//! | `bonds` | bond id | `BondEntry` of a bond that can still sign |
 //! | `meta` | `state_meta` / `base` / `finality` | [`StateMeta`] / [`SnapshotBase`] / [`FinalityInfo`] |
 //! | `sync_headers` | height | verified headers of an unfinished sync |
 //! | `peers` | multiaddr | empty |
@@ -33,7 +34,8 @@ use crate::core::mw::crypto::{compress, decompress, scalar_from_bytes, Point32, 
 use crate::core::mw::{Kernel, StoredGroup};
 use crate::core::snapshot::{mmr_from_peaks, mmr_peak_values, Snapshot, SNAPSHOT_HEADERS};
 use crate::core::state::{calculate_target, calculate_work};
-use crate::core::types::{block_reward, utxo_leaf, UtxoEntry};
+use crate::core::bond::BondSet;
+use crate::core::types::{block_reward, utxo_leaf, BlockEffects, UtxoEntry};
 use crate::core::{Batch, BatchHeader, State};
 use anyhow::{anyhow, bail, Context, Result};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -49,6 +51,9 @@ const KERNELS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kernels");
 const GROUPS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("output_groups");
 const MEMBERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("group_members");
 const UNDO: TableDefinition<u64, &[u8]> = TableDefinition::new("undo");
+/// The bond set: every registered bond that can still sign. Blocks change
+/// it by the diffs in their undo records, so it is never copied whole.
+const BONDS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("bonds");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// Each block's signer (bond id; empty if unsigned). Never pruned: the
 /// fork-choice window needs signers after their bodies are gone.
@@ -80,10 +85,6 @@ pub struct StateMeta {
     pub height: u64,
     pub timestamp: u64,
     pub header_hash: [u8; 32],
-    /// Registered mining bonds. Kept here so every undo record's copy of the
-    /// previous meta restores them on a reorg.
-    #[serde(default)]
-    pub bonds: im::HashMap<[u8; 32], crate::core::bond::BondEntry>,
 }
 
 impl StateMeta {
@@ -98,7 +99,6 @@ impl StateMeta {
             height: s.height,
             timestamp: s.timestamp,
             header_hash: s.header_hash,
-            bonds: s.bonds.clone(),
         }
     }
 
@@ -139,13 +139,6 @@ impl StateMeta {
             height: height + 1,
             timestamp: batch.timestamp,
             header_hash: batch.extension.final_hash,
-            bonds: {
-                let mut bonds = self.bonds.clone();
-                for registration in &batch.registrations {
-                    bonds.insert(registration.bond_id(), registration.entry());
-                }
-                bonds
-            },
         })
     }
 }
@@ -163,6 +156,8 @@ pub struct BlockUndo {
     pub touched_groups: Vec<([u8; 32], StoredGroup)>,
     /// Group membership of the outputs it spent.
     pub spent_members: Vec<(Point32, [u8; 32], u32)>,
+    /// What it changed in the bond set.
+    pub effects: BlockEffects,
 }
 
 /// Where a checkpoint-synced database begins.
@@ -213,6 +208,40 @@ fn signer_to_log(signer: Option<[u8; 32]>) -> Vec<u8> {
 
 fn signer_from_log(bytes: &[u8]) -> Option<[u8; 32]> {
     bytes.try_into().ok()
+}
+
+/// The bond set as a table holds it.
+fn read_bonds(table: &impl ReadableTable<&'static [u8], &'static [u8]>) -> Result<BondSet> {
+    let mut bonds = BondSet::default();
+    for entry in table.iter()? {
+        let (k, v) = entry?;
+        let id: [u8; 32] = k
+            .value()
+            .try_into()
+            .map_err(|_| anyhow!("corrupt bond key"))?;
+        bonds.insert(id, bincode::deserialize(v.value())?);
+    }
+    Ok(bonds)
+}
+
+/// Applies a block's bond diff to an in-memory set.
+fn apply_bond_effects(bonds: &mut BondSet, effects: &BlockEffects) {
+    for (id, _) in &effects.bonds_removed {
+        bonds.remove(id);
+    }
+    for (id, entry) in &effects.bonds_added {
+        bonds.insert(*id, *entry);
+    }
+}
+
+/// Takes a block's bond diff back off an in-memory set.
+fn undo_bond_effects(bonds: &mut BondSet, effects: &BlockEffects) {
+    for (id, _) in &effects.bonds_added {
+        bonds.remove(id);
+    }
+    for (id, entry) in &effects.bonds_removed {
+        bonds.insert(*id, *entry);
+    }
 }
 
 /// The signer of a stored block body (for blocks stored before the signer log).
@@ -273,6 +302,7 @@ impl Storage {
             txn.open_table(SIGNERS)?;
             txn.open_table(CAPPED)?;
             txn.open_table(DEPTHS)?;
+            txn.open_table(BONDS)?;
         }
         txn.commit()?;
         Ok(Self { db: Arc::new(db) })
@@ -417,6 +447,7 @@ impl Storage {
                 .map_err(|_| anyhow!("corrupt kernel key"))?;
             kernel_ids.insert(id);
         }
+        let bonds = read_bonds(&txn.open_table(BONDS)?)?;
 
         // Chain MMR over every block but the tip (which the tip header's
         // state root excludes), starting from the snapshot base if any.
@@ -445,10 +476,11 @@ impl Storage {
 
         let mut state = State {
             mw_midstate: meta.mw_midstate,
-            bonds: meta.bonds.clone(),
+            bonds,
             recent_signers: Default::default(),
             signer_counts: Default::default(),
             work_floor: Default::default(),
+            effects: Default::default(),
             capped: 0,
             utxos,
             utxo_set: UtxoAccumulator::from_canonical_coins(leaves, true),
@@ -509,6 +541,7 @@ impl Storage {
             for k in &undo.kernels {
                 state.kernels.remove(k, true);
             }
+            undo_bond_effects(&mut state.bonds, &undo.effects);
             let p = undo.prev;
             state.mw_midstate = p.mw_midstate;
             state.kernel_excess_sum = p.kernel_excess_sum;
@@ -519,7 +552,6 @@ impl Storage {
             state.height = p.height;
             state.timestamp = p.timestamp;
             state.header_hash = p.header_hash;
-            state.bonds = p.bonds;
         }
         state.chain_mmr = current.chain_mmr.truncated(height);
         state.capped = self.capped_before(height)?;
@@ -569,14 +601,29 @@ impl Storage {
     }
 
     /// Replaces every block at or above `first_height` with `batches`, whose
-    /// application yields `state`. The blocks must already be validated.
-    pub fn commit_chain(&self, first_height: u64, batches: &[Batch], state: &State) -> Result<()> {
+    /// application yields `state`. The blocks must already be validated, and
+    /// `effects` holds what applying each one changed in the bond set (each
+    /// state's [`State::effects`] as it was applied).
+    pub fn commit_chain(
+        &self,
+        first_height: u64,
+        batches: &[Batch],
+        effects: &[Arc<BlockEffects>],
+        state: &State,
+    ) -> Result<()> {
         if first_height + batches.len() as u64 != state.height {
             bail!(
                 "commit_chain: {} blocks from {} do not end at state height {}",
                 batches.len(),
                 first_height,
                 state.height
+            );
+        }
+        if effects.len() != batches.len() {
+            bail!(
+                "commit_chain: {} blocks but {} sets of effects",
+                batches.len(),
+                effects.len()
             );
         }
         let finality = self.finality()?;
@@ -605,6 +652,7 @@ impl Storage {
             let mut signer_log = txn.open_table(SIGNERS)?;
             let mut capped_table = txn.open_table(CAPPED)?;
             let mut depth_table = txn.open_table(DEPTHS)?;
+            let mut bond_table = txn.open_table(BONDS)?;
 
             let stored: Option<StateMeta> = match meta_table.get("state_meta")? {
                 Some(v) => Some(bincode::deserialize(v.value())?),
@@ -648,6 +696,12 @@ impl Storage {
                 for k in &undo.kernels {
                     kernels.remove(k.as_slice())?;
                 }
+                for (id, _) in &undo.effects.bonds_added {
+                    bond_table.remove(id.as_slice())?;
+                }
+                for (id, entry) in &undo.effects.bonds_removed {
+                    bond_table.insert(id.as_slice(), enc(entry)?.as_slice())?;
+                }
                 blocks.remove(h)?;
                 headers.remove(h)?;
                 signer_log.remove(h)?;
@@ -655,6 +709,10 @@ impl Storage {
                 depth_table.remove(h)?;
                 meta = undo.prev;
             }
+
+            // The bond set below the first new block, advanced block by block
+            // with the blocks' own diffs, for the fork-choice weights below.
+            let mut bonds = read_bonds(&bond_table)?;
 
             // The fork-choice windows below the first new block, rebuilt as the
             // node rebuilds its own, so each block is weighed as the node did.
@@ -669,7 +727,7 @@ impl Storage {
                         None => None,
                     },
                 };
-                crate::core::bond::credit_in_window(&mut recent, &mut counts, &meta.bonds, signer, 0, 0);
+                crate::core::bond::credit_in_window(&mut recent, &mut counts, &bonds, signer, 0, 0);
             }
             let mut floor: im::Vector<(u64, u128)> = im::Vector::new();
             let floor_start =
@@ -780,13 +838,21 @@ impl Storage {
                 }
 
                 let next = meta.advance(batch)?;
+                let block_effects: &BlockEffects = &effects[i];
+                apply_bond_effects(&mut bonds, block_effects);
+                for (id, _) in &block_effects.bonds_removed {
+                    bond_table.remove(id.as_slice())?;
+                }
+                for (id, entry) in &block_effects.bonds_added {
+                    bond_table.insert(id.as_slice(), enc(entry)?.as_slice())?;
+                }
                 let signer = batch.miner.as_ref().map(|auth| auth.bond_id);
                 let work = calculate_work(&batch.target);
                 let creditable = crate::core::bond::cap_work(&mut floor, height, work);
                 let credited = crate::core::bond::credit_in_window(
                     &mut recent,
                     &mut counts,
-                    &next.bonds,
+                    &bonds,
                     signer,
                     creditable,
                     batch.timestamp,
@@ -803,6 +869,7 @@ impl Storage {
                     created_groups,
                     touched_groups: touched,
                     spent_members,
+                    effects: block_effects.clone(),
                 };
                 undo_table.insert(height, enc(&undo)?.as_slice())?;
 
@@ -819,6 +886,9 @@ impl Storage {
             }
             if capped != state.capped {
                 bail!("commit_chain: replayed fork-choice weight disagrees with the supplied state");
+            }
+            if bonds.root() != state.bonds.root() || bond_table.len()? != state.bonds.len() as u64 {
+                bail!("commit_chain: stored bond diffs disagree with the supplied state");
             }
             meta_table.insert("state_meta", enc(&meta)?.as_slice())?;
 
@@ -1028,6 +1098,10 @@ impl Storage {
                 h - 1,
                 enc(&snapshot.checkpoint.mw_cumulative_work)?.as_slice(),
             )?;
+            let mut bonds = txn.open_table(BONDS)?;
+            for (id, entry) in state.bonds.iter() {
+                bonds.insert(id.as_slice(), enc(entry)?.as_slice())?;
+            }
             let mut meta = txn.open_table(META)?;
             meta.insert("state_meta", enc(&StateMeta::of(state))?.as_slice())?;
             let base = SnapshotBase {
@@ -1167,11 +1241,16 @@ mod tests {
 
     /// A producer signing with its own devnet bond, registered in its first block.
     fn devnet_bond(seed: &[u8], target: &[u8; 32]) -> crate::core::bond::MinerBond {
+        let until = crate::core::bond::est_midstate_height(crate::core::types::GENESIS_TIMESTAMP)
+            + crate::core::bond::MAX_BOND_HORIZON / 2;
+        bond_until(seed, until, target)
+    }
+
+    /// [`devnet_bond`] locked until midstate height `until`.
+    fn bond_until(seed: &[u8], until: u64, target: &[u8; 32]) -> crate::core::bond::MinerBond {
         use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
         let secret = Scalar::from_bytes_mod_order(crate::core::types::hash(seed));
         let mining_key = RistrettoPoint::mul_base(&secret).compress().to_bytes();
-        let until = crate::core::bond::est_midstate_height(crate::core::types::GENESIS_TIMESTAMP)
-            + crate::core::bond::MAX_BOND_HORIZON / 2;
         let registration = crate::core::bond::devnet_registration(
             mining_key,
             until,
@@ -1222,14 +1301,28 @@ mod tests {
         let b = template.mine_blocking();
         apply_batch(state, &b, ts).unwrap();
         ts.push(b.timestamp);
-        storage.commit_chain(state.height - 1, std::slice::from_ref(&b), state).unwrap();
+        storage
+            .commit_chain(
+                state.height - 1,
+                std::slice::from_ref(&b),
+                std::slice::from_ref(&state.effects),
+                state,
+            )
+            .unwrap();
     }
 
     fn fresh(dir: &std::path::Path) -> (Storage, State, Vec<u64>) {
         let storage = Storage::open(dir).unwrap();
         let mut state = State::genesis();
         apply_batch(&mut state, Batch::genesis(), &[]).unwrap();
-        storage.commit_chain(0, std::slice::from_ref(Batch::genesis()), &state).unwrap();
+        storage
+            .commit_chain(
+                0,
+                std::slice::from_ref(Batch::genesis()),
+                std::slice::from_ref(&state.effects),
+                &state,
+            )
+            .unwrap();
         (storage, state, vec![Batch::genesis().timestamp])
     }
 
@@ -1255,6 +1348,91 @@ mod tests {
             mine_signed(&storage, &mut loaded, &mut ts, &to, &bond);
         }
         assert_eq!(loaded.capped, 0);
+    }
+
+    /// Bonds come and go by diffs: a bond that expires is removed from the
+    /// table and its undo record brings it back, a restart reloads exactly
+    /// the set, and no undo record carries a copy of the whole set.
+    #[test]
+    fn bond_diffs_persist_and_rewind() {
+        use crate::core::bond::{est_midstate_height, MIN_REMAINING_BOND_LOCK};
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut state, mut ts) = fresh(dir.path());
+        let to = WalletKeys::random().address();
+        let t0 = crate::core::state::current_timestamp();
+        let lasting = bond_until(
+            b"lasting",
+            est_midstate_height(t0) + crate::core::bond::MAX_BOND_HORIZON / 2,
+            &state.target,
+        );
+        let brief = bond_until(
+            b"brief",
+            est_midstate_height(t0 + 300) + MIN_REMAINING_BOND_LOCK,
+            &state.target,
+        );
+        let mut at = |state: &mut State, bond: &crate::core::bond::MinerBond, t: u64| {
+            let (template, _) = crate::core::template::build_template_bonded(
+                state,
+                &ts,
+                &[],
+                &[(to, 1)],
+                [0; 32],
+                Some(t),
+                Some(bond),
+            )
+            .unwrap();
+            let b = template.mine_blocking();
+            apply_batch(state, &b, &ts).unwrap();
+            ts.push(b.timestamp);
+            storage
+                .commit_chain(
+                    state.height - 1,
+                    std::slice::from_ref(&b),
+                    std::slice::from_ref(&state.effects),
+                    state,
+                )
+                .unwrap();
+            state.clone()
+        };
+        at(&mut state, &lasting, t0 + 60);
+        let registered = at(&mut state, &brief, t0 + 120);
+        at(&mut state, &lasting, t0 + 240);
+        let before_expiry = at(&mut state, &lasting, t0 + 400);
+        let expired = at(&mut state, &lasting, t0 + 500);
+        assert!(registered.bonds.contains_key(&brief.bond_id));
+        assert!(before_expiry.bonds.contains_key(&brief.bond_id));
+        assert!(!expired.bonds.contains_key(&brief.bond_id));
+
+        // A restart reloads exactly the set, commitment included.
+        let loaded = storage.load_state().unwrap().unwrap();
+        assert_eq!(loaded.bonds, expired.bonds);
+        assert_eq!(loaded.state_root(), expired.state_root());
+        // Rewinding in memory brings the expired bond back.
+        let rewound = storage.state_at(&loaded, before_expiry.height).unwrap();
+        assert_eq!(rewound.bonds, before_expiry.bonds);
+        // Undo records hold diffs, not the set.
+        let txn = storage.db.begin_read().unwrap();
+        let undo: BlockUndo = bincode::deserialize(
+            txn.open_table(UNDO)
+                .unwrap()
+                .get(expired.height - 1)
+                .unwrap()
+                .unwrap()
+                .value(),
+        )
+        .unwrap();
+        assert_eq!(undo.effects.bonds_removed.len(), 1);
+        assert!(undo.effects.bonds_added.is_empty());
+        drop(txn);
+
+        // Taking the expiring block back off the chain restores the bond in
+        // the table too.
+        storage
+            .commit_chain(before_expiry.height, &[], &[], &before_expiry)
+            .unwrap();
+        let loaded = storage.load_state().unwrap().unwrap();
+        assert_eq!(loaded.bonds, before_expiry.bonds);
+        assert!(loaded.bonds.contains_key(&brief.bond_id));
     }
 
     /// Two bonds, one far over its cap: storage replays the same weight the
@@ -1410,6 +1588,11 @@ mod tests {
         }
     }
 
+    /// What applying each block changed, from the states after them.
+    fn fx(states: &[State]) -> Vec<Arc<BlockEffects>> {
+        states.iter().map(|s| s.effects.clone()).collect()
+    }
+
     fn same(a: &State, b: &State) -> bool {
         a.state_root() == b.state_root()
             && StateMeta::of(a) == StateMeta::of(b)
@@ -1444,7 +1627,12 @@ mod tests {
         let c = chain_with_spend(2);
         for (h, b) in c.batches.iter().enumerate() {
             storage
-                .commit_chain(h as u64, std::slice::from_ref(b), &c.states[h])
+                .commit_chain(
+                    h as u64,
+                    std::slice::from_ref(b),
+                    std::slice::from_ref(&c.states[h].effects),
+                    &c.states[h],
+                )
                 .unwrap();
         }
         let loaded = storage.load_state().unwrap().unwrap();
@@ -1467,7 +1655,9 @@ mod tests {
         let storage = Storage::open(dir.path()).unwrap();
         let a = chain_with_spend(1);
         let tip = a.states.last().unwrap();
-        storage.commit_chain(0, &a.batches, tip).unwrap();
+        storage
+            .commit_chain(0, &a.batches, &fx(&a.states), tip)
+            .unwrap();
 
         // Every unspent output sits in exactly one stored group; the spent
         // coinbase's single-output group is gone.
@@ -1486,13 +1676,20 @@ mod tests {
         // Replace the chain with an unrelated one and back: identical groups.
         let b = chain_with_spend(3);
         storage
-            .commit_chain(1, &b.batches[1..], b.states.last().unwrap())
+            .commit_chain(
+                1,
+                &b.batches[1..],
+                &fx(&b.states[1..]),
+                b.states.last().unwrap(),
+            )
             .unwrap();
         assert!(same(
             &storage.load_state().unwrap().unwrap(),
             b.states.last().unwrap()
         ));
-        storage.commit_chain(1, &a.batches[1..], tip).unwrap();
+        storage
+            .commit_chain(1, &a.batches[1..], &fx(&a.states[1..]), tip)
+            .unwrap();
         assert_eq!(group_digest(&storage), before);
         assert!(same(&storage.load_state().unwrap().unwrap(), tip));
     }
@@ -1503,7 +1700,8 @@ mod tests {
         let full = Storage::open(&dir.path().join("full")).unwrap();
         let mut c = chain_with_spend(2);
         let tip = c.states.last().unwrap().clone();
-        full.commit_chain(0, &c.batches, &tip).unwrap();
+        full.commit_chain(0, &c.batches, &fx(&c.states), &tip)
+            .unwrap();
 
         // At the tip, and at an older height (groups and kernels rewound).
         for h in [tip.height, tip.height - 3] {
@@ -1531,16 +1729,27 @@ mod tests {
         for _ in 0..3 {
             let b = mine(&mut st, &mut c.ts, &[], &payout);
             let h = st.height - 1;
-            full.commit_chain(h, std::slice::from_ref(&b), &st).unwrap();
+            full.commit_chain(
+                h,
+                std::slice::from_ref(&b),
+                std::slice::from_ref(&st.effects),
+                &st,
+            )
+            .unwrap();
             light
-                .commit_chain(h, std::slice::from_ref(&b), &st)
+                .commit_chain(
+                    h,
+                    std::slice::from_ref(&b),
+                    std::slice::from_ref(&st.effects),
+                    &st,
+                )
                 .unwrap();
         }
         let l = light.load_state().unwrap().unwrap();
         assert!(same(&l, &full.load_state().unwrap().unwrap()));
         assert!(same(&l, &st));
         // The light node cannot rewrite below its base.
-        assert!(light.commit_chain(cp.mw_height - 1, &[], &st).is_err());
+        assert!(light.commit_chain(cp.mw_height - 1, &[], &[], &st).is_err());
         // But it can serve a snapshot at its own newer checkpoints.
         let cp2 = checkpoint_for(&light, &l, l.height);
         light
@@ -1556,7 +1765,7 @@ mod tests {
         let s = Storage::open(dir.path()).unwrap();
         let c = chain_with_spend(1);
         let tip = c.states.last().unwrap();
-        s.commit_chain(0, &c.batches, tip).unwrap();
+        s.commit_chain(0, &c.batches, &fx(&c.states), tip).unwrap();
         let cp = checkpoint_for(&s, tip, tip.height);
         let good = s.export_snapshot(tip, &cp).unwrap();
         good.verify(&cp.id()).unwrap();
@@ -1600,7 +1809,7 @@ mod tests {
         let s = Storage::open(dir.path()).unwrap();
         let c = chain_with_spend(3);
         let tip = c.states.last().unwrap();
-        s.commit_chain(0, &c.batches, tip).unwrap();
+        s.commit_chain(0, &c.batches, &fx(&c.states), tip).unwrap();
         let floor = tip.height - 2;
         let cp = checkpoint_for(&s, tip, floor);
         s.set_finality(&FinalityInfo {
@@ -1612,10 +1821,20 @@ mod tests {
         .unwrap();
 
         assert!(s
-            .commit_chain(floor - 1, &c.batches[floor as usize - 1..], tip)
+            .commit_chain(
+                floor - 1,
+                &c.batches[floor as usize - 1..],
+                &fx(&c.states[floor as usize - 1..]),
+                tip
+            )
             .is_err());
-        s.commit_chain(floor, &c.batches[floor as usize..], tip)
-            .unwrap();
+        s.commit_chain(
+            floor,
+            &c.batches[floor as usize..],
+            &fx(&c.states[floor as usize..]),
+            tip,
+        )
+        .unwrap();
 
         assert_eq!(s.prune_bodies_below(u64::MAX).unwrap(), floor);
         assert!(s.load_batch(floor - 1).unwrap().is_none());
@@ -1636,7 +1855,7 @@ mod tests {
         let storage = Storage::open(dir.path()).unwrap();
         let c = chain_with_spend(0);
         storage
-            .commit_chain(0, &c.batches, c.states.last().unwrap())
+            .commit_chain(0, &c.batches, &fx(&c.states), c.states.last().unwrap())
             .unwrap();
         let txn = storage.db.begin_write().unwrap();
         {
@@ -1662,10 +1881,16 @@ mod tests {
         let storage = Storage::open(dir.path()).unwrap();
         let a = chain_with_spend(0);
         let tip = a.states.last().unwrap();
-        storage.commit_chain(0, &a.batches, tip).unwrap();
+        storage
+            .commit_chain(0, &a.batches, &fx(&a.states), tip)
+            .unwrap();
         let b = chain_with_spend(0);
-        assert!(storage.commit_chain(1, &b.batches[1..], tip).is_err());
-        assert!(storage.commit_chain(0, &a.batches[..2], tip).is_err());
+        assert!(storage
+            .commit_chain(1, &b.batches[1..], &fx(&b.states[1..]), tip)
+            .is_err());
+        assert!(storage
+            .commit_chain(0, &a.batches[..2], &fx(&a.states[..2]), tip)
+            .is_err());
         assert!(same(&storage.load_state().unwrap().unwrap(), tip));
     }
 
@@ -1690,7 +1915,7 @@ mod tests {
             headers.len() - 1
         );
         storage
-            .commit_chain(0, &a.batches[..3], &a.states[2])
+            .commit_chain(0, &a.batches[..3], &fx(&a.states[..3]), &a.states[2])
             .unwrap();
         assert!(storage.load_sync_headers(1, 100).unwrap().is_empty());
         assert_eq!(

@@ -230,8 +230,10 @@ pub struct BlockSync {
     pub applying: bool,
     /// The fork-point state is being derived off-thread.
     pub rebuilding: bool,
-    /// Applied blocks not yet committed (while a reorg is still lighter).
+    /// Applied blocks not yet committed (while a reorg is still lighter),
+    /// and what applying each changed (`State::effects`).
     pub staged: Vec<Batch>,
+    pub staged_effects: Vec<std::sync::Arc<crate::core::types::BlockEffects>>,
     /// Whether our chain has been replaced (always true for fast-forwards).
     pub committed: bool,
     pub buffer: BTreeMap<u64, Chunk>,
@@ -254,6 +256,7 @@ impl BlockSync {
             applying: false,
             rebuilding: false,
             staged: Vec::new(),
+            staged_effects: Vec::new(),
             committed,
             buffer: BTreeMap::new(),
             buffered_bytes: 0,

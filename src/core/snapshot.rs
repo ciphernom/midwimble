@@ -227,11 +227,16 @@ impl Snapshot {
         chain_mmr.append(&cp.mw_header_hash, true);
 
         let tip = self.headers.last().expect("checked");
+        let bonds: crate::core::bond::BondSet = self.bonds.iter().copied().collect();
+        if bonds.len() != self.bonds.len() {
+            bail!("duplicate bond in snapshot");
+        }
         let state = State {
-            bonds: self.bonds.iter().copied().collect(),
+            bonds,
             recent_signers: Default::default(),
             signer_counts: Default::default(),
             work_floor: Default::default(),
+            effects: Default::default(),
             capped: 0,
             mw_midstate: tip.post_tx_midstate,
             utxos,

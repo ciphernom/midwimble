@@ -84,8 +84,9 @@ A registration is an item in a midwimble block carrying:
 
 It adds `bond_id → (mining key, bonded_until, value)` to a bond set committed
 in midwimble's state root, and pays the ordinary fee by weight: about 8 KB of
-SMT proof plus the header run. Registrations never expire in consensus terms;
-entries simply stop being eligible and can be pruned.
+SMT proof plus the header run. A registration must be eligible at its own
+block's time. Once a bond can no longer sign, it leaves the set (see "The bond
+set" below).
 
 A block may carry the registration for its own miner's bond, which is how the
 first block after launch gets mined.
@@ -127,11 +128,25 @@ re-attributed to another bond, and merged mining keeps this because the
 midstate parent commits to the full mining hash. Pools sign with the
 operator's bond; workers need nothing.
 
-Registered bonds live in the chain state, committed in its root
-(`types::bonds_root`). They are stored in `StateMeta`, so every undo record's
-copy of the previous meta restores them on a reorg, and snapshots carry them. A
-block carries at most one registration, checked against the block's own
-target.
+Registered bonds live in the chain state, committed in its root. A block
+carries at most one registration, checked against the block's own target.
+
+### The bond set
+
+The set holds only bonds that can still sign. Before a block is applied,
+every bond that is not eligible at the earliest timestamp that block may carry
+(one more than the median of the last eleven) is removed. A later block's
+timestamp can only be higher, because the median never falls, so a removed
+bond could never have signed again on that chain: removal changes nothing but
+the size of the set, and the work of every rule that reads it.
+
+- **Commitment.** The set is a sparse Merkle tree over one leaf per bond
+  (`bond::bond_leaf`: its id and every field of its entry), updated as bonds
+  come and go, so the state root never sorts or rehashes the whole set.
+- **Storage.** Bonds have a table of their own. Each block's undo record holds
+  only what it changed (`types::BlockEffects`: bonds added and removed), so a
+  reorg restores the set without any record carrying a copy of it.
+- **Snapshots** carry the set and check it against the state root.
 
 A block is authorised when its key belongs to a registered bond with:
 

@@ -545,14 +545,30 @@ fn apply_batch_internal(
         }
     }
 
-    // 4. Cheap stateful registration checks, then contents: structure,
+    // 4. Bonds that can no longer sign leave the set before anything reads
+    //    it: no timestamp this block or a later one may carry would make them
+    //    eligible again.
+    let mut base = state.clone();
+    let expired = base
+        .bonds
+        .prune_expired(min_next_timestamp(previous_timestamps));
+
+    // 4a. Cheap stateful registration checks, then contents: structure,
     //    balances, proofs, signatures and registration headers.
-    super::bond::precheck_registrations(&state.bonds, &batch.registrations, batch.timestamp)?;
+    super::bond::precheck_registrations(&base.bonds, &batch.registrations, batch.timestamp)?;
     validate_block_contents(batch, height, skip_crypto)?;
 
     // 4b. State transition and root.
-    let mut next = apply_body(state, &batch.body, batch.coinbase.as_ref())?;
+    let mut next = apply_body(&base, &batch.body, batch.coinbase.as_ref())?;
     apply_registrations(&mut next, &batch.registrations)?;
+    next.effects = std::sync::Arc::new(BlockEffects {
+        bonds_added: batch
+            .registrations
+            .iter()
+            .map(|r| (r.bond_id(), r.entry()))
+            .collect(),
+        bonds_removed: expired,
+    });
     let expected_root = next.state_root();
     if batch.state_root != expected_root {
         bail!(

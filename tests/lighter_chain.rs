@@ -47,13 +47,24 @@ fn mine(state: &mut State, ts: &mut Vec<u64>, bond: &MinerBond) -> Batch {
 }
 
 /// A data directory holding genesis and then `blocks`, which end at `state`.
+/// The blocks are applied again on the way in, for what each one changed.
 fn stored(blocks: &[Batch], state: &State) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::open(dir.path()).unwrap();
-    let mut genesis = State::genesis();
-    apply_batch(&mut genesis, Batch::genesis(), &[]).unwrap();
-    storage.commit_chain(0, std::slice::from_ref(Batch::genesis()), &genesis).unwrap();
-    storage.commit_chain(1, blocks, state).unwrap();
+    let mut replay = State::genesis();
+    apply_batch(&mut replay, Batch::genesis(), &[]).unwrap();
+    let genesis_effects = std::slice::from_ref(&replay.effects);
+    storage
+        .commit_chain(0, std::slice::from_ref(Batch::genesis()), genesis_effects, &replay)
+        .unwrap();
+    let (mut ts, mut effects) = (vec![Batch::genesis().timestamp], Vec::new());
+    for block in blocks {
+        apply_batch(&mut replay, block, &ts).unwrap();
+        ts.push(block.timestamp);
+        effects.push(replay.effects.clone());
+    }
+    assert_eq!(replay.state_root(), state.state_root());
+    storage.commit_chain(1, blocks, &effects, &replay).unwrap();
     dir
 }
 

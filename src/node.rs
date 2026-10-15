@@ -377,6 +377,8 @@ enum Internal {
         candidate: State,
         timestamps: VecDeque<u64>,
         applied: Vec<Batch>,
+        /// What each applied block changed (`State::effects`), for storage.
+        effects: Vec<Arc<crate::core::types::BlockEffects>>,
         error: Option<String>,
     },
     AnchorsChecked {
@@ -539,7 +541,12 @@ impl Node {
             None => {
                 let mut s = State::genesis();
                 apply_batch(&mut s, Batch::genesis(), &[])?;
-                storage.commit_chain(0, std::slice::from_ref(Batch::genesis()), &s)?;
+                storage.commit_chain(
+                    0,
+                    std::slice::from_ref(Batch::genesis()),
+                    std::slice::from_ref(&s.effects),
+                    &s,
+                )?;
                 s
             }
         };
@@ -1132,8 +1139,11 @@ impl Node {
                 candidate,
                 timestamps,
                 applied,
+                effects,
                 error,
-            } => self.on_batches_applied(session, source, candidate, timestamps, applied, error),
+            } => self.on_batches_applied(
+                session, source, candidate, timestamps, applied, effects, error,
+            ),
         }
     }
 
@@ -1282,10 +1292,12 @@ impl Node {
     fn accept_block(&mut self, candidate: State, batch: Batch, from: Option<PeerId>) {
         let height = self.state.height;
         let hash = batch.extension.final_hash;
-        if let Err(e) = self
-            .storage
-            .commit_chain(height, std::slice::from_ref(&batch), &candidate)
-        {
+        if let Err(e) = self.storage.commit_chain(
+            height,
+            std::slice::from_ref(&batch),
+            std::slice::from_ref(&candidate.effects),
+            &candidate,
+        ) {
             tracing::error!("Failed to persist block {}: {:#}", height, e);
             self.resolve_block(&hash, Err(format!("storage error: {e:#}")));
             return;
@@ -2412,6 +2424,7 @@ impl Node {
         let source = chunk.source;
         tokio::task::spawn_blocking(move || {
             let mut applied = Vec::new();
+            let mut effects = Vec::new();
             let mut error = None;
             for (batch, header) in chunk.batches.into_iter().zip(chunk.headers) {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2432,6 +2445,7 @@ impl Node {
                     ts.pop_front();
                 }
                 applied.push(batch);
+                effects.push(state.effects.clone());
             }
             let _ = tx.send(Internal::BatchesApplied {
                 session: id,
@@ -2439,11 +2453,13 @@ impl Node {
                 candidate: state,
                 timestamps: ts,
                 applied,
+                effects,
                 error,
             });
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn on_batches_applied(
         &mut self,
         id: u64,
@@ -2451,6 +2467,7 @@ impl Node {
         new_state: State,
         new_ts: VecDeque<u64>,
         applied: Vec<Batch>,
+        effects: Vec<Arc<crate::core::types::BlockEffects>>,
         error: Option<String>,
     ) {
         let Some(mut s) = self.sync.take() else {
@@ -2480,7 +2497,10 @@ impl Node {
                 if !applied.is_empty() {
                     if our_height != first {
                         fatal = Some((false, "chain tip moved during sync".into()));
-                    } else if let Err(e) = self.storage.commit_chain(first, &applied, &new_state) {
+                    } else if let Err(e) = self
+                        .storage
+                        .commit_chain(first, &applied, &effects, &new_state)
+                    {
                         fatal = Some((false, format!("persisting synced blocks failed: {e:#}")));
                     } else {
                         self.adopt_chain(new_state.clone(), new_ts, first, &applied, false);
@@ -2488,12 +2508,17 @@ impl Node {
                 }
             } else {
                 b.staged.extend(applied);
+                b.staged_effects.extend(effects);
                 let heavier = new_state.weight() > self.state.weight()
                     && choose_best_state(&self.state, &new_state).mw_midstate
                         == new_state.mw_midstate;
                 if heavier {
                     let blocks = std::mem::take(&mut b.staged);
-                    match self.storage.commit_chain(b.fork, &blocks, &new_state) {
+                    let staged_effects = std::mem::take(&mut b.staged_effects);
+                    match self
+                        .storage
+                        .commit_chain(b.fork, &blocks, &staged_effects, &new_state)
+                    {
                         Ok(()) => {
                             tracing::warn!(
                                 "REORG: replaced {} block(s) from height {}; new height {}",
