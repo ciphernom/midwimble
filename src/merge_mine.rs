@@ -8,7 +8,8 @@
 //! 2. Ask midstate for its coinbase total (its `/block_template` answers a
 //!    wrong total with the expected one), split it into midstate's
 //!    power-of-two outputs, and put the merge commitment in the salt of the
-//!    last (largest) output so no outputs follow it in the proof.
+//!    last (largest) output: consensus accepts it nowhere else, so that one
+//!    parent header commits to exactly one midwimble block.
 //! 3. Rebuild midstate's fold from the returned `batch_template` and check it
 //!    reproduces the node's `mining_midstate` exactly; refuse to hash otherwise.
 //! 4. Hash against the easier of the two targets. A result below midstate's

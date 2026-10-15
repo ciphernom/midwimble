@@ -137,6 +137,52 @@ async fn a_pool_mines_midwimble_with_its_midstate_search() {
             }),
         );
 
+        // A pool that planted the commitment in an earlier output (so that
+        // other outputs follow it) is refused even with a genuine search:
+        // otherwise one solved parent could carry several blocks.
+        let not_last = {
+            let early: Vec<Value> = values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let salt = if i == 0 {
+                        commitment
+                    } else {
+                        hash(&(i as u64 + 100).to_le_bytes())
+                    };
+                    json!({
+                        "address": hex::encode([0x22u8; 32]),
+                        "value": v,
+                        "salt": hex::encode(salt),
+                    })
+                })
+                .collect();
+            let tpl = ms
+                .post("/block_template", &json!({ "coinbase": early }))
+                .expect("/block_template");
+            let parent = bytes32(&tpl["mining_midstate"]).unwrap();
+            let (nonce, final_hash) = (0u64..)
+                .find_map(|nonce| {
+                    let ext = create_extension(parent, nonce);
+                    (ext.final_hash < target).then_some((nonce, ext.final_hash))
+                })
+                .expect("a nonce below the target");
+            mw.post(
+                "/merge/found",
+                &json!({
+                    "mining_hash": job["mining_hash"],
+                    "batch_template": tpl["batch_template"],
+                    "commit_index": 0,
+                    "nonce": nonce,
+                    "final_hash": hex::encode(final_hash),
+                }),
+            )
+        };
+        assert!(
+            values.len() > 1,
+            "the mock's reward splits into several outputs"
+        );
+
         // 4. Hand it back.
         let found = mw
             .post(
@@ -150,16 +196,18 @@ async fn a_pool_mines_midwimble_with_its_midstate_search() {
                 }),
             )
             .expect("/merge/found");
-        (job, found, stale.is_err(), wrong_output.is_err())
+        (job, found, stale.is_err(), wrong_output.is_err(), not_last)
     })
     .await
     .unwrap();
-    let (job, found, stale_refused, wrong_output_refused) = job_and_result;
+    let (job, found, stale_refused, wrong_output_refused, not_last) = job_and_result;
     assert!(stale_refused, "a mining hash the node never issued was accepted");
     assert!(
         wrong_output_refused,
         "a commitment claimed in the wrong coinbase output was accepted"
     );
+    let err = not_last.expect_err("a commitment followed by other outputs was accepted");
+    assert!(err.to_string().contains("last output"), "{err:#}");
 
     assert_eq!(found["accepted"], true, "{found}");
     assert_eq!(found["merged_mined"], true, "the block carries its aux proof");

@@ -32,9 +32,9 @@ miners the fractured wallet that importing mined coinbases produces.
 ## Why it works
 
 Midstate's pool already plants its score-commitment root in the salt of a
-coinbase output. Midwimble's merged-mining commitment goes in a coinbase
-output's salt too. They simply live in different outputs of the same coinbase,
-and neither knows about the other.
+coinbase output. Midwimble's merged-mining commitment goes in the salt of the
+coinbase's last output. They simply live in different outputs of the same
+coinbase, and neither knows about the other.
 
 A share is a midstate header that met the pool's share target. If that same
 header happens to clear midwimble's target, it is a valid midwimble block,
@@ -78,8 +78,11 @@ applies it.
    midwimble).
 2. **Building a job:** call `/merge/job` with the same score table the job's
    precommitment root is built from, put the returned commitment in the salt of
-   one coinbase output, and remember that output's index. Keep the returned
-   target in the job.
+   the coinbase's **last** output, and remember that output's index. Keep the
+   returned target in the job. Consensus accepts the commitment in the last
+   output only: a commitment anywhere else would let one solved parent seal
+   several conflicting midwimble blocks at the same height, so the node refuses
+   it. The pool's own score root goes in any earlier output.
 3. **Processing a share:** if the share's final hash also clears the job's
    midwimble target, call `/merge/found` with the job's batch template, the
    commitment output's index, and the share's nonce and final hash.
@@ -91,10 +94,10 @@ as before.
 Both endpoints are exercised end to end by `tests/pool_merge.rs`, against a
 stand-in midstate node: a pool asks for a commitment, plants it, searches once,
 and hands back a nonce that becomes a merge-mined midwimble block signed by the
-operator's bond. The test also checks the two refusals that matter — a mining
-hash the node never issued, and a commitment claimed in the wrong coinbase
-output — because the node rebuilds the proof itself rather than trusting the
-pool.
+operator's bond. The test also checks the refusals that matter — a mining
+hash the node never issued, a commitment claimed in the wrong coinbase output,
+and a commitment that is not in the last output — because the node rebuilds
+the proof itself rather than trusting the pool.
 
 ## Failure behaviour
 

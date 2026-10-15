@@ -7,7 +7,7 @@
 //!
 //! # Commitment
 //!
-//! One parent coinbase output, normally the last, has
+//! The parent's **last** coinbase output has
 //!
 //! ```text
 //!   salt = H("midwimble.merge-mining.v1", NETWORK_MAGIC, aux_mining_hash)
@@ -15,6 +15,14 @@
 //!
 //! where `aux_mining_hash` is the midwimble block's own header hash, which
 //! commits to every byte of the block and to its target.
+//!
+//! Only the last output may carry it. The proof hands the verifier the parent's
+//! fold state just before the committing output, so if any output could carry
+//! a commitment, one parent coinbase could commit to several midwimble blocks
+//! at once — one solved parent, any number of conflicting siblings at the same
+//! height, which is free equivocation for a merged miner. The last fold item
+//! before the state root is unique, so a parent header commits to exactly one
+//! midwimble block.
 //!
 //! # Why the parent's work is valid here
 //!
@@ -30,15 +38,14 @@
 //!
 //! and midwimble's native proof of work is the same function with the same N.
 //! The proof carries the fold state just before the committing output (the
-//! prefix cannot affect the binding), that output's address and value, the
-//! coin ids after it, and the parent's header fields. A verifier recomputes
-//! the parent mining hash and the whole chain, and requires
-//! `final < midwimble target`.
+//! prefix cannot affect the binding), that output's address and value, and the
+//! parent's header fields. A verifier recomputes the parent mining hash and
+//! the whole chain, and requires `final < midwimble target`.
 //!
 //! As with Bitcoin/Namecoin AuxPoW, the parent need not be valid on midstate;
-//! only its work counts, and only against midwimble's own target. A parent can
-//! commit to several midwimble blocks (several salts), so an aux block's id is
-//! `H(parent_final ‖ aux_mining_hash)`, never the bare parent hash.
+//! only its work counts, and only against midwimble's own target. An aux
+//! block's id is `H(parent_final ‖ aux_mining_hash)`, never the bare parent
+//! hash, so it can never be mistaken for the parent's own id.
 
 use super::extension::{create_extension, verify_extension};
 use super::simd_mining::pow_seed;
@@ -49,19 +56,24 @@ use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Parent coinbase outputs allowed after the committing one. Keeps headers
-/// small; merged miners put the commitment last so this is normally zero.
-pub const MAX_COINBASE_AFTER: usize = 16;
+/// Parent coinbase outputs allowed after the committing one: none. The
+/// commitment must be the parent's last fold item before its state root,
+/// which is what makes one parent header commit to one midwimble block (see
+/// the module docs). The field stays in [`AuxPow`] so the proof keeps its
+/// shape, and must be empty.
+pub const MAX_COINBASE_AFTER: usize = 0;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct AuxPow {
     /// Parent fold state after its transactions and the coinbase outputs that
     /// precede the committing one.
     pub pre_commit_midstate: [u8; 32],
-    /// The committing output (its salt is [`merge_commitment`]).
+    /// The committing output (its salt is [`merge_commitment`]): the parent
+    /// coinbase's last output.
     pub commit_address: [u8; 32],
     pub commit_value: u64,
-    /// Coin ids of parent coinbase outputs after the committing one.
+    /// Coin ids of parent coinbase outputs after the committing one. Always
+    /// empty ([`MAX_COINBASE_AFTER`]).
     pub coinbase_after: Vec<[u8; 32]>,
     pub state_root: [u8; 32],
     pub prev_header_hash: [u8; 32],
@@ -144,7 +156,10 @@ impl AuxPow {
         target: &[u8; 32],
     ) -> Result<()> {
         if self.coinbase_after.len() > MAX_COINBASE_AFTER {
-            bail!("merged-mining proof lists too many trailing coinbase outputs");
+            bail!(
+                "the merge commitment must be the parent coinbase's last output \
+                 (one parent commits to one block)"
+            );
         }
         if extension.nonce != 0 || extension.final_hash != self.block_id(aux_mining_hash) {
             bail!("merged-mined block id does not match its proof");
@@ -231,7 +246,11 @@ impl ParentTemplate {
         }
         let (commit_address, commit_value, commit_salt) = commit.expect("index checked");
         if after.len() > MAX_COINBASE_AFTER {
-            bail!("too many coinbase outputs after the commitment");
+            bail!(
+                "the merge commitment must be in the coinbase's last output (index {}), not {}",
+                coinbase.len() - 1,
+                commit_index
+            );
         }
         Ok(Self {
             pre_commit_midstate: m,
@@ -403,7 +422,7 @@ mod tests {
             commit_address: [1; 32],
             commit_value: 64,
             commit_salt: merge_commitment(aux_hash),
-            coinbase_after: vec![[2; 32]],
+            coinbase_after: vec![],
             state_root: [3; 32],
             prev_header_hash: [4; 32],
             timestamp: 1_000,
@@ -573,9 +592,56 @@ mod tests {
         });
         parent.check(&aux_hash, &expected).unwrap();
         assert!(parent.check(&[0; 32], &expected).is_err());
-        assert!(ParentTemplate::from_midstate_json(&batch, 0)
-            .unwrap()
-            .check(&aux_hash, &expected)
-            .is_err());
+        // The commitment may only sit in the coinbase's last output.
+        assert!(ParentTemplate::from_midstate_json(&batch, 0).is_err());
+    }
+
+    /// The equivocation this rule closes: a parent coinbase carrying two
+    /// commitments. Solved once, it used to seal two different blocks at the
+    /// same height; now only the commitment in the last output is a proof.
+    #[test]
+    fn one_parent_commits_to_one_block() {
+        let (aux_a, aux_b) = ([0xa1u8; 32], [0xb2u8; 32]);
+        let target = [0xff; 32];
+        let (address, value) = ([1u8; 32], 64);
+        let prefix = hash(b"parent fold before the commitments");
+        let coin_a = midstate_coin_id(&address, value, &merge_commitment(&aux_a));
+        let coin_b = midstate_coin_id(&address, value, &merge_commitment(&aux_b));
+        // The parent coinbase ends [.., A's commitment, B's commitment].
+        let for_b = ParentTemplate {
+            pre_commit_midstate: hash_concat(&prefix, &coin_a),
+            commit_address: address,
+            commit_value: value,
+            commit_salt: merge_commitment(&aux_b),
+            coinbase_after: vec![],
+            state_root: [3; 32],
+            prev_header_hash: [4; 32],
+            timestamp: 1_000,
+            target,
+        };
+        let for_a = ParentTemplate {
+            pre_commit_midstate: prefix,
+            commit_salt: merge_commitment(&aux_a),
+            coinbase_after: vec![coin_b],
+            ..for_b.clone()
+        };
+        let mining = for_b.proof(0, [0; 32]).parent_mining_hash(&aux_b);
+        assert_eq!(
+            mining,
+            for_a.proof(0, [0; 32]).parent_mining_hash(&aux_a),
+            "both proofs describe the same parent header"
+        );
+        let ext = create_extension(mining, 0);
+        let (proof_a, proof_b) = (
+            for_a.proof(0, ext.final_hash),
+            for_b.proof(0, ext.final_hash),
+        );
+        let id = |aux: &[u8; 32], p: &AuxPow| Extension {
+            nonce: 0,
+            final_hash: p.block_id(aux),
+        };
+        verify_pow(aux_b, &id(&aux_b, &proof_b), &target, Some(&proof_b)).unwrap();
+        let err = verify_pow(aux_a, &id(&aux_a, &proof_a), &target, Some(&proof_a)).unwrap_err();
+        assert!(err.to_string().contains("last output"), "{err}");
     }
 }
