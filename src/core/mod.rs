@@ -26,3 +26,5 @@ pub use types::{Batch, BatchHeader, Extension, State};
 
 #[cfg(all(test, feature = "fast-mining"))]
 mod chain_tests;
+#[cfg(test)]
+mod golden;

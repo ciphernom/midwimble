@@ -339,6 +339,10 @@ verify. The vendored copy keys the file by a seed fingerprint.
   assumed; pruning stays off (`docs/ANCHORING.md`).
 - [x] `EXTENSION_ITERATIONS` stays 1,000,000: midstate compatibility, and so
   merged mining.
+- [x] Consensus encodings pinned: block hashes cover bincode 1 encodings, so
+  bincode is pinned to `=1.3.3`, and `core/golden.rs` and the protocol tests
+  hold vectors for every hashed encoding and the wire format. Build releases
+  with `--locked`.
 - [ ] Rehearse against a real midstate node: bonded mining and merged mining
   (`scripts/rehearse.py`, `docs/REHEARSAL.md`).
 - [ ] Run the public testnet (`docs/TESTNET.md`): publish `scripts/testnet.json`,

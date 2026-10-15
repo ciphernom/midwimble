@@ -297,6 +297,37 @@ mod tests {
         assert!(msg.try_serialize_bin().is_err());
     }
 
+    /// The wire encoding (bincode's `DefaultOptions`: varint integers, enum
+    /// tags in declaration order). Peers built with a different one cannot
+    /// talk to this protocol id.
+    #[test]
+    fn wire_encoding_is_unchanged() {
+        let get = Message::GetHeaders {
+            start_height: 1_000,
+            count: 5,
+        };
+        let info = Message::StateInfo {
+            height: 300,
+            depth: 1 << 70,
+            weight: 251,
+            mw_midstate: [7; 32],
+        };
+        // Variant 11; 1,000 as 0xfb + u16; 5.
+        assert_eq!(hex::encode(get.serialize_bin()), "0bfbe80305");
+        // Variant 4; 300; 2^70 as 0xfe + u128; 251 as 0xfb + u16; the
+        // midstate as 32 raw bytes.
+        assert_eq!(
+            hex::encode(info.serialize_bin()),
+            concat!(
+                "04",
+                "fb2c01",
+                "fe00000000000000004000000000000000",
+                "fbfb00",
+                "0707070707070707070707070707070707070707070707070707070707070707",
+            )
+        );
+    }
+
     #[test]
     fn trailing_bytes_and_garbage_are_rejected() {
         let mut bytes = Message::GetState.serialize_bin();
