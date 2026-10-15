@@ -16,13 +16,12 @@
 //! no heavier than ours starts no new session until that chain could be
 //! ([`LighterChains`]).
 
-use crate::core::simd_mining::{pow_seed, verify_pow_batch};
+use crate::core::simd_mining::{check_pow_chains_with, pow_seed, PowCheck};
 use crate::core::state::{calculate_target, calculate_work, current_timestamp, validate_timestamp};
 use crate::core::types::{compute_header_hash, MEDIAN_TIME_PAST_WINDOW};
 use crate::core::{Batch, BatchHeader, State};
 use anyhow::{bail, Context as _, Result};
 use libp2p::PeerId;
-use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -120,9 +119,6 @@ pub fn verify_header_chain_with(
     }
 
     if check_pow {
-        // Midstate's approach: rayon over SIMD-width chunks, each chunk
-        // hashing all of its lanes' chains simultaneously.
-        let lanes = crate::core::simd_mining::detected_level().lanes().max(1);
         let checked: Vec<&BatchHeader> = headers.iter().filter(|h| h.height > 0).collect();
         // Each header's chain seed and expected result: its own for native
         // blocks, its parent's for merged-mined ones.
@@ -147,25 +143,15 @@ pub fn verify_header_chain_with(
                 }
             }
         }
-        // Pieces wide enough to keep every thread busy, small enough that an
-        // abandoned verification stops within seconds.
-        let piece = (lanes * rayon::current_num_threads() * 4).max(128);
-        for piece in jobs.chunks(piece) {
-            if !proceed(piece.len()) {
-                bail!("header verification abandoned");
-            }
-            let bad = piece.par_chunks(lanes).find_map_any(|chunk| {
-                let seeds: Vec<[u8; 32]> = chunk.iter().map(|j| j.1).collect();
-                let finals = verify_pow_batch(&seeds);
-                chunk
-                    .iter()
-                    .zip(finals)
-                    .find(|(j, f)| *f != j.2)
-                    .map(|(j, _)| j.0)
-            });
-            if let Some(height) = bad {
-                bail!("proof of work invalid at height {}", height);
-            }
+        // The first header alone, so a chunk whose first header is forged
+        // costs one extension; then pieces wide enough to keep every thread
+        // busy, small enough that an abandoned verification stops within
+        // seconds.
+        let chains: Vec<([u8; 32], [u8; 32])> = jobs.iter().map(|j| (j.1, j.2)).collect();
+        match check_pow_chains_with(&chains, &mut proceed) {
+            Ok(()) => {}
+            Err(PowCheck::Bad(i)) => bail!("proof of work invalid at height {}", jobs[i].0),
+            Err(PowCheck::Abandoned) => bail!("header verification abandoned"),
         }
     }
     Ok(())

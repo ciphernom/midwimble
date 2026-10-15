@@ -88,15 +88,26 @@ pub enum Message {
 }
 
 pub const MAX_ANCHORS_PER_MESSAGE: usize = 64;
+/// Responders stop adding anchor records once a response reaches this size
+/// (each carries a confirmation header per Midstate block of depth).
+pub const ANCHORS_RESPONSE_SOFT_LIMIT: usize = 8_000_000;
 pub const SNAPSHOT_PART_BYTES: usize = 4_000_000;
 
 impl Message {
     pub fn serialize_bin(&self) -> Vec<u8> {
+        self.try_serialize_bin()
+            .expect("message exceeds MAX_MSG_SIZE")
+    }
+
+    /// The wire encoding, or an error if it would exceed [`MAX_MSG_SIZE`].
+    /// Writers use this: an oversized response fails its stream instead of
+    /// panicking the connection task.
+    pub fn try_serialize_bin(&self) -> io::Result<Vec<u8>> {
         use bincode::Options;
         bincode::DefaultOptions::new()
             .with_limit(MAX_MSG_SIZE as u64)
             .serialize(self)
-            .expect("message exceeds MAX_MSG_SIZE")
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     pub fn serialized_size(&self) -> u64 {
@@ -232,7 +243,7 @@ async fn read_message<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<Mes
 }
 
 async fn write_message<T: AsyncWrite + Unpin + Send>(io: &mut T, msg: &Message) -> io::Result<()> {
-    let bytes = msg.serialize_bin();
+    let bytes = msg.try_serialize_bin()?;
     io.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
     io.write_all(&bytes).await?;
     io.close().await?;
@@ -266,6 +277,17 @@ mod tests {
             Message::Batches { batches, .. } => assert_eq!(&batches[0], Batch::genesis()),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn oversized_messages_are_an_error_not_a_panic() {
+        let msg = Message::SnapshotPart {
+            checkpoint_id: [0; 32],
+            part: 0,
+            total: 1,
+            data: vec![0; MAX_MSG_SIZE],
+        };
+        assert!(msg.try_serialize_bin().is_err());
     }
 
     #[test]

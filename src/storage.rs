@@ -58,6 +58,9 @@ const SIGNERS: TableDefinition<u64, &[u8]> = TableDefinition::new("signers");
 /// leaves that cap out, which is harmless: fork choice only compares branches
 /// that share every entry below the point where they part.
 const CAPPED: TableDefinition<u64, &[u8]> = TableDefinition::new("capped");
+/// Cumulative proof of work of the chain up to and including each block, so
+/// finality can compare a checkpoint's claimed work without summing headers.
+const DEPTHS: TableDefinition<u64, &[u8]> = TableDefinition::new("depths");
 const SYNC_HEADERS: TableDefinition<u64, &[u8]> = TableDefinition::new("sync_headers");
 const PEERS: TableDefinition<&str, &[u8]> = TableDefinition::new("peers");
 
@@ -269,6 +272,7 @@ impl Storage {
             txn.open_table(PEERS)?;
             txn.open_table(SIGNERS)?;
             txn.open_table(CAPPED)?;
+            txn.open_table(DEPTHS)?;
         }
         txn.commit()?;
         Ok(Self { db: Arc::new(db) })
@@ -356,6 +360,20 @@ impl Storage {
 
     pub fn finality(&self) -> Result<FinalityInfo> {
         Ok(self.meta("finality")?.unwrap_or_default())
+    }
+
+    /// Cumulative proof of work of the stored chain up to and including the
+    /// block at `height`, if this database recorded it (blocks stored before
+    /// the table existed, and blocks below a snapshot base other than its
+    /// tip, did not).
+    pub fn depth_after(&self, height: u64) -> Result<Option<u128>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(DEPTHS)?;
+        let value = table.get(height)?;
+        Ok(match value {
+            Some(v) => Some(bincode::deserialize(v.value())?),
+            None => None,
+        })
     }
 
     pub fn set_finality(&self, info: &FinalityInfo) -> Result<()> {
@@ -586,6 +604,7 @@ impl Storage {
             let mut meta_table = txn.open_table(META)?;
             let mut signer_log = txn.open_table(SIGNERS)?;
             let mut capped_table = txn.open_table(CAPPED)?;
+            let mut depth_table = txn.open_table(DEPTHS)?;
 
             let stored: Option<StateMeta> = match meta_table.get("state_meta")? {
                 Some(v) => Some(bincode::deserialize(v.value())?),
@@ -633,6 +652,7 @@ impl Storage {
                 headers.remove(h)?;
                 signer_log.remove(h)?;
                 capped_table.remove(h)?;
+                depth_table.remove(h)?;
                 meta = undo.prev;
             }
 
@@ -774,6 +794,7 @@ impl Storage {
                 capped = capped.saturating_add(work - credited);
                 signer_log.insert(height, signer_to_log(signer).as_slice())?;
                 capped_table.insert(height, enc(&capped)?.as_slice())?;
+                depth_table.insert(height, enc(&next.depth)?.as_slice())?;
                 let undo = BlockUndo {
                     spent,
                     created,
@@ -1003,6 +1024,10 @@ impl Storage {
             for header in &snapshot.headers {
                 headers.insert(header.height, enc(header)?.as_slice())?;
             }
+            txn.open_table(DEPTHS)?.insert(
+                h - 1,
+                enc(&snapshot.checkpoint.mw_cumulative_work)?.as_slice(),
+            )?;
             let mut meta = txn.open_table(META)?;
             meta.insert("state_meta", enc(&StateMeta::of(state))?.as_slice())?;
             let base = SnapshotBase {

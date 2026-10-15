@@ -6,10 +6,13 @@
 //!
 //! * **Nothing expensive runs on the event loop.** Block validation, orphan
 //!   proof-of-work checks, transaction proof verification, header
-//!   verification, fork-state derivation and block application all run on
-//!   blocking workers and report back through an internal channel. Blocks are
-//!   validated one at a time against the tip they were started on; a result
-//!   that arrives after the tip moved is simply re-evaluated.
+//!   verification, fork-state derivation, block application, anchor
+//!   evidence verification, reading the anchor store, and serving headers,
+//!   blocks and filters from storage all run on blocking workers and report
+//!   back through an internal channel, each kind with a bound on how many
+//!   run at once. Blocks are validated one at a time against the tip they
+//!   were started on; a result that arrives after the tip moved is simply
+//!   re-evaluated.
 //! * **New blocks** (midstate `handle_new_batch`): extend the tip after full
 //!   validation, or screen the proof of work of an orphan, hold it in a
 //!   bounded pool, and ask the sender for its state.
@@ -34,7 +37,7 @@
 //!   transactions that time out together are aggregated before fluffing.
 //! * **Mining** on a dedicated thread, restarted on every tip or pool change.
 
-use crate::anchor::{load_records, AnchorRecord};
+use crate::anchor::{load_records, load_records_from, AnchorRecord};
 use crate::core::auxpow::verify_pow;
 use crate::core::filter::CompactFilter;
 use crate::core::mw::{Context, StealthAddress, Transaction};
@@ -45,13 +48,17 @@ use crate::core::types::{
     compute_header_hash, utxo_leaf, Batch, BatchHeader, State, DIFFICULTY_LOOKBACK, KERNEL_WEIGHT,
     MAX_BLOCK_WEIGHT, MEDIAN_TIME_PAST_WINDOW, OUTPUT_WEIGHT,
 };
-use crate::finality::{FinalityConfig, FinalityTracker};
+use crate::finality::{
+    precheck, verify_evidence, CheckedLinks, FinalityConfig, FinalityTracker, RecordFault,
+};
 use crate::mempool::{Mempool, ReorgCache};
 use crate::miner::{MinedBlock, Miner};
 use crate::network::amino::{self, AminoHandle};
 use crate::network::light_protocol::{LightNotification, LightRequest, LightResponse};
 use crate::network::protocol::BATCH_RESPONSE_SOFT_LIMIT;
-use crate::network::protocol::{MAX_ANCHORS_PER_MESSAGE, SNAPSHOT_PART_BYTES};
+use crate::network::protocol::{
+    ANCHORS_RESPONSE_SOFT_LIMIT, MAX_ANCHORS_PER_MESSAGE, SNAPSHOT_PART_BYTES,
+};
 use crate::network::{Message, Network, NetworkEvent, MAX_GETBATCHES_COUNT, MAX_GETHEADERS_COUNT};
 use crate::storage::FinalityInfo;
 use crate::storage::Storage;
@@ -82,6 +89,18 @@ const SEEN_TX_LIMIT: usize = 20_000;
 const MAX_PENDING_BLOCKS: usize = 16;
 const MAX_ORPHAN_CHECKS: usize = 4;
 const MAX_TX_VALIDATIONS: usize = 64;
+/// Anchor-evidence verifications at once (each can keep every core busy for
+/// seconds), and batches of records waiting for one.
+const MAX_ANCHOR_JOBS: usize = 2;
+const MAX_QUEUED_ANCHOR_BATCHES: usize = 16;
+/// Records taken from the anchor store per read; the next read waits until
+/// they are verified.
+const STORE_RECORDS_PER_READ: usize = 256;
+/// Requests served from storage off the event loop at once, in all and per
+/// peer. An honest syncing peer has at most `MAX_BATCH_REQUESTS_IN_FLIGHT`
+/// block requests and one header request outstanding with us.
+const MAX_SERVE_JOBS: usize = 16;
+const MAX_SERVE_JOBS_PER_PEER: usize = MAX_BATCH_REQUESTS_IN_FLIGHT + 2;
 
 // ── Configuration and handle ────────────────────────────────────────────────
 
@@ -289,6 +308,30 @@ impl TxReply {
     }
 }
 
+/// Who handed the node anchor records, and so who hears about them.
+enum AnchorSource {
+    /// Gossip: forged evidence gets the peer banned.
+    Peer(PeerId),
+    /// The RPC, waiting for the verdict.
+    Rpc(oneshot::Sender<Result<()>>),
+    /// The node's anchor store.
+    File,
+}
+
+/// Anchor records waiting for verification.
+struct AnchorBatch {
+    source: AnchorSource,
+    records: Vec<AnchorRecord>,
+    /// Digests of `records`, held in `Node::anchors_in_flight`.
+    digests: Vec<[u8; 32]>,
+}
+
+/// Identifies a record with its exact evidence, so a forged copy of a
+/// checkpoint's record cannot shadow the genuine one while both wait.
+fn record_digest(record: &AnchorRecord) -> [u8; 32] {
+    crate::core::types::hash(&bincode::serialize(record).unwrap_or_default())
+}
+
 enum TxOrigin {
     /// Fluff-phase gossip.
     Gossip(Option<PeerId>),
@@ -335,6 +378,23 @@ enum Internal {
         timestamps: VecDeque<u64>,
         applied: Vec<Batch>,
         error: Option<String>,
+    },
+    AnchorsChecked {
+        source: AnchorSource,
+        digests: Vec<[u8; 32]>,
+        verified: Vec<AnchorRecord>,
+        /// Records that failed, with why.
+        faults: Vec<(String, RecordFault)>,
+    },
+    AnchorStoreRead {
+        records: Vec<AnchorRecord>,
+        offset: u64,
+    },
+    /// A request served off the event loop; `channel` is `None` for light
+    /// clients, which were answered directly.
+    Served {
+        peer: PeerId,
+        reply: Option<(ResponseChannel<Message>, Message)>,
     },
 }
 
@@ -427,7 +487,22 @@ pub struct Node {
     /// Miners waiting to hear what became of a submitted block.
     block_replies: HashMap<[u8; 32], Vec<oneshot::Sender<Result<()>>>>,
     finality: FinalityTracker,
-    anchors_seen_len: u64,
+    /// Anchor verification: running jobs, waiting batches, peers with a
+    /// batch waiting or running, digests of the records in either, and the
+    /// Midstate headers already verified.
+    anchor_jobs: usize,
+    anchor_queue: VecDeque<AnchorBatch>,
+    anchor_peers: HashSet<PeerId>,
+    anchors_in_flight: HashSet<[u8; 32]>,
+    checked_links: CheckedLinks,
+    /// How far the anchor store has been read, whether a read is running,
+    /// and how many of its batches are waiting or being verified.
+    anchor_store_offset: u64,
+    anchor_store_reading: bool,
+    anchor_store_batches: usize,
+    /// Requests being served off the event loop, per peer and in all.
+    serving: HashMap<PeerId, usize>,
+    serving_total: usize,
     snapshot_cache: Option<([u8; 32], Arc<Vec<u8>>)>,
     snapshot_building: Option<[u8; 32]>,
 }
@@ -556,12 +631,22 @@ impl Node {
             last_tip_change: Instant::now(),
             block_replies: HashMap::new(),
             finality,
-            anchors_seen_len: 0,
+            anchor_jobs: 0,
+            anchor_queue: VecDeque::new(),
+            anchor_peers: HashSet::new(),
+            anchors_in_flight: HashSet::new(),
+            checked_links: CheckedLinks::default(),
+            anchor_store_offset: 0,
+            anchor_store_reading: false,
+            anchor_store_batches: 0,
+            serving: HashMap::new(),
+            serving_total: 0,
             snapshot_cache: None,
             snapshot_building: None,
         };
+        // Stored anchor records are read and verified in the background
+        // once the node runs; the floor itself was persisted.
         node.cache_state();
-        node.refresh_finality();
         Ok((node, handle))
     }
 
@@ -621,7 +706,8 @@ impl Node {
                 }
                 _ = poll.tick() => {
                     self.poll_peers();
-                    self.refresh_finality();
+                    self.read_anchor_store();
+                    self.refresh_floor();
                 }
                 _ = slow.tick() => self.maintenance().await,
             }
@@ -653,7 +739,7 @@ impl Node {
         info.hashes = self.miner.hashes.load(std::sync::atomic::Ordering::Relaxed);
         info.sync_stats = self.sync_stats.clone();
         info.finality = self.storage.finality().unwrap_or_default();
-        info.anchors_known = self.finality.records(usize::MAX).len();
+        info.anchors_known = self.finality.len();
     }
 
     fn cache_state(&mut self) {
@@ -782,11 +868,7 @@ impl Node {
             }
             Command::Dial(addr) => self.network.dial_trusted(addr),
             Command::SubmitAnchor(record, reply) => {
-                let result = self.finality.add(record).map(|_| ());
-                if result.is_ok() {
-                    self.refresh_finality();
-                }
-                let _ = reply.send(result);
+                self.queue_anchors(AnchorSource::Rpc(reply), vec![record])
             }
             Command::Anchors(reply) => {
                 let _ = reply.send(self.finality.records(usize::MAX));
@@ -822,6 +904,10 @@ impl Node {
                                 respond.send(LightResponse::error(format!("bad transaction: {e}")));
                         }
                     }
+                    return;
+                }
+                if request_reads_storage(&request) {
+                    self.serve_light(peer, request, respond);
                     return;
                 }
                 let response = self.handle_light_request(request);
@@ -877,19 +963,12 @@ impl Node {
             Message::GetHeaders {
                 start_height,
                 count,
-            } => {
-                let headers = self
-                    .storage
+            } => self.serve(peer, channel, move |storage| Message::Headers {
+                start_height,
+                headers: storage
                     .load_headers(start_height, count.min(MAX_GETHEADERS_COUNT))
-                    .unwrap_or_default();
-                self.respond(
-                    channel,
-                    Message::Headers {
-                        start_height,
-                        headers,
-                    },
-                );
-            }
+                    .unwrap_or_default(),
+            }),
             Message::Headers {
                 start_height,
                 headers,
@@ -901,21 +980,13 @@ impl Node {
                 start_height,
                 count,
             } => {
-                let batches = self
-                    .storage
-                    .load_batches(
-                        start_height,
-                        count.min(MAX_GETBATCHES_COUNT),
-                        self.config.batch_response_bytes,
-                    )
-                    .unwrap_or_default();
-                self.respond(
-                    channel,
-                    Message::Batches {
-                        start_height,
-                        batches,
-                    },
-                );
+                let limit = self.config.batch_response_bytes;
+                self.serve(peer, channel, move |storage| Message::Batches {
+                    start_height,
+                    batches: storage
+                        .load_batches(start_height, count.min(MAX_GETBATCHES_COUNT), limit)
+                        .unwrap_or_default(),
+                })
             }
             Message::Batches {
                 start_height,
@@ -961,21 +1032,15 @@ impl Node {
                 }
             }
             Message::GetAnchors => {
-                let list = self.finality.records(MAX_ANCHORS_PER_MESSAGE);
+                let list = self
+                    .finality
+                    .records_within(MAX_ANCHORS_PER_MESSAGE, ANCHORS_RESPONSE_SOFT_LIMIT);
                 self.respond(channel, Message::Anchors(list));
             }
-            Message::Anchors(list) => {
+            Message::Anchors(mut list) => {
                 self.ack(channel);
-                let mut added = false;
-                for record in list.into_iter().take(MAX_ANCHORS_PER_MESSAGE) {
-                    match self.finality.add(record) {
-                        Ok(new) => added |= new,
-                        Err(e) => tracing::debug!("ignoring anchor from {}: {:#}", peer, e),
-                    }
-                }
-                if added {
-                    self.refresh_finality();
-                }
+                list.truncate(MAX_ANCHORS_PER_MESSAGE);
+                self.queue_anchors(AnchorSource::Peer(peer), list);
             }
             Message::GetSnapshot {
                 checkpoint_id,
@@ -1015,6 +1080,31 @@ impl Node {
             } => self.on_orphan_checked(batch, from, pow_ok),
             Internal::TxValidated { tx, origin, result } => {
                 self.on_tx_validated(tx, origin, result)
+            }
+            Internal::AnchorsChecked {
+                source,
+                digests,
+                verified,
+                faults,
+            } => self.on_anchors_checked(source, digests, verified, faults),
+            Internal::AnchorStoreRead { records, offset } => {
+                self.anchor_store_reading = false;
+                self.anchor_store_offset = offset;
+                if !records.is_empty() {
+                    self.queue_anchors(AnchorSource::File, records);
+                }
+            }
+            Internal::Served { peer, reply } => {
+                self.serving_total = self.serving_total.saturating_sub(1);
+                if let Some(n) = self.serving.get_mut(&peer) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        self.serving.remove(&peer);
+                    }
+                }
+                if let Some((channel, message)) = reply {
+                    self.network.respond(channel, message);
+                }
             }
             Internal::HeadersVerified {
                 session,
@@ -2482,22 +2572,225 @@ impl Node {
             .unwrap_or_else(|| self.config.data_dir.join("anchors.jsonl"))
     }
 
-    fn refresh_finality(&mut self) {
-        let path = self.anchors_path();
-        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        if len != self.anchors_seen_len {
-            self.anchors_seen_len = len;
-            match load_records(&path) {
-                Ok(records) => {
-                    for r in records {
-                        if let Err(e) = self.finality.add(r) {
-                            tracing::debug!("ignoring stored anchor: {:#}", e);
-                        }
+    // Anchor records are checked in two steps. The cheap checks (the
+    // record's id, its network, and that its evidence is as deep and as
+    // heavy as this node requires) run here. Records that pass are verified
+    // on a blocking worker, at most `MAX_ANCHOR_JOBS` batches at a time:
+    // each costs an extension per Midstate header not verified before.
+    // Evidence that is weaker than we ask for may be another node's policy
+    // and is just ignored; evidence that is forged gets its sender banned.
+
+    /// Takes anchor records from `source`: drops those already known or
+    /// waiting, checks the rest cheaply, and queues them for verification.
+    fn queue_anchors(&mut self, source: AnchorSource, list: Vec<AnchorRecord>) {
+        let mut records = Vec::new();
+        let mut digests = Vec::new();
+        let mut weak: Option<anyhow::Error> = None;
+        for mut record in list {
+            if self.finality.knows(&record.checkpoint.id()) {
+                continue;
+            }
+            match precheck(&mut record, &self.finality.cfg) {
+                Ok(()) => {}
+                Err(RecordFault::Policy(e)) => {
+                    tracing::debug!("ignoring anchor {}: {:#}", record.checkpoint_id, e);
+                    weak = Some(e);
+                    continue;
+                }
+                Err(fault @ RecordFault::Invalid(_)) => {
+                    let faults = vec![(record.checkpoint_id.clone(), fault)];
+                    if matches!(source, AnchorSource::File) {
+                        self.report_anchor_faults(AnchorSource::File, faults);
+                        continue;
+                    }
+                    return self.report_anchor_faults(source, faults);
+                }
+            }
+            let digest = record_digest(&record);
+            if self.anchors_in_flight.contains(&digest) || digests.contains(&digest) {
+                continue;
+            }
+            records.push(record);
+            digests.push(digest);
+        }
+        if records.is_empty() {
+            if let AnchorSource::Rpc(reply) = source {
+                let _ = reply.send(weak.map_or(Ok(()), Err));
+            }
+            return;
+        }
+        match &source {
+            AnchorSource::Peer(peer) => {
+                if self.anchor_queue.len() >= MAX_QUEUED_ANCHOR_BATCHES
+                    || !self.anchor_peers.insert(*peer)
+                {
+                    tracing::debug!("anchor verification busy; dropping records from {}", peer);
+                    return;
+                }
+            }
+            AnchorSource::Rpc(_) if self.anchor_queue.len() >= MAX_QUEUED_ANCHOR_BATCHES => {
+                if let AnchorSource::Rpc(reply) = source {
+                    let _ = reply.send(Err(anyhow!("anchor verification is busy; try again")));
+                }
+                return;
+            }
+            _ => {}
+        }
+        self.anchors_in_flight.extend(digests.iter().copied());
+        if matches!(source, AnchorSource::File) {
+            // Batches the size of a message, so peers' batches interleave.
+            while records.len() > MAX_ANCHORS_PER_MESSAGE {
+                let rest = records.split_off(MAX_ANCHORS_PER_MESSAGE);
+                let rest_digests = digests.split_off(MAX_ANCHORS_PER_MESSAGE);
+                self.anchor_store_batches += 1;
+                self.anchor_queue.push_back(AnchorBatch {
+                    source: AnchorSource::File,
+                    records: std::mem::replace(&mut records, rest),
+                    digests: std::mem::replace(&mut digests, rest_digests),
+                });
+            }
+            self.anchor_store_batches += 1;
+        }
+        self.anchor_queue.push_back(AnchorBatch {
+            source,
+            records,
+            digests,
+        });
+        self.start_anchor_jobs();
+    }
+
+    fn start_anchor_jobs(&mut self) {
+        while self.anchor_jobs < MAX_ANCHOR_JOBS {
+            let Some(batch) = self.anchor_queue.pop_front() else {
+                return;
+            };
+            // Another batch may have brought the same checkpoints meanwhile.
+            let records: Vec<AnchorRecord> = batch
+                .records
+                .into_iter()
+                .filter(|r| !self.finality.knows(&r.checkpoint.id()))
+                .collect();
+            self.anchor_jobs += 1;
+            let source = batch.source;
+            let digests = batch.digests;
+            let (cfg, checked, tx) = (
+                self.finality.cfg.clone(),
+                self.checked_links.clone(),
+                self.internal_tx.clone(),
+            );
+            // Every record is checked even after a forgery is found: a copy
+            // of a genuine record in a forger's batch kept identical copies
+            // from other peers out of the queue. Each forged record costs
+            // one extension, its first header's.
+            tokio::task::spawn_blocking(move || {
+                let mut verified = Vec::new();
+                let mut faults = Vec::new();
+                for record in records {
+                    match verify_evidence(&record, &cfg, &checked) {
+                        Ok(()) => verified.push(record),
+                        Err(fault) => faults.push((record.checkpoint_id.clone(), fault)),
                     }
                 }
-                Err(e) => tracing::warn!("reading {}: {:#}", path.display(), e),
+                let _ = tx.send(Internal::AnchorsChecked {
+                    source,
+                    digests,
+                    verified,
+                    faults,
+                });
+            });
+        }
+    }
+
+    fn on_anchors_checked(
+        &mut self,
+        source: AnchorSource,
+        digests: Vec<[u8; 32]>,
+        verified: Vec<AnchorRecord>,
+        faults: Vec<(String, RecordFault)>,
+    ) {
+        self.anchor_jobs = self.anchor_jobs.saturating_sub(1);
+        for d in &digests {
+            self.anchors_in_flight.remove(d);
+        }
+        match &source {
+            AnchorSource::Peer(peer) => {
+                self.anchor_peers.remove(peer);
+            }
+            AnchorSource::File => {
+                self.anchor_store_batches = self.anchor_store_batches.saturating_sub(1)
+            }
+            AnchorSource::Rpc(_) => {}
+        }
+        let mut added = false;
+        for record in verified {
+            added |= self.finality.insert_verified(record);
+        }
+        if added {
+            self.refresh_floor();
+        }
+        self.report_anchor_faults(source, faults);
+        self.start_anchor_jobs();
+    }
+
+    /// Tells `source` what became of its records: bans a peer that sent
+    /// forged evidence, answers the RPC, logs for the store.
+    fn report_anchor_faults(&mut self, source: AnchorSource, faults: Vec<(String, RecordFault)>) {
+        match source {
+            AnchorSource::Peer(peer) => {
+                if let Some((id, fault)) = faults.into_iter().next() {
+                    self.ban_peer(peer, &format!("forged anchor {id}: {fault}"));
+                }
+            }
+            AnchorSource::Rpc(reply) => {
+                let _ = reply.send(match faults.into_iter().next() {
+                    Some((_, fault)) => Err(anyhow!("{fault}")),
+                    None => Ok(()),
+                });
+            }
+            AnchorSource::File => {
+                for (id, fault) in faults {
+                    tracing::warn!("ignoring stored anchor {id}: {fault}");
+                }
             }
         }
+    }
+
+    /// Reads records appended to the anchor store since the last read, on a
+    /// blocking worker, once the previous read's records are verified.
+    /// Records at or below the floor are skipped (except the floor's own,
+    /// which snapshots are served at): they can no longer finalize anything.
+    fn read_anchor_store(&mut self) {
+        if self.anchor_store_reading || self.anchor_store_batches > 0 {
+            return;
+        }
+        let path = self.anchors_path();
+        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if len == self.anchor_store_offset {
+            return;
+        }
+        self.anchor_store_reading = true;
+        let (offset, tx) = (self.anchor_store_offset, self.internal_tx.clone());
+        let floor = self.finality.floor();
+        let floor_id = self.storage.finality().ok().and_then(|f| f.checkpoint_id);
+        let wanted = move |r: &AnchorRecord| {
+            r.checkpoint.mw_height > floor || Some(r.checkpoint.id()) == floor_id
+        };
+        tokio::task::spawn_blocking(move || {
+            let read = load_records_from(&path, offset, STORE_RECORDS_PER_READ, wanted);
+            let (records, offset) = match read {
+                Ok(read) => read,
+                Err(e) => {
+                    tracing::warn!("reading {}: {:#}", path.display(), e);
+                    (Vec::new(), offset)
+                }
+            };
+            let _ = tx.send(Internal::AnchorStoreRead { records, offset });
+        });
+    }
+
+    /// Raises the finalized floor if a known checkpoint now qualifies.
+    /// Cheap: a few storage reads per known record.
+    fn refresh_floor(&mut self) {
         match self.finality.refresh(&self.storage, &self.state) {
             Ok(Some(info)) => {
                 if let Err(e) = self.storage.set_finality(&info) {
@@ -2507,19 +2800,90 @@ impl Node {
                 tracing::info!("checkpoint at height {} finalized", info.floor);
                 self.state_cache.retain(|h, _| *h >= info.floor);
                 if self.config.finality.prune {
-                    match self.storage.prune_bodies_below(info.floor) {
+                    let (storage, floor) = (self.storage.clone(), info.floor);
+                    tokio::task::spawn_blocking(move || match storage.prune_bodies_below(floor) {
                         Ok(n) if n > 0 => {
-                            tracing::info!("pruned {} block bodies below height {}", n, info.floor)
+                            tracing::info!("pruned {} block bodies below height {}", n, floor)
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!("pruning failed: {:#}", e),
-                    }
+                    });
                 }
                 self.publish_info();
             }
             Ok(None) => {}
             Err(e) => tracing::warn!("finality refresh failed: {:#}", e),
         }
+    }
+
+    // ── Serving requests off the event loop ─────────────────────────────
+
+    /// Counts a request about to be served off the event loop, unless the
+    /// peer or the node is at its limit.
+    fn start_serving(&mut self, peer: PeerId) -> bool {
+        let mine = self.serving.get(&peer).copied().unwrap_or(0);
+        if self.serving_total >= MAX_SERVE_JOBS || mine >= MAX_SERVE_JOBS_PER_PEER {
+            return false;
+        }
+        *self.serving.entry(peer).or_insert(0) += 1;
+        self.serving_total += 1;
+        true
+    }
+
+    /// Answers a peer's request from storage on a blocking worker. Past the
+    /// limits the request is dropped, which the peer sees as a failed
+    /// request (as it would a slow or departed peer's).
+    fn serve(
+        &mut self,
+        peer: PeerId,
+        channel: Option<ResponseChannel<Message>>,
+        build: impl FnOnce(&Storage) -> Message + Send + 'static,
+    ) {
+        let Some(channel) = channel else { return };
+        if !self.start_serving(peer) {
+            tracing::debug!("busy: dropping a request from {}", peer);
+            return;
+        }
+        let (storage, tx) = (self.storage.clone(), self.internal_tx.clone());
+        tokio::task::spawn_blocking(move || {
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&storage)));
+            let reply = built.ok().map(|message| (channel, message));
+            let _ = tx.send(Internal::Served { peer, reply });
+        });
+    }
+
+    /// A light client's request that reads storage, served like [`Node::serve`].
+    fn serve_light(
+        &mut self,
+        peer: PeerId,
+        request: LightRequest,
+        respond: oneshot::Sender<LightResponse>,
+    ) {
+        if !self.start_serving(peer) {
+            let _ = respond.send(LightResponse::error("busy; try again"));
+            return;
+        }
+        let (storage, tip, tx) = (
+            self.storage.clone(),
+            self.state.height,
+            self.internal_tx.clone(),
+        );
+        let honest = self.network.observe_honest_light_peer(peer);
+        tokio::spawn(async move {
+            let response = tokio::task::spawn_blocking(move || {
+                match light_from_storage(&storage, tip, request) {
+                    Ok(v) => LightResponse::success(v),
+                    Err(e) => LightResponse::error(format!("{e:#}")),
+                }
+            })
+            .await
+            .unwrap_or_else(|_| LightResponse::error("internal error"));
+            if response.ok {
+                honest.await;
+            }
+            let _ = respond.send(response);
+            let _ = tx.send(Internal::Served { peer, reply: None });
+        });
     }
 
     /// One part of a snapshot, building it in the background on first use.
@@ -2652,41 +3016,10 @@ impl Node {
                 "supply": self.state.supply,
                 "utxos": self.state.utxos.len(),
             }),
-            LightRequest::GetHeaders {
-                start_height,
-                count,
-            } => {
-                let headers = self
-                    .storage
-                    .load_headers(start_height, count.min(MAX_GETHEADERS_COUNT))?;
-                json!({ "headers_hex": hex::encode(bincode::serialize(&headers)?) })
-            }
-            LightRequest::GetBlock { height } => {
-                let batch = self
-                    .storage
-                    .load_batch(height)?
-                    .ok_or_else(|| anyhow!("no block at {height}"))?;
-                json!({ "height": height, "block_hex": hex::encode(bincode::serialize(&batch)?) })
-            }
-            LightRequest::GetFilters {
-                start_height,
-                end_height,
-            } => {
-                let end = end_height
-                    .min(start_height.saturating_add(1000))
-                    .min(self.state.height);
-                let mut filters = Vec::new();
-                for h in start_height..end {
-                    if let Some(b) = self.storage.load_batch(h)? {
-                        filters.push(json!({
-                            "height": h,
-                            "block_hash": hex::encode(b.extension.final_hash),
-                            "filter_hex": hex::encode(CompactFilter::build(&b).data),
-                            "element_count": CompactFilter::items_in(&b).len(),
-                        }));
-                    }
-                }
-                json!({ "filters": filters })
+            LightRequest::GetHeaders { .. }
+            | LightRequest::GetBlock { .. }
+            | LightRequest::GetFilters { .. } => {
+                return light_from_storage(&self.storage, self.state.height, request)
             }
             LightRequest::GetMempool => {
                 json!({ "count": self.mempool.len(), "weight": self.mempool.total_weight() })
@@ -2716,6 +3049,60 @@ impl Node {
     }
 }
 
+/// Light requests answered from storage alone, which may take a while.
+fn request_reads_storage(request: &LightRequest) -> bool {
+    matches!(
+        request,
+        LightRequest::GetHeaders { .. }
+            | LightRequest::GetBlock { .. }
+            | LightRequest::GetFilters { .. }
+    )
+}
+
+/// Answers a light request that [`request_reads_storage`], against a chain
+/// of `tip` blocks.
+fn light_from_storage(
+    storage: &Storage,
+    tip: u64,
+    request: LightRequest,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+    Ok(match request {
+        LightRequest::GetHeaders {
+            start_height,
+            count,
+        } => {
+            let headers = storage.load_headers(start_height, count.min(MAX_GETHEADERS_COUNT))?;
+            json!({ "headers_hex": hex::encode(bincode::serialize(&headers)?) })
+        }
+        LightRequest::GetBlock { height } => {
+            let batch = storage
+                .load_batch(height)?
+                .ok_or_else(|| anyhow!("no block at {height}"))?;
+            json!({ "height": height, "block_hex": hex::encode(bincode::serialize(&batch)?) })
+        }
+        LightRequest::GetFilters {
+            start_height,
+            end_height,
+        } => {
+            let end = end_height.min(start_height.saturating_add(1000)).min(tip);
+            let mut filters = Vec::new();
+            for h in start_height..end {
+                if let Some(b) = storage.load_batch(h)? {
+                    filters.push(json!({
+                        "height": h,
+                        "block_hash": hex::encode(b.extension.final_hash),
+                        "filter_hex": hex::encode(CompactFilter::build(&b).data),
+                        "element_count": CompactFilter::items_in(&b).len(),
+                    }));
+                }
+            }
+            json!({ "filters": filters })
+        }
+        _ => return Err(anyhow!("not a storage request")),
+    })
+}
+
 /// Checkpoint verification: fetches the trusted checkpoint's anchor record
 /// and snapshot from peers, verifies both, and imports the snapshot into the
 /// (empty) database (`docs/PRUNING.md` §5).
@@ -2741,8 +3128,9 @@ async fn bootstrap_from_checkpoint(
     .unwrap_or_default()
     .into_iter()
     .find(|r| r.checkpoint.id() == trusted);
-    if let Some(r) = &record {
-        r.verify_standalone(fin.anchor_depth, fin.min_work)?;
+    if let Some(r) = record.as_mut() {
+        precheck(r, fin).map_err(|e| anyhow!("{e}"))?;
+        verify_evidence(r, fin, &CheckedLinks::default()).map_err(|e| anyhow!("{e}"))?;
     }
     let mut source: Option<PeerId> = None;
     let mut parts: Vec<Option<Vec<u8>>> = Vec::new();
@@ -2774,14 +3162,28 @@ async fn bootstrap_from_checkpoint(
                 }
                 match message {
                     Message::Anchors(list) if record.is_none() => {
-                        if let Some(r) = list.into_iter().find(|r| r.checkpoint.id() == trusted) {
-                            match r.verify_standalone(fin.anchor_depth, fin.min_work) {
-                                Ok(()) => {
+                        if let Some(mut r) = list.into_iter().find(|r| r.checkpoint.id() == trusted) {
+                            let fin = fin.clone();
+                            let checked = tokio::task::spawn_blocking(move || {
+                                precheck(&mut r, &fin)?;
+                                verify_evidence(&r, &fin, &CheckedLinks::default())?;
+                                Ok::<_, RecordFault>(r)
+                            })
+                            .await
+                            .map_err(|e| anyhow!("verification task failed: {e}"))?;
+                            match checked {
+                                Ok(r) => {
                                     tracing::info!("checkpoint sync: anchor evidence verified (from {})", peer);
                                     record = Some(r);
                                     source = Some(peer);
                                 }
-                                Err(e) => tracing::warn!("checkpoint sync: bad anchor from {}: {:#}", peer, e),
+                                Err(RecordFault::Policy(e)) => {
+                                    tracing::warn!("checkpoint sync: anchor from {} too weak: {:#}", peer, e)
+                                }
+                                Err(fault) => {
+                                    tracing::warn!("checkpoint sync: forged anchor from {}: {}", peer, fault);
+                                    network.ban_peer(peer);
+                                }
                             }
                         }
                     }

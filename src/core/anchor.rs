@@ -4,6 +4,7 @@
 
 use super::auxpow::{bytes32, merge_commitment, midstate_coin_id, tx_fold_item};
 use super::extension::create_extension;
+use super::simd_mining::{check_pow_chains, pow_seed, PowCheck};
 use super::state::calculate_work;
 use super::types::{
     compute_header_hash, hash_concat, hash_domain, network_anchor, BatchHeader, Extension,
@@ -101,6 +102,16 @@ pub struct HeaderLink {
     pub final_hash: [u8; 32],
 }
 
+/// Identifies a Midstate header whose proof of work has been checked: its
+/// mining hash (which commits to its predecessor and every field), nonce and
+/// final hash. Equal keys mean the same proof-of-work computation.
+pub fn link_key(mining_hash: &[u8; 32], link: &HeaderLink) -> [u8; 32] {
+    hash_domain(
+        b"midwimble.checked-midstate-header.v1",
+        &[mining_hash, &link.nonce.to_le_bytes(), &link.final_hash],
+    )
+}
+
 /// The mining hash a Midstate header link commits its proof of work to.
 pub(crate) fn link_mining_hash(prev: [u8; 32], link: &HeaderLink) -> [u8; 32] {
     compute_header_hash(&BatchHeader {
@@ -149,7 +160,66 @@ impl MidstateInclusion {
     /// This is SPV-level assurance: it proves real work was spent on these
     /// headers, not that they are on Midstate's best chain. Cross-check with a
     /// trusted Midstate node where that matters.
+    ///
+    /// The two halves are also available separately, so a caller can tell
+    /// evidence that is merely weaker than it asks for
+    /// ([`MidstateInclusion::check_policy`]) from evidence that is forged
+    /// ([`MidstateInclusion::verify_proofs`]).
     pub fn verify(&self, payload: &[u8; 32], depth: usize, min_work: u128) -> Result<()> {
+        self.check_policy(depth, min_work)?;
+        self.verify_proofs(payload)
+    }
+
+    /// The headers: the anchor block, then its confirmations.
+    pub fn links(&self) -> impl Iterator<Item = &HeaderLink> {
+        std::iter::once(&self.block).chain(&self.confirmations)
+    }
+
+    /// The configurable, cheap half of [`MidstateInclusion::verify`]: enough
+    /// confirmations, and at least `min_work` claimed by every header. Nothing
+    /// here hashes a chain, so it runs before anything that does. Failing it
+    /// says the evidence is weaker than this node asks for, not that it is
+    /// forged: another node may be configured to accept it.
+    pub fn check_policy(&self, depth: usize, min_work: u128) -> Result<()> {
+        if self.confirmations.len() + 1 < depth {
+            bail!(
+                "anchor has {} confirmation(s), {} required",
+                self.confirmations.len() + 1,
+                depth
+            );
+        }
+        if let Some(i) = self
+            .links()
+            .position(|l| calculate_work(&l.target) < min_work)
+        {
+            bail!("Midstate header {i} of the anchor evidence claims too little work");
+        }
+        Ok(())
+    }
+
+    /// The half of [`MidstateInclusion::verify`] that proves the evidence
+    /// genuine: `payload` folds into the anchor block, every header meets its
+    /// own target, and every header's proof of work holds over its
+    /// predecessor (which is also what links them). Failing it means the
+    /// evidence was forged.
+    ///
+    /// Cheap checks come first, then the proofs of work: the first alone, so
+    /// a forged record costs one extension to reject, then the rest in
+    /// parallel SIMD batches.
+    pub fn verify_proofs(&self, payload: &[u8; 32]) -> Result<()> {
+        self.verify_proofs_with(payload, |_| false).map(|_| ())
+    }
+
+    /// [`MidstateInclusion::verify_proofs`], skipping the proof of work of
+    /// headers whose [`link_key`] `known` recognises (headers the caller has
+    /// already checked: consecutive anchors share nearly all of theirs).
+    /// Returns the keys of every header, to remember once the whole
+    /// evidence has been accepted.
+    pub fn verify_proofs_with(
+        &self,
+        payload: &[u8; 32],
+        known: impl Fn(&[u8; 32]) -> bool,
+    ) -> Result<Vec<[u8; 32]>> {
         let mut m = hash_concat(&self.pre_item_midstate, &self.kind.fold_item(payload));
         for item in &self.items_after {
             m = hash_concat(&m, item);
@@ -160,24 +230,38 @@ impl MidstateInclusion {
         if m != self.block.post_tx_midstate {
             bail!("the anchored item does not fold into the Midstate block");
         }
-        if !header_pow_ok(self.prev_header_hash, &self.block, min_work) {
-            bail!("the Midstate block's proof of work is invalid or too weak");
-        }
-        let mut prev = self.block.final_hash;
-        for (i, link) in self.confirmations.iter().enumerate() {
-            if !header_pow_ok(prev, link, min_work) {
-                bail!("confirmation {} is invalid, unlinked or too weak", i + 1);
+        let mut prev = self.prev_header_hash;
+        let mut keys = Vec::with_capacity(self.confirmations.len() + 1);
+        let mut jobs = Vec::new();
+        let mut index = Vec::new();
+        for (i, link) in self.links().enumerate() {
+            if link.final_hash >= link.target {
+                bail!("Midstate header {i} of the anchor evidence misses its own target");
             }
+            let mining = link_mining_hash(prev, link);
+            let key = link_key(&mining, link);
+            if !known(&key) {
+                jobs.push((pow_seed(&mining, link.nonce), link.final_hash));
+                index.push(i);
+            }
+            keys.push(key);
             prev = link.final_hash;
         }
-        if self.confirmations.len() + 1 < depth {
-            bail!(
-                "anchor has {} confirmation(s), {} required",
-                self.confirmations.len() + 1,
-                depth
-            );
+        match check_pow_chains(&jobs) {
+            Ok(()) => Ok(keys),
+            Err(PowCheck::Bad(j)) => bail!(
+                "Midstate header {} of the anchor evidence fails its proof of work",
+                index[j]
+            ),
+            Err(PowCheck::Abandoned) => bail!("anchor verification abandoned"),
         }
-        Ok(())
+    }
+
+    /// Drops confirmations beyond the `depth` (anchor block included) a
+    /// verifier asks for: they add nothing to the evidence, and a record
+    /// stored and passed on should cost the next node no more than needed.
+    pub fn trim(&mut self, depth: usize) {
+        self.confirmations.truncate(depth.saturating_sub(1));
     }
 
     /// Builds evidence from Midstate `/batch/{h}` JSON: the anchor block at
@@ -272,7 +356,88 @@ pub fn midstate_header_link(batch: &Value) -> Result<HeaderLink> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{Batch, State};
+    use crate::core::types::{hash, Batch, State};
+
+    /// Genuine evidence for `payload` (a Commit) with `confirmations` more
+    /// headers, on the easiest target so each header is a single extension.
+    fn evidence(payload: &[u8; 32], n: usize) -> MidstateInclusion {
+        let mine = |prev: [u8; 32], post: [u8; 32], i: u64| {
+            let mut link = HeaderLink {
+                post_tx_midstate: post,
+                state_root: [0; 32],
+                timestamp: 1_800_000_000 + i,
+                target: [0xff; 32],
+                nonce: 0,
+                final_hash: [0; 32],
+            };
+            link.final_hash = create_extension(link_mining_hash(prev, &link), 0).final_hash;
+            link
+        };
+        let pre = hash(b"pre");
+        let prev = hash(b"prev");
+        let block = mine(prev, hash_concat(&pre, payload), 0);
+        let mut confirmations = Vec::new();
+        let mut last = block.final_hash;
+        for i in 0..n {
+            let link = mine(last, hash(&(i as u64).to_le_bytes()), 1 + i as u64);
+            last = link.final_hash;
+            confirmations.push(link);
+        }
+        MidstateInclusion {
+            midstate_height: 10,
+            kind: AnchoredItem::Commit,
+            pre_item_midstate: pre,
+            items_after: vec![],
+            prev_header_hash: prev,
+            block,
+            confirmations,
+        }
+    }
+
+    #[test]
+    fn evidence_policy_and_proofs_are_separate_checks() {
+        let payload = hash(b"checkpoint id");
+        let ev = evidence(&payload, 2);
+        ev.verify(&payload, 3, 1).unwrap();
+        // Asking for more than it has is policy: the evidence is still genuine.
+        assert!(ev.check_policy(4, 1).is_err());
+        assert!(ev.check_policy(3, u128::MAX).is_err());
+        ev.verify_proofs(&payload).unwrap();
+        // A tampered header is forgery.
+        let mut forged = ev.clone();
+        forged.confirmations[1].nonce ^= 1;
+        let err = forged.verify_proofs(&payload).unwrap_err().to_string();
+        assert!(err.contains("proof of work"), "{err}");
+        // So is a header that misses its own target, caught before hashing.
+        let mut lazy = ev.clone();
+        lazy.block.target = [0; 32];
+        assert!(lazy
+            .verify_proofs(&payload)
+            .unwrap_err()
+            .to_string()
+            .contains("own target"));
+        // Another payload does not fold in.
+        assert!(ev.verify_proofs(&hash(b"another")).is_err());
+        // Headers already checked are skipped; the rest are still checked,
+        // and a tampered header never matches a checked one's key.
+        let keys = ev.verify_proofs_with(&payload, |_| false).unwrap();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(
+            ev.verify_proofs_with(&payload, |k| keys.contains(k))
+                .unwrap(),
+            keys
+        );
+        let err = forged
+            .verify_proofs_with(&payload, |k| keys.contains(k))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("header 2"), "{err}");
+        // Trimming keeps exactly what a verifier asks for.
+        let mut trimmed = ev.clone();
+        trimmed.trim(2);
+        assert_eq!(trimmed.confirmations.len(), 1);
+        trimmed.verify(&payload, 2, 1).unwrap();
+    }
 
     #[test]
     fn checkpoint_ids_bind_every_field() {

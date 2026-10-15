@@ -127,13 +127,30 @@ struct MidstateInclusion {
 }
 ```
 
-A verifier does the following:
+A verifier does the following, cheapest first:
 
-1. **Fold.** Recomputes Midstate's fold from the pieces.
-2. **Header.** Recomputes the header hash.
-3. **Proof of work.** Checks it with the shared extension function.
-4. **Depth.** Checks each confirmation links to the previous final hash, has
-   valid proof of work, and that their count reaches the required depth.
+1. **Depth and work.** Counts the confirmations against the required depth
+   and checks that every header claims at least the minimum work. Nothing is
+   hashed yet. Evidence that fails here is weaker than this verifier asks
+   for, not necessarily forged: another node may be configured to accept it.
+2. **Fold.** Recomputes Midstate's fold from the pieces.
+3. **Header.** Recomputes each header hash; each confirmation's commits to
+   the previous final hash, which is what links them.
+4. **Proof of work.** Checks every header with the shared extension
+   function: the first alone, so forged evidence costs one extension to
+   reject, then the rest in parallel SIMD batches. Headers already verified
+   as part of earlier evidence are skipped, since anchors made close
+   together share nearly all their confirmations.
+
+A node keeps a record's confirmations only to the depth it requires, so the
+records it passes on cost the next node no more than needed.
+
+**Gossip.** Nodes exchange verified records (`GetAnchors` / `Anchors`). A
+node runs steps 1–3 as records arrive and step 4 on a background worker, two
+batches at a time, so gossip can never stall it. A peer whose evidence fails
+step 1 is ignored; one whose evidence fails steps 2–4 is banned. A node keeps
+at most 256 records: none below its finalized floor except the checkpoints
+it retains and any that conflict with its chain.
 
 This is SPV-level assurance, which can be strengthened by cross-checking a
 trusted local Midstate node. Midwimble stores the evidence itself because

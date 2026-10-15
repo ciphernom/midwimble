@@ -525,3 +525,129 @@ async fn forged_blocks_from_a_helper_peer_are_routed_around() {
     d.stop().await;
     a.stop().await;
 }
+
+/// Anchor gossip is checked cheaply on the event loop and verified off it.
+/// Records weaker than this node requires are ignored without hashing any
+/// proof of work and without blaming the sender (another node may accept
+/// them); a record whose evidence is forged gets its sender banned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forged_anchor_gossip_gets_the_sender_banned() {
+    use midwimble::anchor::AnchorRecord;
+    use midwimble::core::anchor::{
+        AnchoredItem, Checkpoint, HeaderLink, MidstateInclusion, CHECKPOINT_VERSION,
+    };
+    use midwimble::core::types::{hash, hash_concat, network_anchor};
+    use midwimble::network::{Message, Network, NetworkEvent};
+
+    /// Free to make: the fold is right, every claimed target carries work,
+    /// and only hashing the made-up proofs of work refutes them.
+    fn forged(i: u64, confirmations: usize) -> AnchorRecord {
+        let checkpoint = Checkpoint {
+            version: CHECKPOINT_VERSION,
+            network: network_anchor(),
+            mw_height: 1_000 + i,
+            mw_header_hash: hash(&i.to_le_bytes()),
+            mw_state_root: [0; 32],
+            mw_cumulative_work: 0,
+            previous_checkpoint: [0; 32],
+        };
+        let id = checkpoint.id();
+        let pre = hash(b"pre");
+        let mut target = [0xffu8; 32];
+        target[0] = 0;
+        let link = |post: [u8; 32]| HeaderLink {
+            post_tx_midstate: post,
+            state_root: [0; 32],
+            timestamp: 0,
+            target,
+            nonce: 0,
+            final_hash: [0; 32],
+        };
+        AnchorRecord {
+            checkpoint,
+            checkpoint_id: hex::encode(id),
+            posted_at_midstate_height: 0,
+            evidence: Some(MidstateInclusion {
+                midstate_height: 0,
+                kind: AnchoredItem::Commit,
+                pre_item_midstate: pre,
+                items_after: vec![],
+                prev_header_hash: [0; 32],
+                block: link(hash_concat(&pre, &id)),
+                confirmations: vec![link([1; 32]); confirmations],
+            }),
+            mw_header: None,
+        }
+    }
+
+    let a = TestNode::start_tuned(None, vec![], Duration::ZERO, None, |config| {
+        config.finality.anchor_depth = 8;
+        config.finality.min_work = 1;
+    })
+    .await;
+    let addr = a.dial_addr().await;
+
+    let mut net = Network::new(
+        libp2p::identity::Keypair::generate_ed25519(),
+        "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+        vec![addr.parse().unwrap()],
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let me = net.local_peer_id().to_string();
+    let (to_send, mut outbox) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let attacker = tokio::spawn(async move {
+        let mut victim = None;
+        loop {
+            tokio::select! {
+                event = net.next_event() => match event {
+                    NetworkEvent::PeerConnected(peer, _) => victim = Some(peer),
+                    NetworkEvent::MessageReceived { channel: Some(ch), .. } => {
+                        net.respond(ch, Message::Pong { nonce: 0 })
+                    }
+                    _ => {}
+                },
+                Some(message) = outbox.recv(), if victim.is_some() => {
+                    net.send(victim.unwrap(), message)
+                }
+            }
+        }
+    });
+    wait_until("the attacker to connect", 20, || {
+        a.handle.info().peers.contains(&me)
+    })
+    .await;
+
+    // Too few confirmations for this node: ignored, sender not blamed.
+    to_send
+        .send(Message::Anchors((0..64).map(|i| forged(i, 3)).collect()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        a.handle.info().peers.contains(&me),
+        "weak evidence is not a ban"
+    );
+    assert!(a.handle.anchors().await.unwrap().is_empty());
+
+    // Deep enough, but forged: banned, and nothing kept.
+    to_send
+        .send(Message::Anchors(
+            (0..64).map(|i| forged(100 + i, 7)).collect(),
+        ))
+        .unwrap();
+    wait_until("the forger to be banned", 30, || {
+        !a.handle.info().peers.contains(&me)
+    })
+    .await;
+    let t = Instant::now();
+    assert!(a.handle.anchors().await.unwrap().is_empty());
+    assert!(
+        t.elapsed() < Duration::from_secs(1),
+        "the node stayed responsive"
+    );
+    assert_eq!(a.handle.info().anchors_known, 0);
+
+    attacker.abort();
+    a.stop().await;
+}

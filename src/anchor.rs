@@ -40,6 +40,20 @@ impl AnchorRecord {
     /// Verifies the record on its own: the checkpoint id, the header (if
     /// carried) and the Midstate evidence.
     pub fn verify_standalone(&self, depth: usize, min_work: u128) -> Result<()> {
+        self.verify_standalone_with(depth, min_work, |_| false)
+            .map(|_| ())
+    }
+
+    /// [`AnchorRecord::verify_standalone`], skipping the proof of work of
+    /// Midstate headers `known` recognises (see
+    /// [`MidstateInclusion::verify_proofs_with`]). Returns the evidence's
+    /// header keys.
+    pub fn verify_standalone_with(
+        &self,
+        depth: usize,
+        min_work: u128,
+        known: impl Fn(&[u8; 32]) -> bool,
+    ) -> Result<Vec<[u8; 32]>> {
         let id = self.checkpoint.id();
         if hex::encode(id) != self.checkpoint_id {
             bail!("stored id does not match the checkpoint");
@@ -63,7 +77,8 @@ impl AnchorRecord {
                 bail!("merged-mining record without its header")
             }
         };
-        evidence.verify(&payload, depth, min_work)
+        evidence.check_policy(depth, min_work)?;
+        evidence.verify_proofs_with(&payload, known)
     }
 }
 
@@ -357,6 +372,51 @@ pub fn load_records(path: &Path) -> Result<Vec<AnchorRecord>> {
         .collect()
 }
 
+/// Reads a store from byte `offset`: up to `max` records that `keep`
+/// accepts, and the offset to read from next time. Only complete lines are
+/// read, so a record still being written is read once it is whole. A store
+/// shorter than `offset` was replaced and is read from the start. Lines that
+/// do not parse are skipped (and reported), not fatal: one bad line must not
+/// hide the records after it.
+pub fn load_records_from(
+    path: &Path,
+    offset: u64,
+    max: usize,
+    keep: impl Fn(&AnchorRecord) -> bool,
+) -> Result<(Vec<AnchorRecord>, u64)> {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Ok((Vec::new(), 0));
+    };
+    let len = file.metadata()?.len();
+    let mut pos = if len < offset { 0 } else { offset };
+    file.seek(SeekFrom::Start(pos))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut records = Vec::new();
+    let mut line = Vec::new();
+    while records.len() < max {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line)?;
+        if n == 0 || line.last() != Some(&b'\n') {
+            break; // the end, or a line still being written
+        }
+        pos += n as u64;
+        let text = String::from_utf8_lossy(&line);
+        if text.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<AnchorRecord>(&text) {
+            Ok(record) if keep(&record) => records.push(record),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                "skipping unreadable anchor record in {}: {e}",
+                path.display()
+            ),
+        }
+    }
+    Ok((records, pos))
+}
+
 pub fn append_record(path: &Path, record: &AnchorRecord) -> Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -439,4 +499,75 @@ pub fn verify_records(
         out.push((r.checkpoint_id.clone(), result));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(height: u64) -> AnchorRecord {
+        let checkpoint = Checkpoint {
+            version: crate::core::anchor::CHECKPOINT_VERSION,
+            network: crate::core::types::network_anchor(),
+            mw_height: height,
+            mw_header_hash: hash(&height.to_le_bytes()),
+            mw_state_root: [0; 32],
+            mw_cumulative_work: 0,
+            previous_checkpoint: [0; 32],
+        };
+        AnchorRecord {
+            checkpoint_id: hex::encode(checkpoint.id()),
+            checkpoint,
+            posted_at_midstate_height: 0,
+            evidence: None,
+            mw_header: None,
+        }
+    }
+
+    #[test]
+    fn stores_are_read_incrementally_and_whole_lines_only() {
+        let all = |_: &AnchorRecord| true;
+        let heights = |records: &[AnchorRecord]| -> Vec<u64> {
+            records.iter().map(|r| r.checkpoint.mw_height).collect()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anchors.jsonl");
+        assert_eq!(load_records_from(&path, 0, 10, all).unwrap().1, 0);
+        append_record(&path, &record(1)).unwrap();
+        append_record(&path, &record(2)).unwrap();
+        // A third record, half written.
+        let third = serde_json::to_string(&record(3)).unwrap();
+        let (head, tail) = third.split_at(third.len() / 2);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(head.as_bytes())
+            .unwrap();
+        let (records, offset) = load_records_from(&path, 0, 10, all).unwrap();
+        assert_eq!(heights(&records), vec![1, 2]);
+        // Nothing new until the line is complete; then only the new records,
+        // past a line that does not parse and those `keep` refuses.
+        assert!(load_records_from(&path, offset, 10, all).unwrap().0.is_empty());
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{tail}").unwrap();
+        writeln!(f, "not json").unwrap();
+        for h in 4..=6 {
+            append_record(&path, &record(h)).unwrap();
+        }
+        let odd = |r: &AnchorRecord| r.checkpoint.mw_height % 2 == 1;
+        let (records, next) = load_records_from(&path, offset, 10, odd).unwrap();
+        assert_eq!(heights(&records), vec![3, 5]);
+        assert_eq!(next, std::fs::metadata(&path).unwrap().len());
+        // At most `max` a read, resuming where it stopped.
+        let (records, mid) = load_records_from(&path, offset, 2, all).unwrap();
+        assert_eq!(heights(&records), vec![3, 4]);
+        let (records, end) = load_records_from(&path, mid, 2, all).unwrap();
+        assert_eq!((heights(&records), end), (vec![5, 6], next));
+        // A replaced, shorter store is read from the start.
+        std::fs::write(&path, "").unwrap();
+        append_record(&path, &record(7)).unwrap();
+        let (records, _) = load_records_from(&path, end, 10, all).unwrap();
+        assert_eq!(heights(&records), vec![7]);
+    }
 }

@@ -403,6 +403,70 @@ pub fn verify_pow_batch(seeds: &[[u8; 32]]) -> Vec<[u8; 32]> {
     out
 }
 
+/// Checks many independent proof-of-work chains: `jobs[i]` is a chain's
+/// seed ([`pow_seed`]) and the final hash it must reach.
+///
+/// Each chain costs a full extension, and claimed final hashes cost their
+/// sender nothing, so the order of work matters more than its speed. The
+/// first chain is checked alone (a forgery that fails there costs one
+/// extension, as checking one header always did); the rest are checked a piece
+/// at a time across SIMD lanes and threads, stopping after the first piece
+/// that holds a bad chain. Before each piece `proceed` is told its size, and
+/// returning `false` abandons the check.
+///
+/// Returns the index of a bad chain, or [`PowCheck::Abandoned`].
+pub fn check_pow_chains_with(
+    jobs: &[([u8; 32], [u8; 32])],
+    mut proceed: impl FnMut(usize) -> bool,
+) -> Result<(), PowCheck> {
+    use rayon::prelude::*;
+    let Some((first, rest)) = jobs.split_first() else {
+        return Ok(());
+    };
+    if !proceed(1) {
+        return Err(PowCheck::Abandoned);
+    }
+    if iterate_scalar(&first.0) != first.1 {
+        return Err(PowCheck::Bad(0));
+    }
+    let lanes = detected_level().lanes().max(1);
+    let piece = (lanes * rayon::current_num_threads() * 4).max(128);
+    for (p, chunk) in rest.chunks(piece).enumerate() {
+        if !proceed(chunk.len()) {
+            return Err(PowCheck::Abandoned);
+        }
+        let bad = chunk
+            .par_chunks(lanes)
+            .enumerate()
+            .find_map_any(|(c, sub)| {
+                let seeds: Vec<[u8; 32]> = sub.iter().map(|j| j.0).collect();
+                verify_pow_batch(&seeds)
+                    .into_iter()
+                    .zip(sub)
+                    .position(|(f, j)| f != j.1)
+                    .map(|k| 1 + p * piece + c * lanes + k)
+            });
+        if let Some(i) = bad {
+            return Err(PowCheck::Bad(i));
+        }
+    }
+    Ok(())
+}
+
+/// [`check_pow_chains_with`] that always proceeds.
+pub fn check_pow_chains(jobs: &[([u8; 32], [u8; 32])]) -> Result<(), PowCheck> {
+    check_pow_chains_with(jobs, |_| true)
+}
+
+/// Why [`check_pow_chains_with`] stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowCheck {
+    /// The chain at this index does not reach its claimed final hash.
+    Bad(usize),
+    /// The caller's `proceed` asked to stop.
+    Abandoned,
+}
+
 /// Convenience: 4-way entry point (backward compat + tests).
 ///
 /// Dispatches to the best available 4-lane backend (NEON, WASM SIMD128, or
@@ -1512,6 +1576,40 @@ mod tests {
 
     use super::*;
     use crate::core::types::{hash, hash_concat};
+
+    #[test]
+    fn pow_chains_are_checked_and_the_bad_one_is_named() {
+        let jobs: Vec<([u8; 32], [u8; 32])> = (0..37u64)
+            .map(|i| {
+                let seed = pow_seed(&hash(&i.to_le_bytes()), i);
+                (seed, iterate_scalar(&seed))
+            })
+            .collect();
+        assert_eq!(check_pow_chains(&jobs), Ok(()));
+        assert_eq!(check_pow_chains(&[]), Ok(()));
+        for bad in [0usize, 1, 9, 36] {
+            let mut forged = jobs.clone();
+            forged[bad].1[0] ^= 1;
+            assert_eq!(
+                check_pow_chains(&forged),
+                Err(PowCheck::Bad(bad)),
+                "bad {bad}"
+            );
+        }
+        // A forged first chain is found before anything else is hashed.
+        let mut first = jobs.clone();
+        first[0].1[0] ^= 1;
+        let mut asked = Vec::new();
+        let r = check_pow_chains_with(&first, |n| {
+            asked.push(n);
+            true
+        });
+        assert_eq!((r, asked), (Err(PowCheck::Bad(0)), vec![1]));
+        assert_eq!(
+            check_pow_chains_with(&jobs, |n| n == 1),
+            Err(PowCheck::Abandoned)
+        );
+    }
 
     /// Scalar reference implementation for cross-checking all SIMD paths.
     ///
