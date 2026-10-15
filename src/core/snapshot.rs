@@ -7,23 +7,37 @@
 
 use super::anchor::Checkpoint;
 use super::auxpow::verify_pow;
+use super::bond::{rebuild_signer_window, rebuild_work_floor, CAP_WINDOW, WORK_CAP_WINDOW};
 use super::mmr::{mmr_size, peaks, MerkleMountainRange, UtxoAccumulator};
 use super::mw::crypto::{compress, decompress, sum_points, Point32, IDENTITY};
 use super::mw::{GroupMember, Kernel, KernelFeatures, StoredGroup};
-use super::state::calculate_target;
+use super::state::{calculate_target, calculate_work};
 use super::types::{compute_header_hash, utxo_leaf, BatchHeader, State, StateRootParts, UtxoEntry};
 use anyhow::{anyhow, bail, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-/// Headers carried for the timestamp window (median-time-past) and targets.
-pub const SNAPSHOT_HEADERS: usize = 60;
+/// Headers carried for the timestamp window (median-time-past) and targets,
+/// and for the fork-choice windows: the signers of the last [`CAP_WINDOW`]
+/// blocks and the work of the last [`WORK_CAP_WINDOW`] decide how much the
+/// next block adds to the chain's weight, which every block's header claims
+/// and every node checks.
+pub const SNAPSHOT_HEADERS: usize = max(60, max(CAP_WINDOW, WORK_CAP_WINDOW));
+
+const fn max(a: usize, b: usize) -> usize {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub checkpoint: Checkpoint,
-    /// The last ≤ 60 headers, ending with block `mw_height - 1`.
+    /// The last ≤ [`SNAPSHOT_HEADERS`] headers, ending with block
+    /// `mw_height - 1`.
     pub headers: Vec<BatchHeader>,
     pub parts: StateRootParts,
     /// Peaks of the chain MMR over blocks `0..mw_height - 1` (the tip's own
@@ -103,6 +117,17 @@ fn check_headers(checkpoint: &Checkpoint, headers: &[BatchHeader]) -> Result<()>
                 || h.target != calculate_target(h.height, prev.timestamp)
             {
                 bail!("snapshot headers do not link at height {}", h.height);
+            }
+            // A block adds at least a sliver and at most its work. (The
+            // exact credit depends on a window reaching below the snapshot;
+            // what the importer needs is the tip's claim, which the
+            // checkpoint vouches for.)
+            let added = h.chain_weight.checked_sub(prev.chain_weight);
+            if !added.is_some_and(|a| a >= 1 && a <= calculate_work(&h.target)) {
+                bail!(
+                    "snapshot header {} claims an impossible chain weight",
+                    h.height
+                );
             }
         }
     }
@@ -231,6 +256,12 @@ impl Snapshot {
         chain_mmr.append(&cp.mw_header_hash, true);
 
         let tip = self.headers.last().expect("checked");
+        // What fork choice leaves out of the trusted work: the tip header
+        // claims the chain's weight under its proof of work.
+        let capped = cp
+            .mw_cumulative_work
+            .checked_sub(tip.chain_weight)
+            .ok_or_else(|| anyhow!("snapshot tip claims more weight than the checkpoint's work"))?;
         let bonds: crate::core::bond::BondSet = self.bonds.iter().copied().collect();
         if bonds.len() != self.bonds.len() {
             bail!("duplicate bond in snapshot");
@@ -239,14 +270,14 @@ impl Snapshot {
         if relay.commitment() != self.parts.relay_root {
             bail!("snapshot relay does not match the checkpoint");
         }
-        let state = State {
+        let mut state = State {
             bonds,
             relay,
             recent_signers: Default::default(),
             signer_counts: Default::default(),
             work_floor: Default::default(),
             effects: Default::default(),
-            capped: 0,
+            capped,
             mw_midstate: tip.post_tx_midstate,
             utxos,
             utxo_set,
@@ -279,6 +310,17 @@ impl Snapshot {
         if state.checkpoint_parts() != self.parts {
             bail!("rebuilt state does not reproduce the checkpoint");
         }
+        // The fork-choice windows, from the signers and targets the headers
+        // carry.
+        let window = self.headers.len().saturating_sub(CAP_WINDOW);
+        rebuild_signer_window(&mut state, self.headers[window..].iter().map(|h| h.signer));
+        let window = self.headers.len().saturating_sub(WORK_CAP_WINDOW);
+        rebuild_work_floor(
+            &mut state,
+            self.headers[window..]
+                .iter()
+                .map(|h| (h.height, calculate_work(&h.target))),
+        );
         Ok(state)
     }
 }

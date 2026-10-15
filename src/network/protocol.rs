@@ -4,7 +4,9 @@
 //! bincode framing, size caps, 60-second read deadline and panic-isolated
 //! decoding. Changes:
 //!
-//! * Protocol id `/midwimble/1.0.0`, so the two networks never talk.
+//! * Protocol id `/midwimble/2.0.0`, so the two networks never talk, and so
+//!   nodes from before chain weights were in headers and `StateInfo` (1.0.0)
+//!   never talk to these.
 //! * `Transaction` / `Batch` / `BatchHeader` are the MimbleWimble types.
 //! * CoinJoin (`Mix*`) and chat variants are gone. MimbleWimble aggregates
 //!   every block, which is the privacy property CoinJoin was approximating,
@@ -30,7 +32,7 @@ pub const MAX_GETHEADERS_COUNT: u64 = 5000;
 pub const BATCH_RESPONSE_SOFT_LIMIT: usize = 8_000_000;
 pub const MAX_MSG_SIZE: usize = 10_000_000;
 
-pub const MIDWIMBLE_PROTOCOL: StreamProtocol = StreamProtocol::new("/midwimble/1.0.0");
+pub const MIDWIMBLE_PROTOCOL: StreamProtocol = StreamProtocol::new("/midwimble/2.0.0");
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Message {
@@ -42,7 +44,10 @@ pub enum Message {
     GetState,
     StateInfo {
         height: u64,
+        /// Cumulative proof of work.
         depth: u128,
+        /// Fork-choice weight (`State::weight`): what sync compares.
+        weight: u128,
         mw_midstate: [u8; 32],
     },
     GetAddr,
@@ -259,14 +264,16 @@ mod tests {
         let msg = Message::StateInfo {
             height: 7,
             depth: 99,
+            weight: 98,
             mw_midstate: [3; 32],
         };
         match Message::deserialize_bin(&msg.serialize_bin()).unwrap() {
             Message::StateInfo {
                 height,
                 depth,
+                weight,
                 mw_midstate,
-            } => assert_eq!((height, depth, mw_midstate), (7, 99, [3; 32])),
+            } => assert_eq!((height, depth, weight, mw_midstate), (7, 99, 98, [3; 32])),
             _ => panic!("wrong variant"),
         }
         let msg = Message::Batches {

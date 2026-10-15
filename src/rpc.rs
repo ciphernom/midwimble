@@ -200,6 +200,7 @@ async fn state(AxState(node): AxState<NodeHandle>) -> Json<Value> {
         "height": s.height,
         "tip": hex::encode(s.header_hash),
         "depth": s.depth.to_string(),
+        "weight": s.weight().to_string(),
         "target": hex::encode(s.target),
         "timestamp": s.timestamp,
         "state_root": hex::encode(s.state_root()),

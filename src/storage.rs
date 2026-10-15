@@ -269,18 +269,45 @@ fn signer_of_block(bytes: &[u8]) -> Result<Option<[u8; 32]>> {
     Ok(batch.miner.map(|m| m.bond_id))
 }
 
-/// `(height, work)` of each stored header in `range`, oldest first: what the
-/// fork-choice work window (`bond::cap_work`) is rebuilt from. A height with no
-/// header, below a snapshot's base, is left out.
+/// The signer of block `h`: from the signer log, else from its body. Neither
+/// means the database is corrupt.
+fn logged_signer(
+    log: &impl ReadableTable<u64, &'static [u8]>,
+    blocks: &impl ReadableTable<u64, &'static [u8]>,
+    h: u64,
+) -> Result<Option<[u8; 32]>> {
+    if let Some(v) = log.get(h)? {
+        return Ok(signer_from_log(v.value()));
+    }
+    match blocks.get(h)? {
+        Some(v) => signer_of_block(v.value()),
+        None => bail!(
+            "the signer of block {} is missing; the database is corrupt",
+            h
+        ),
+    }
+}
+
+/// `(height, work)` of each block in `range`, oldest first, from its stored
+/// header: what the fork-choice work window (`bond::cap_work`) is rebuilt
+/// from. Like the signer window, it decides the chain weight the next block
+/// must claim, so a missing header is an error, never a gap.
 fn header_works(
     headers: &impl ReadableTable<u64, &'static [u8]>,
     range: std::ops::Range<u64>,
 ) -> Result<Vec<(u64, u128)>> {
     let mut out = Vec::with_capacity(range.end.saturating_sub(range.start) as usize);
-    for entry in headers.range(range)? {
+    for entry in headers.range(range.clone())? {
         let (k, v) = entry?;
         let header: BatchHeader = bincode::deserialize(v.value())?;
         out.push((k.value(), calculate_work(&header.target)));
+    }
+    if out.len() as u64 != range.end.saturating_sub(range.start) {
+        bail!(
+            "headers {}..{} are incomplete; the database is corrupt",
+            range.start,
+            range.end
+        );
     }
     Ok(out)
 }
@@ -586,9 +613,9 @@ impl Storage {
 
     /// Refills the fork-choice windows (`bond::credit_work`) from the stored
     /// blocks just below `state`: signers from the signer log, work from the
-    /// headers. A pruned block counts as unsigned, and a block with no header
-    /// (below a snapshot's base) drops out of the work window. Either can only
-    /// loosen this node's weighting, never validity.
+    /// headers. The windows decide the chain weight the next block must
+    /// claim, so they are consensus: a signer or header that cannot be found
+    /// is an error, never a guess.
     fn rebuild_fork_choice_windows(&self, state: &mut State) -> Result<()> {
         let end = state.height;
         let start = end.saturating_sub(crate::core::bond::CAP_WINDOW as u64);
@@ -597,19 +624,25 @@ impl Storage {
         let blocks = txn.open_table(BATCHES)?;
         let mut signers = Vec::with_capacity((end - start) as usize);
         for h in start..end {
-            signers.push(match log.get(h)? {
-                Some(v) => signer_from_log(v.value()),
-                None => match blocks.get(h)? {
-                    Some(v) => signer_of_block(v.value())?,
-                    None => None,
-                },
-            });
+            signers.push(logged_signer(&log, &blocks, h)?);
         }
         crate::core::bond::rebuild_signer_window(state, signers);
         let floor_start = end.saturating_sub(crate::core::bond::WORK_CAP_WINDOW as u64);
         let works = header_works(&txn.open_table(HEADERS)?, floor_start..end)?;
         crate::core::bond::rebuild_work_floor(state, works);
         Ok(())
+    }
+
+    /// The fork-choice work window (`bond::cap_work`) a block at `height`
+    /// is weighed against, from the stored headers below it.
+    pub fn work_floor_before(&self, height: u64) -> Result<im::Vector<(u64, u128)>> {
+        let start = height.saturating_sub(crate::core::bond::WORK_CAP_WINDOW as u64);
+        let txn = self.db.begin_read()?;
+        let mut floor = im::Vector::new();
+        for (h, work) in header_works(&txn.open_table(HEADERS)?, start..height)? {
+            crate::core::bond::cap_work(&mut floor, h, work);
+        }
+        Ok(floor)
     }
 
     /// Work fork choice withheld from blocks `0..height`.
@@ -757,13 +790,7 @@ impl Storage {
             let mut counts: im::HashMap<[u8; 32], u32> = im::HashMap::new();
             let window_start = first_height.saturating_sub(crate::core::bond::CAP_WINDOW as u64);
             for h in window_start..first_height {
-                let signer = match signer_log.get(h)? {
-                    Some(v) => signer_from_log(v.value()),
-                    None => match blocks.get(h)? {
-                        Some(v) => signer_of_block(v.value())?,
-                        None => None,
-                    },
-                };
+                let signer = logged_signer(&signer_log, &blocks, h)?;
                 crate::core::bond::credit_in_window(&mut recent, &mut counts, &bonds, signer, 0, 0);
             }
             let mut floor: im::Vector<(u64, u128)> = im::Vector::new();
@@ -901,6 +928,14 @@ impl Storage {
                     batch.timestamp,
                 );
                 capped = capped.saturating_add(work - credited);
+                if batch.chain_weight != next.depth.saturating_sub(capped) {
+                    bail!(
+                        "commit_chain: block {} claims chain weight {}, the replay gives {}",
+                        height,
+                        batch.chain_weight,
+                        next.depth.saturating_sub(capped)
+                    );
+                }
                 signer_log.insert(height, signer_to_log(signer).as_slice())?;
                 capped_table.insert(height, enc(&capped)?.as_slice())?;
                 depth_table.insert(height, enc(&next.depth)?.as_slice())?;
@@ -1144,13 +1179,19 @@ impl Storage {
                 }
             }
             let mut headers = txn.open_table(HEADERS)?;
+            let mut signers = txn.open_table(SIGNERS)?;
             for header in &snapshot.headers {
                 headers.insert(header.height, enc(header)?.as_slice())?;
+                // The fork-choice window below the base (the snapshot
+                // carries at least `CAP_WINDOW` headers).
+                signers.insert(header.height, signer_to_log(header.signer).as_slice())?;
             }
             txn.open_table(DEPTHS)?.insert(
                 h - 1,
                 enc(&snapshot.checkpoint.mw_cumulative_work)?.as_slice(),
             )?;
+            txn.open_table(CAPPED)?
+                .insert(h - 1, enc(&state.capped)?.as_slice())?;
             let mut bonds = txn.open_table(BONDS)?;
             for (id, entry) in state.bonds.iter() {
                 bonds.insert(id.as_slice(), enc(entry)?.as_slice())?;
@@ -1598,6 +1639,148 @@ mod tests {
         assert_eq!(rewound.work_floor.front().map(|&(_, w)| w), Some(cheap));
         mine_signed(&storage, &mut loaded, &mut ts, &to, &bond);
         assert_eq!(loaded.capped, after);
+    }
+
+    /// The work window crosses a snapshot exactly: a node started from one
+    /// that carries only the window's headers, while a cheap block is still
+    /// in the window, caps the next block just as the full node does.
+    #[test]
+    fn snapshots_carry_the_work_window() {
+        use crate::core::bond::WORK_CAP_WINDOW;
+        let dir = tempfile::tempdir().unwrap();
+        let (full, mut state, mut ts) = fresh(&dir.path().join("full"));
+        let to = WalletKeys::random().address();
+        let bond = devnet_bond(b"work window", &state.target);
+        for _ in 0..WORK_CAP_WINDOW + 6 {
+            mine_signed(&full, &mut state, &mut ts, &to, &bond);
+        }
+        let late = crate::core::types::GENESIS_TIMESTAMP + 60 * state.height + 4 * 3600;
+        mine_signed_at(&full, &mut state, &mut ts, &to, &bond, late);
+        for _ in 0..3 {
+            mine_signed(&full, &mut state, &mut ts, &to, &bond);
+        }
+        let before = state.capped;
+        assert!(before > 0, "the cheap block caps the blocks after it");
+
+        let cp = checkpoint_for(&full, &state, state.height);
+        let snap = full.export_snapshot(&state, &cp).unwrap();
+        assert_eq!(snap.headers.len(), crate::core::snapshot::SNAPSHOT_HEADERS);
+        assert!(
+            (snap.headers[0].height as usize) > 0,
+            "the chain is longer than the snapshot"
+        );
+        let restored = snap.verify(&cp.id()).unwrap();
+        assert_eq!(restored.work_floor, state.work_floor);
+        let light = Storage::open(&dir.path().join("light")).unwrap();
+        light.import_snapshot(&snap, &restored).unwrap();
+        let mut loaded = light.load_state().unwrap().unwrap();
+        assert_eq!(loaded.work_floor, state.work_floor);
+
+        let (template, _) = crate::core::template::build_template_bonded(
+            &loaded,
+            &ts,
+            &[],
+            &[(to, 1)],
+            [0; 32],
+            Some(crate::core::types::GENESIS_TIMESTAMP + 60 * loaded.height),
+            Some(&bond),
+        )
+        .unwrap();
+        let block = template.mine_blocking();
+        apply_batch(&mut loaded, &block, &ts).unwrap();
+        apply_batch(&mut state, &block, &ts).unwrap();
+        light
+            .commit_chain(
+                loaded.height - 1,
+                std::slice::from_ref(&block),
+                std::slice::from_ref(&loaded.effects),
+                &loaded,
+            )
+            .unwrap();
+        assert!(state.capped > before, "still capped");
+        assert_eq!(
+            (loaded.weight(), loaded.capped),
+            (state.weight(), state.capped)
+        );
+    }
+
+    /// A snapshot carries what the next blocks' claimed chain weights depend
+    /// on: the work the cap withheld (the trusted depth less the weight the
+    /// tip header claims) and the signer window (from the headers). A node
+    /// that starts from one weighs new blocks exactly as a full node does.
+    #[test]
+    fn snapshots_carry_the_fork_choice_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let (full, mut state, mut ts) = fresh(&dir.path().join("full"));
+        let to = WalletKeys::random().address();
+        let mut bonds = devnet_bonds(&[b"bond a", b"bond b"], &state.target);
+        let (a, b) = (bonds.remove(0), bonds.remove(0));
+        mine_signed(&full, &mut state, &mut ts, &to, &a);
+        mine_signed(&full, &mut state, &mut ts, &to, &b);
+        for _ in 0..crate::core::bond::CAP_WINDOW {
+            mine_signed(&full, &mut state, &mut ts, &to, &a);
+        }
+        assert!(state.capped > 0, "bond a went over its cap");
+
+        let cp = checkpoint_for(&full, &state, state.height);
+        let snap = full.export_snapshot(&state, &cp).unwrap();
+        assert!(snap.headers.len() >= crate::core::bond::CAP_WINDOW);
+        let restored = snap.verify(&cp.id()).unwrap();
+        assert_eq!(
+            (restored.depth, restored.capped),
+            (state.depth, state.capped)
+        );
+        assert_eq!(restored.recent_signers, state.recent_signers);
+        assert_eq!(restored.signer_counts, state.signer_counts);
+        assert_eq!(restored.work_floor, state.work_floor);
+
+        let light = Storage::open(&dir.path().join("light")).unwrap();
+        light.import_snapshot(&snap, &restored).unwrap();
+        let mut loaded = light.load_state().unwrap().unwrap();
+        assert_eq!((loaded.depth, loaded.capped), (state.depth, state.capped));
+        assert_eq!(loaded.recent_signers, state.recent_signers);
+        assert_eq!(loaded.work_floor, state.work_floor);
+
+        // New blocks, over the cap and under it, apply on both with the same
+        // claimed weights, and storage replays them from the seeded window.
+        for bond in [&a, &b, &a] {
+            let (template, _) = crate::core::template::build_template_bonded(
+                &loaded,
+                &ts,
+                &[],
+                &[(to, 1)],
+                [0; 32],
+                Some(crate::core::types::GENESIS_TIMESTAMP + 60 * loaded.height),
+                Some(bond),
+            )
+            .unwrap();
+            let block = template.mine_blocking();
+            apply_batch(&mut loaded, &block, &ts).unwrap();
+            apply_batch(&mut state, &block, &ts).unwrap();
+            ts.push(block.timestamp);
+            light
+                .commit_chain(
+                    loaded.height - 1,
+                    std::slice::from_ref(&block),
+                    std::slice::from_ref(&loaded.effects),
+                    &loaded,
+                )
+                .unwrap();
+            assert_eq!(
+                (loaded.weight(), loaded.capped),
+                (state.weight(), state.capped)
+            );
+        }
+        let reloaded = light.load_state().unwrap().unwrap();
+        assert_eq!(reloaded.capped, state.capped);
+
+        // A snapshot without the whole window is refused.
+        let mut short = snap.clone();
+        short.headers.remove(0);
+        assert!(
+            short.verify(&cp.id()).is_err(),
+            "too few headers for the window"
+        );
     }
 
     fn mine(

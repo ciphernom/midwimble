@@ -64,10 +64,10 @@ use crate::network::{Message, Network, NetworkEvent, MAX_GETBATCHES_COUNT, MAX_G
 use crate::storage::FinalityInfo;
 use crate::storage::Storage;
 use crate::sync::{
-    headers_work, verify_header_chain_with, BlockSync, Chunk, HeaderSync, InFlight, Judgement,
-    LighterChains, SyncSession, SyncStats, BATCH_LOOKAHEAD_BLOCKS, BATCH_REQUEST_TIMEOUT_SECS,
-    HEADERS_PER_REQUEST, INITIAL_STEP_BACK, MAX_BATCH_REQUESTS_IN_FLIGHT, MAX_BUFFER_BYTES,
-    MAX_QUEUED_HEADER_CHUNKS, MAX_REORG_DEPTH, SYNC_TIMEOUT_SECS,
+    verify_header_chain_with, BlockSync, Chunk, HeaderSync, InFlight, SyncSession, SyncStats,
+    BATCH_LOOKAHEAD_BLOCKS, BATCH_REQUEST_TIMEOUT_SECS, HEADERS_PER_REQUEST, INITIAL_STEP_BACK,
+    MAX_BATCH_REQUESTS_IN_FLIGHT, MAX_BUFFER_BYTES, MAX_QUEUED_HEADER_CHUNKS, MAX_REORG_DEPTH,
+    SYNC_TIMEOUT_SECS,
 };
 use anyhow::{anyhow, bail, Context as _, Result};
 use libp2p::identity::Keypair;
@@ -490,9 +490,6 @@ pub struct Node {
     sync: Option<SyncSession>,
     next_session_id: u64,
     sync_stats: SyncStats,
-    /// Peers whose chain was judged no heavier than ours, not to sync from
-    /// again until it could have caught up.
-    lighter: LighterChains,
     batch_sources: HashSet<PeerId>,
     miner: Miner,
     mined_rx: mpsc::UnboundedReceiver<MinedBlock>,
@@ -658,7 +655,6 @@ impl Node {
             sync: None,
             next_session_id: 1,
             sync_stats: SyncStats::default(),
-            lighter: LighterChains::default(),
             batch_sources: HashSet::new(),
             miner,
             mined_rx,
@@ -844,6 +840,7 @@ impl Node {
         Message::StateInfo {
             height: self.state.height,
             depth: self.state.depth,
+            weight: self.state.weight(),
             mw_midstate: self.state.mw_midstate,
         }
     }
@@ -998,13 +995,9 @@ impl Node {
                 let info = self.state_info();
                 self.respond(channel, info);
             }
-            Message::StateInfo {
-                height,
-                depth,
-                mw_midstate,
-            } => {
+            Message::StateInfo { height, weight, .. } => {
                 self.ack(channel);
-                self.on_state_info(peer, height, depth, mw_midstate);
+                self.on_state_info(peer, height, weight);
             }
             Message::GetHeaders {
                 start_height,
@@ -1625,49 +1618,37 @@ impl Node {
 
     // ── Sync: sessions ──────────────────────────────────────────────────
 
-    fn on_state_info(&mut self, peer: PeerId, height: u64, depth: u128, tip: [u8; 32]) {
-        self.peer_tips.insert(peer, (height, depth));
-        if tip == self.state.mw_midstate {
-            // On our chain now: whatever we judged of it before is moot.
-            self.lighter.forget(&peer);
-        }
+    /// A peer's tip. Its chain is worth syncing only if fork choice would
+    /// prefer it: compared by weight, not raw work, which a chain capped by
+    /// the per-bond rule can have more of while weighing less.
+    fn on_state_info(&mut self, peer: PeerId, height: u64, weight: u128) {
+        self.peer_tips.insert(peer, (height, weight));
         if let Some(s) = self.sync.as_mut() {
             if s.peer == peer {
                 s.peer_height = s.peer_height.max(height);
-                s.peer_depth = s.peer_depth.max(depth);
+                s.peer_weight = s.peer_weight.max(weight);
             }
             // A newly known peer may be able to serve blocks.
             self.schedule_batch_requests();
             return;
         }
-        if depth <= self.state.depth {
-            return;
+        if weight > self.state.weight() {
+            self.start_sync(peer, height, weight, INITIAL_STEP_BACK, true);
         }
-        // Deeper is not heavier. A chain we already found no heavier than
-        // ours is not fetched and verified again until it could be.
-        let our_weight = self.state.weight();
-        if !self.lighter.worth_syncing(&peer, depth, tip, our_weight, Instant::now()) {
-            self.sync_stats.lighter_skipped += 1;
-            tracing::debug!(
-                "Not syncing from {}: its chain was no heavier than ours and cannot have caught up",
-                peer
-            );
-            return;
-        }
-        self.start_sync(peer, height, depth, INITIAL_STEP_BACK, true);
     }
 
-    /// Verified headers on disk that extend our tip:
-    /// (last header, MTP window after it, their work, count).
-    fn resume_point(&self) -> Option<(BatchHeader, VecDeque<u64>, u128, u64)> {
+    /// Verified headers on disk that extend our tip: (last header, MTP
+    /// window after it, work window after it, count).
+    fn resume_point(&self) -> Option<(BatchHeader, VecDeque<u64>, im::Vector<(u64, u128)>, u64)> {
         let mut window: VecDeque<u64> = self
             .storage
             .load_timestamps(self.state.height, MEDIAN_TIME_PAST_WINDOW as u64)
             .ok()?
             .into();
+        let mut work_floor = self.storage.work_floor_before(self.state.height).ok()?;
         let mut from = self.state.height;
         let mut last: Option<BatchHeader> = None;
-        let (mut work, mut count) = (0u128, 0u64);
+        let mut count = 0u64;
         loop {
             let chunk = self
                 .storage
@@ -1684,13 +1665,14 @@ impl Node {
             if !links {
                 break;
             }
-            work = work.saturating_add(headers_work(&chunk));
             count += chunk.len() as u64;
             for h in &chunk {
                 window.push_back(h.timestamp);
                 while window.len() > MEDIAN_TIME_PAST_WINDOW {
                     window.pop_front();
                 }
+                let work = crate::core::state::calculate_work(&h.target);
+                crate::core::bond::cap_work(&mut work_floor, h.height, work);
             }
             let full = chunk.len() as u64 == MAX_GETHEADERS_COUNT;
             last = chunk.into_iter().last();
@@ -1699,14 +1681,14 @@ impl Node {
                 break;
             }
         }
-        last.map(|l| (l, window, work, count))
+        last.map(|l| (l, window, work_floor, count))
     }
 
     fn start_sync(
         &mut self,
         peer: PeerId,
         height: u64,
-        depth: u128,
+        weight: u128,
         step_back: u64,
         allow_resume: bool,
     ) {
@@ -1719,7 +1701,7 @@ impl Node {
             None
         };
         let headers = match resume {
-            Some((last, window, work, count)) => {
+            Some((last, window, work_floor, count)) => {
                 tracing::info!(
                     "Resuming sync from {}: {} verified headers on disk (to height {})",
                     peer,
@@ -1732,9 +1714,8 @@ impl Node {
                     fork: Some(our_height),
                     window,
                     verified_to: last.height + 1,
-                    their_work: work,
-                    our_work: 0,
-                    fork_depth: self.state.depth,
+                    verified_weight: last.chain_weight,
+                    work_floor,
                     queue: VecDeque::new(),
                     verifying: false,
                     next_fetch: last.height,
@@ -1749,6 +1730,15 @@ impl Node {
             None => {
                 let _ = self.storage.clear_sync_headers();
                 let start = our_height.saturating_sub(step_back);
+                // Below `start` the peer's chain is ours, and so is the work
+                // window its first claims are checked against.
+                let work_floor = match self.storage.work_floor_before(start) {
+                    Ok(floor) => floor,
+                    Err(e) => {
+                        tracing::error!("Cannot sync: no work window below {}: {:#}", start, e);
+                        return;
+                    }
+                };
                 let window = self
                     .storage
                     .load_timestamps(start, MEDIAN_TIME_PAST_WINDOW as u64)
@@ -1760,9 +1750,10 @@ impl Node {
                     tip: None,
                     window,
                     verified_to: start,
-                    their_work: 0,
-                    our_work: 0,
-                    fork_depth: 0,
+                    // Set from our header below `start` once the first chunk
+                    // is found to link to it.
+                    verified_weight: 0,
+                    work_floor,
                     queue: VecDeque::new(),
                     verifying: false,
                     next_fetch: start,
@@ -1785,8 +1776,7 @@ impl Node {
             id,
             peer,
             peer_height: height,
-            peer_depth: depth,
-            claimed_depth: depth,
+            peer_weight: weight,
             step_back,
             last_progress: Instant::now(),
             headers,
@@ -1861,58 +1851,24 @@ impl Node {
     fn maybe_finish_sync(&mut self) {
         enum Verdict {
             Wait,
-            /// The peer's chain was no heavier than ours, and what it showed.
-            Abort(&'static str, PeerId, Judgement),
+            Abort(&'static str),
             Done(PeerId),
         }
-        let (our_depth, our_weight) = (self.state.depth, self.state.weight());
         let verdict = match self.sync.as_ref() {
             None => return,
             Some(s) => {
                 let h = &s.headers;
-                // The chain the peer served. A peer that announced more work
-                // than that is not heard again for a while.
-                let judged = |tip: Option<[u8; 32]>, depth: u128, deficit: u128| Judgement {
-                    tip,
-                    depth,
-                    deficit,
-                    our_weight,
-                    ignored: s.claimed_depth > depth,
-                };
-                let served_tip = h.tip.as_ref().map(|t| t.post_tx_midstate);
-                let served_depth = h.fork_depth.saturating_add(h.their_work);
                 if !(h.done && h.queue.is_empty() && !h.verifying && !h.fetch_in_flight) {
                     Verdict::Wait
                 } else {
                     match &s.blocks {
-                        // Its chain is part of ours.
-                        None if h.fork.is_none() => Verdict::Abort(
-                            "peer has nothing new",
-                            s.peer,
-                            judged(None, our_depth, 0),
-                        ),
-                        None => Verdict::Abort(
-                            "peer chain is not heavier",
-                            s.peer,
-                            judged(served_tip, served_depth, 0),
-                        ),
+                        None if h.fork.is_none() => Verdict::Abort("peer has nothing new"),
+                        None => Verdict::Abort("peer chain is not heavier"),
                         Some(b) if b.applying || b.rebuilding || b.cursor < h.verified_to => {
                             Verdict::Wait
                         }
                         Some(b) if !b.committed => {
-                            let judgement = match &b.candidate {
-                                Some(c) => judged(
-                                    Some(c.mw_midstate),
-                                    c.depth,
-                                    our_weight.saturating_sub(c.weight()),
-                                ),
-                                None => judged(served_tip, served_depth, 0),
-                            };
-                            Verdict::Abort(
-                                "downloaded chain did not end up heavier",
-                                s.peer,
-                                judgement,
-                            )
+                            Verdict::Abort("downloaded chain did not end up heavier")
                         }
                         Some(_) => Verdict::Done(s.peer),
                     }
@@ -1921,19 +1877,11 @@ impl Node {
         };
         match verdict {
             Verdict::Wait => {}
-            Verdict::Abort(reason, peer, judgement) => {
-                self.lighter.judged(peer, judgement, Instant::now());
-                if judgement.ignored {
-                    tracing::info!(
-                        "{} announced more work than its chain has; not believing it for a while",
-                        peer
-                    );
-                }
+            Verdict::Abort(reason) => {
                 let _ = self.storage.clear_sync_headers();
                 self.abort_sync(reason);
             }
             Verdict::Done(peer) => {
-                self.lighter.forget(&peer);
                 tracing::info!(
                     "Sync with {} complete at height {}",
                     peer,
@@ -1982,7 +1930,7 @@ impl Node {
         s.headers.fetch_in_flight = false;
         s.last_progress = Instant::now();
         let step = self.examine_headers(&mut s, chunk);
-        let (height, depth) = (s.peer_height, s.peer_depth);
+        let (height, weight) = (s.peer_height, s.peer_weight);
         self.sync = Some(s);
         match step {
             HeaderStep::Continue => {
@@ -1991,18 +1939,13 @@ impl Node {
                 self.maybe_finish_sync();
             }
             HeaderStep::Ban(reason) => self.ban_peer(peer, reason),
-            HeaderStep::Abort(reason) => {
-                // It served no chain we could adopt: asking again soon would
-                // only repeat the work.
-                self.lighter.judged(peer, Judgement::ignored(), Instant::now());
-                self.abort_sync(reason)
-            }
+            HeaderStep::Abort(reason) => self.abort_sync(reason),
             HeaderStep::Restart {
                 step_back: new_step,
                 allow_resume,
             } => {
                 self.sync = None;
-                self.start_sync(peer, height, depth, new_step, allow_resume);
+                self.start_sync(peer, height, weight, new_step, allow_resume);
             }
         }
     }
@@ -2054,10 +1997,12 @@ impl Node {
             }
             None => {
                 let links = if h.start == 0 {
+                    h.verified_weight = 0;
                     chunk[0].extension.final_hash == Batch::genesis().extension.final_hash
                 } else {
                     match self.storage.load_header(h.start - 1).ok().flatten() {
                         Some(ours) => {
+                            h.verified_weight = ours.chain_weight;
                             ours.extension.final_hash == chunk[0].prev_header_hash
                                 && ours.post_tx_midstate == chunk[0].prev_midstate
                         }
@@ -2099,16 +2044,25 @@ impl Node {
         };
         s.headers.verifying = true;
         let prior: Vec<u64> = s.headers.window.iter().copied().collect();
+        let parent_weight = s.headers.verified_weight;
+        let work_floor = s.headers.work_floor.clone();
         let deferred = s.headers.fetch_deferred;
         let (id, tx, cancel) = (s.id, self.internal_tx.clone(), s.cancel.clone());
         #[cfg(feature = "fast-mining")]
         let delay = self.config.header_verify_delay;
         tokio::task::spawn_blocking(move || {
-            let result = verify_header_chain_with(&chunk, &prior, true, |_headers| {
-                #[cfg(feature = "fast-mining")]
-                std::thread::sleep(delay * _headers as u32);
-                !cancel.load(std::sync::atomic::Ordering::Relaxed)
-            });
+            let result = verify_header_chain_with(
+                &chunk,
+                &prior,
+                parent_weight,
+                &work_floor,
+                true,
+                |_headers| {
+                    #[cfg(feature = "fast-mining")]
+                    std::thread::sleep(delay * _headers as u32);
+                    !cancel.load(std::sync::atomic::Ordering::Relaxed)
+                },
+            );
             let _ = tx.send(Internal::HeadersVerified {
                 session: id,
                 chunk,
@@ -2149,6 +2103,13 @@ impl Node {
             }
         }
         let last_height = chunk.last().map_or(s.headers.verified_to, |x| x.height + 1);
+        if let Some(last) = chunk.last() {
+            s.headers.verified_weight = last.chain_weight;
+        }
+        for x in &chunk {
+            let work = crate::core::state::calculate_work(&x.target);
+            crate::core::bond::cap_work(&mut s.headers.work_floor, x.height, work);
+        }
         let our_len = self.state.height;
 
         let new_headers: Vec<BatchHeader> = if s.headers.fork.is_some() {
@@ -2177,15 +2138,11 @@ impl Node {
                     s.headers.verified_to = last_height;
                     if last_height >= our_len {
                         s.headers.fork = Some(our_len);
-                        s.headers.fork_depth = self.state.depth;
                     }
                     Vec::new()
                 }
                 Some(fork) => {
                     if our_len - fork > MAX_REORG_DEPTH || fork < self.finality.floor() {
-                        // A chain we can never adopt, and it only falls
-                        // further behind as ours grows.
-                        self.lighter.judged(s.peer, Judgement::ignored(), Instant::now());
                         self.sync = Some(s);
                         let _ = self.storage.clear_sync_headers();
                         self.abort_sync(
@@ -2201,13 +2158,6 @@ impl Node {
                         );
                     }
                     s.headers.fork = Some(fork);
-                    s.headers.our_work = headers_work(
-                        &self
-                            .storage
-                            .load_headers(fork, our_len - fork)
-                            .unwrap_or_default(),
-                    );
-                    s.headers.fork_depth = self.state.depth.saturating_sub(s.headers.our_work);
                     chunk.into_iter().filter(|x| x.height >= fork).collect()
                 }
             }
@@ -2216,10 +2166,6 @@ impl Node {
             if let Err(e) = self.storage.save_sync_headers(&new_headers) {
                 tracing::warn!("Could not persist verified headers: {:#}", e);
             }
-            s.headers.their_work = s
-                .headers
-                .their_work
-                .saturating_add(headers_work(&new_headers));
         }
         s.headers.verified_to = last_height;
         self.sync = Some(s);
@@ -2233,14 +2179,17 @@ impl Node {
 
     // ── Sync: blocks ────────────────────────────────────────────────────
 
-    /// Starts block download once the verified headers outweigh our chain.
+    /// Starts block download once the verified headers outweigh our chain,
+    /// by the weight fork choice uses (each header's claim was checked to be
+    /// one its block could make; applying the blocks settles the rest).
     fn maybe_start_blocks(&mut self) {
+        let our_weight = self.state.weight();
         let Some(s) = self.sync.as_mut() else { return };
         if s.blocks.is_some() {
             return;
         }
         let Some(fork) = s.headers.fork else { return };
-        if s.headers.their_work <= s.headers.our_work || s.headers.verified_to <= fork {
+        if s.headers.verified_weight <= our_weight || s.headers.verified_to <= fork {
             return;
         }
         let our_len = self.state.height;
@@ -3142,6 +3091,7 @@ impl Node {
             LightRequest::GetState => json!({
                 "height": self.state.height,
                 "depth": self.state.depth.to_string(),
+                "weight": self.state.weight().to_string(),
                 "tip": hex::encode(self.state.header_hash),
                 "target": hex::encode(self.state.target),
                 "state_root": hex::encode(self.state.state_root()),

@@ -12,9 +12,7 @@
 //! sequential hashes, so a chunk of headers can take minutes to verify on a
 //! one-core machine, and that machine must still be able to sync
 //! ([`SyncSession::timed_out`]). A dropped session stops its background
-//! work, so retries do not pile up on the CPU. A peer whose chain turns out
-//! no heavier than ours starts no new session until that chain could be
-//! ([`LighterChains`]).
+//! work, so retries do not pile up on the CPU.
 
 use crate::core::simd_mining::{check_pow_chains_with, pow_seed, PowCheck};
 use crate::core::state::{calculate_target, calculate_work, current_timestamp, validate_timestamp};
@@ -49,14 +47,32 @@ pub const INITIAL_STEP_BACK: u64 = 16;
 ///
 /// `prior_timestamps` are the timestamps of the blocks just below
 /// `headers[0]` (oldest first); the last one also fixes `headers[0]`'s
-/// expected target. The caller checks that `headers[0]` links to its own
-/// chain.
+/// expected target. `parent_weight` is the chain weight of the block below
+/// `headers[0]` (0 below genesis), and `work_floor` the fork-choice work
+/// window after it (`bond::cap_work`; empty below genesis). The caller
+/// checks that `headers[0]` links to its own chain.
+///
+/// Each header's claimed chain weight must have grown by what its block
+/// could add: its work as far as the work cap allows, which the headers
+/// themselves decide, or for a signed block the sliver an over-cap block
+/// adds (`bond::credit_possible`). Which of those two is right depends on
+/// the bond set, which headers do not carry, so applying the blocks settles
+/// it: a block whose claim is wrong is invalid.
 pub fn verify_header_chain(
     headers: &[BatchHeader],
     prior_timestamps: &[u64],
+    parent_weight: u128,
+    work_floor: &im::Vector<(u64, u128)>,
     check_pow: bool,
 ) -> Result<()> {
-    verify_header_chain_with(headers, prior_timestamps, check_pow, |_| true)
+    verify_header_chain_with(
+        headers,
+        prior_timestamps,
+        parent_weight,
+        work_floor,
+        check_pow,
+        |_| true,
+    )
 }
 
 /// [`verify_header_chain`], checking proof of work a piece at a time. Before
@@ -65,6 +81,8 @@ pub fn verify_header_chain(
 pub fn verify_header_chain_with(
     headers: &[BatchHeader],
     prior_timestamps: &[u64],
+    parent_weight: u128,
+    work_floor: &im::Vector<(u64, u128)>,
     check_pow: bool,
     mut proceed: impl FnMut(usize) -> bool,
 ) -> Result<()> {
@@ -72,6 +90,25 @@ pub fn verify_header_chain_with(
         return Ok(());
     };
     let now = current_timestamp();
+
+    let (mut weight, mut floor) = (parent_weight, work_floor.clone());
+    for header in headers {
+        let work = calculate_work(&header.target);
+        let creditable = crate::core::bond::cap_work(&mut floor, header.height, work);
+        let possible = header
+            .chain_weight
+            .checked_sub(weight)
+            .is_some_and(|added| {
+                crate::core::bond::credit_possible(creditable, header.signer.is_some(), added)
+            });
+        if !possible {
+            bail!(
+                "header {} claims a chain weight its block could not have added",
+                header.height
+            );
+        }
+        weight = header.chain_weight;
+    }
 
     let expected_first_target = match (first.height, prior_timestamps.last()) {
         (0, _) => calculate_target(0, 0),
@@ -157,13 +194,6 @@ pub fn verify_header_chain_with(
     Ok(())
 }
 
-/// Cumulative work of a run of headers.
-pub fn headers_work(headers: &[BatchHeader]) -> u128 {
-    headers.iter().fold(0u128, |acc, h| {
-        acc.saturating_add(calculate_work(&h.target))
-    })
-}
-
 /// Batch requests outstanding at once, across all serving peers.
 pub const MAX_BATCH_REQUESTS_IN_FLIGHT: usize = 4;
 /// How far past the apply cursor blocks may be requested.
@@ -186,12 +216,14 @@ pub struct HeaderSync {
     pub window: VecDeque<u64>,
     /// Every header below this height is verified.
     pub verified_to: u64,
-    /// Work of verified headers from the fork.
-    pub their_work: u128,
-    /// Work of our own blocks from the fork.
-    pub our_work: u128,
-    /// Our chain's depth at the fork, once known: the work both chains share.
-    pub fork_depth: u128,
+    /// The chain weight of the block below `verified_to`: what the peer's
+    /// chain weighs as far as it is verified, and the weight the next chunk
+    /// builds on. Fork choice compares it with ours.
+    pub verified_weight: u128,
+    /// The fork-choice work window after the block below `verified_to`
+    /// (`bond::cap_work`), which the next chunk's claims are checked
+    /// against.
+    pub work_floor: im::Vector<(u64, u128)>,
     pub queue: VecDeque<Vec<BatchHeader>>,
     pub verifying: bool,
     pub next_fetch: u64,
@@ -273,10 +305,8 @@ pub struct SyncSession {
     /// The peer whose chain we are adopting; headers come only from it.
     pub peer: PeerId,
     pub peer_height: u64,
-    pub peer_depth: u128,
-    /// The depth the peer announced when the session started: the work its
-    /// chain should show.
-    pub claimed_depth: u128,
+    /// The chain weight the peer claimed (`State::weight`).
+    pub peer_weight: u128,
     pub step_back: u64,
     /// When the peer last sent something useful, or our own work on the
     /// session last finished.
@@ -331,211 +361,6 @@ pub struct SyncStats {
     pub batch_chunks_applied: u64,
     /// Distinct peers that supplied applied blocks.
     pub batch_sources: usize,
-    /// Announcements not followed up because the chain behind them, judged
-    /// no heavier than ours, could not have caught up yet ([`LighterChains`]).
-    pub lighter_skipped: u64,
-}
-
-/// How long a peer whose chain was judged no heavier than ours waits for its
-/// chain to catch up before it may start a session regardless.
-pub const LIGHTER_CHAIN_MEMORY: Duration = Duration::from_secs(10 * 60);
-/// How long a peer whose announcements are not worth a session at all goes
-/// unheard, and a tip judged no heavier than ours is remembered.
-pub const IGNORED_PEER_MEMORY: Duration = Duration::from_secs(60 * 60);
-/// Records kept at most, so a stream of peers and tips cannot grow them
-/// without bound.
-const MAX_LIGHTER_RECORDS: usize = 4096;
-
-/// What a session that ended without a heavier chain showed us.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Judgement {
-    /// The tip of the chain the peer served (its last block's midstate), when
-    /// the peer served a chain of its own.
-    pub tip: Option<[u8; 32]>,
-    /// That chain's depth: its cumulative work.
-    pub depth: u128,
-    /// How far its weight fell short of ours: exact when we applied its
-    /// blocks, otherwise 0, which never holds a chain back too long.
-    pub deficit: u128,
-    /// Our weight when we judged it.
-    pub our_weight: u128,
-    /// Nothing the peer announces is worth a session until its record
-    /// expires: it announced more work than it served, or it served no chain
-    /// we could ever adopt.
-    pub ignored: bool,
-}
-
-impl Judgement {
-    /// A peer whose announcements are not worth a session for a while.
-    pub fn ignored() -> Self {
-        Self { tip: None, depth: 0, deficit: 0, our_weight: 0, ignored: true }
-    }
-}
-
-/// Peers whose chain turned out no heavier than ours, and the tips we judged.
-///
-/// Peers announce their depth, cumulative work, but fork choice compares
-/// weight, which the per-bond cap and the work cap can hold far below it. A
-/// chain deeper than ours but lighter would otherwise start a session at
-/// every announcement, once a poll interval, for as long as the peer cared to
-/// announce it: header verification, block download and application each
-/// time, with our miner stopped. After such a session, the peer's
-/// announcements start another only once its chain could have caught up. A
-/// block adds at most its work to a chain's weight, so until the chain has
-/// grown by more than the weight it lacked, plus whatever ours has gained
-/// since, it cannot be heavier than ours.
-///
-/// A tip judged lighter stays lighter, so it is not followed up from any
-/// peer. A peer that announced more work than it then served, or whose chain
-/// we could never adopt (it leaves ours deeper than we reorganise), is not
-/// heard until its record expires. Every record expires: a peer that moved
-/// to another branch, which growth alone does not reveal, is never ignored
-/// for long.
-#[derive(Debug, Default)]
-pub struct LighterChains {
-    peers: HashMap<PeerId, (Judgement, Instant)>,
-    tips: HashMap<[u8; 32], Instant>,
-}
-
-impl LighterChains {
-    /// Records that `peer`'s chain was no heavier than ours.
-    pub fn judged(&mut self, peer: PeerId, judgement: Judgement, now: Instant) {
-        self.peers.retain(|_, (_, until)| *until > now);
-        self.tips.retain(|_, until| *until > now);
-        let memory = if judgement.ignored {
-            IGNORED_PEER_MEMORY
-        } else {
-            LIGHTER_CHAIN_MEMORY
-        };
-        self.peers.insert(peer, (judgement, now + memory));
-        if let Some(tip) = judgement.tip {
-            self.tips.insert(tip, now + IGNORED_PEER_MEMORY);
-        }
-        if self.peers.len() > MAX_LIGHTER_RECORDS {
-            let oldest = self.peers.iter().min_by_key(|(_, (_, until))| *until).map(|(p, _)| *p);
-            if let Some(oldest) = oldest {
-                self.peers.remove(&oldest);
-            }
-        }
-        if self.tips.len() > MAX_LIGHTER_RECORDS {
-            let oldest = self.tips.iter().min_by_key(|(_, until)| **until).map(|(t, _)| *t);
-            if let Some(oldest) = oldest {
-                self.tips.remove(&oldest);
-            }
-        }
-    }
-
-    /// Drops `peer`'s record: it gave us a heavier chain, or is on ours.
-    pub fn forget(&mut self, peer: &PeerId) {
-        self.peers.remove(peer);
-    }
-
-    /// Whether `peer`'s announcement of a chain of `depth` ending at `tip`
-    /// could be a chain heavier than ours, which weighs `our_weight`.
-    pub fn worth_syncing(
-        &mut self,
-        peer: &PeerId,
-        depth: u128,
-        tip: [u8; 32],
-        our_weight: u128,
-        now: Instant,
-    ) -> bool {
-        if self.tips.get(&tip).is_some_and(|until| *until > now) {
-            return false;
-        }
-        match self.peers.get(peer) {
-            Some((judged, until)) if *until > now => {
-                if judged.ignored {
-                    return false;
-                }
-                let grown = depth.saturating_sub(judged.depth);
-                let gained = our_weight.saturating_sub(judged.our_weight);
-                grown > judged.deficit.saturating_add(gained)
-            }
-            Some(_) => {
-                self.peers.remove(peer);
-                true
-            }
-            None => true,
-        }
-    }
-}
-
-#[cfg(test)]
-mod lighter_tests {
-    use super::*;
-
-    fn judgement(depth: u128, deficit: u128, our_weight: u128) -> Judgement {
-        Judgement { tip: Some([depth as u8; 32]), depth, deficit, our_weight, ignored: false }
-    }
-
-    #[test]
-    fn a_lighter_chain_waits_until_it_could_have_caught_up() {
-        let (mut memo, peer, now) = (LighterChains::default(), PeerId::random(), Instant::now());
-        memo.judged(peer, judgement(1_000, 100, 600), now);
-        // Announced again, or grown by no more than the weight it lacked.
-        assert!(!memo.worth_syncing(&peer, 1_000, [1; 32], 600, now));
-        assert!(!memo.worth_syncing(&peer, 1_100, [2; 32], 600, now));
-        // Grown by more: it could now be heavier.
-        assert!(memo.worth_syncing(&peer, 1_101, [3; 32], 600, now));
-        // Our own chain has gained 50 since: it must grow by that too.
-        assert!(!memo.worth_syncing(&peer, 1_150, [4; 32], 650, now));
-        assert!(memo.worth_syncing(&peer, 1_151, [5; 32], 650, now));
-    }
-
-    /// The honest race: a tie, then whichever branch grows more wins.
-    #[test]
-    fn after_a_tie_any_growth_beyond_ours_is_followed_up() {
-        let (mut memo, peer, now) = (LighterChains::default(), PeerId::random(), Instant::now());
-        memo.judged(peer, judgement(1_000, 0, 1_000), now);
-        assert!(!memo.worth_syncing(&peer, 1_000, [7; 32], 1_000, now));
-        assert!(memo.worth_syncing(&peer, 1_001, [8; 32], 1_000, now));
-        assert!(!memo.worth_syncing(&peer, 1_010, [8; 32], 1_010, now), "we grew as much");
-    }
-
-    #[test]
-    fn a_judged_tip_is_not_followed_up_from_any_peer() {
-        let (mut memo, now) = (LighterChains::default(), Instant::now());
-        let tip = [9; 32];
-        let judged = Judgement { tip: Some(tip), ..judgement(1_000, 100, 600) };
-        memo.judged(PeerId::random(), judged, now);
-        let other = PeerId::random();
-        assert!(!memo.worth_syncing(&other, 5_000, tip, 600, now));
-        assert!(memo.worth_syncing(&other, 5_000, [10; 32], 600, now));
-        assert!(memo.worth_syncing(&other, 5_000, tip, 600, now + IGNORED_PEER_MEMORY));
-    }
-
-    #[test]
-    fn an_ignored_peer_is_not_heard_until_its_record_expires() {
-        let (mut memo, peer, now) = (LighterChains::default(), PeerId::random(), Instant::now());
-        memo.judged(peer, Judgement::ignored(), now);
-        assert!(!memo.worth_syncing(&peer, u128::MAX, [1; 32], 600, now));
-        assert!(!memo.worth_syncing(&peer, u128::MAX, [1; 32], 600, now + LIGHTER_CHAIN_MEMORY));
-        assert!(memo.worth_syncing(&peer, u128::MAX, [1; 32], 600, now + IGNORED_PEER_MEMORY));
-    }
-
-    #[test]
-    fn records_expire_and_can_be_forgotten() {
-        let (mut memo, peer, now) = (LighterChains::default(), PeerId::random(), Instant::now());
-        memo.judged(peer, judgement(1_000, 100, 600), now);
-        assert!(!memo.worth_syncing(&peer, 1_000, [1; 32], 600, now));
-        assert!(memo.worth_syncing(&peer, 1_000, [1; 32], 600, now + LIGHTER_CHAIN_MEMORY));
-        memo.judged(peer, judgement(1_000, 100, 600), now);
-        memo.forget(&peer);
-        assert!(memo.worth_syncing(&peer, 1_000, [1; 32], 600, now));
-    }
-
-    #[test]
-    fn records_are_bounded() {
-        let (mut memo, now) = (LighterChains::default(), Instant::now());
-        for i in 0..MAX_LIGHTER_RECORDS + 10 {
-            let mut tip = [0u8; 32];
-            tip[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            memo.judged(PeerId::random(), Judgement { tip: Some(tip), ..judgement(1, 0, 1) }, now);
-        }
-        assert_eq!(memo.peers.len(), MAX_LIGHTER_RECORDS);
-        assert_eq!(memo.tips.len(), MAX_LIGHTER_RECORDS);
-    }
 }
 
 #[cfg(all(test, feature = "fast-mining"))]
@@ -566,42 +391,93 @@ mod tests {
         out
     }
 
+    /// The work window after `hs`, as a node holding them computes it.
+    fn floor_after(hs: &[BatchHeader]) -> im::Vector<(u64, u128)> {
+        let mut floor = im::Vector::new();
+        for h in hs {
+            crate::core::bond::cap_work(&mut floor, h.height, calculate_work(&h.target));
+        }
+        floor
+    }
+
     #[test]
     fn valid_chain_verifies_and_tampering_is_caught() {
         let hs = headers(6);
-        verify_header_chain(&hs, &[], true).unwrap();
+        let none = im::Vector::new();
+        verify_header_chain(&hs, &[], 0, &none, true).unwrap();
         verify_header_chain(
             &hs[3..],
             &hs[..3].iter().map(|h| h.timestamp).collect::<Vec<_>>(),
+            hs[2].chain_weight,
+            &floor_after(&hs[..3]),
             true,
         )
         .unwrap();
-        assert!(headers_work(&hs) > 0);
 
         let mut bad = hs.clone();
         bad[4].extension.nonce ^= 1;
-        assert!(verify_header_chain(&bad, &[], true).is_err());
+        assert!(verify_header_chain(&bad, &[], 0, &none, true).is_err());
 
         let mut relinked = hs.clone();
         relinked[5].prev_header_hash = [9; 32];
-        assert!(verify_header_chain(&relinked, &[], false).is_err());
+        assert!(verify_header_chain(&relinked, &[], 0, &none, false).is_err());
 
         let mut easier = hs.clone();
         easier[2].target = [0x01; 32];
-        assert!(verify_header_chain(&easier, &[], false).is_err());
+        assert!(verify_header_chain(&easier, &[], 0, &none, false).is_err());
+    }
+
+    /// A header's chain weight can only grow by what its block could add,
+    /// and the proof of work covers the claim.
+    #[test]
+    fn claimed_chain_weights_are_checked() {
+        let hs = headers(4);
+        let none = im::Vector::new();
+        let work = calculate_work(&hs[2].target);
+        assert_eq!(hs[2].chain_weight - hs[1].chain_weight, work);
+        // From the wrong starting weight, or growing by anything else.
+        let floor = floor_after(&hs[..1]);
+        assert!(verify_header_chain(&hs[1..], &[hs[0].timestamp], 1, &floor, false).is_err());
+        for claimed in [0, work + 1, work * 2, u128::MAX] {
+            let mut lying = hs.clone();
+            lying[2].chain_weight = lying[1].chain_weight.saturating_add(claimed);
+            let err = verify_header_chain(&lying, &[], 0, &none, false).unwrap_err();
+            assert!(err.to_string().contains("chain weight"), "{claimed}: {err}");
+        }
+        // A signer changes what is possible (see `bond::credit_possible`),
+        // but the proof of work covers both fields: changing either, even to
+        // something possible, is forgery.
+        let mut signed = hs.clone();
+        signed[2].signer = Some([7; 32]);
+        verify_header_chain(&signed, &[], 0, &none, false).unwrap();
+        assert!(verify_header_chain(&signed, &[], 0, &none, true).is_err());
+    }
+
+    /// The work window comes from the headers, so the work cap is checked
+    /// exactly: after a cheaper block, the same headers' full-work claims
+    /// are more than their blocks could add.
+    #[test]
+    fn claimed_weights_respect_the_work_cap() {
+        let hs = headers(4);
+        let (prior, parent) = ([hs[0].timestamp], hs[0].chain_weight);
+        verify_header_chain(&hs[1..], &prior, parent, &floor_after(&hs[..1]), false).unwrap();
+        let cheaper = im::vector![(0u64, calculate_work(&hs[1].target) / 2)];
+        let err = verify_header_chain(&hs[1..], &prior, parent, &cheaper, false).unwrap_err();
+        assert!(err.to_string().contains("chain weight"), "{err}");
     }
 
     #[test]
     fn verification_reports_its_pieces_and_can_be_abandoned() {
         let hs = headers(6);
         let mut seen = 0;
-        verify_header_chain_with(&hs, &[], true, |n| {
+        verify_header_chain_with(&hs, &[], 0, &im::Vector::new(), true, |n| {
             seen += n;
             true
         })
         .unwrap();
         assert_eq!(seen, 6, "every header but genesis goes through a piece");
-        let err = verify_header_chain_with(&hs, &[], true, |_| false).unwrap_err();
+        let err =
+            verify_header_chain_with(&hs, &[], 0, &im::Vector::new(), true, |_| false).unwrap_err();
         assert!(err.to_string().contains("abandoned"), "{err:#}");
     }
 
@@ -610,8 +486,7 @@ mod tests {
             id: 1,
             peer: PeerId::random(),
             peer_height: 100,
-            peer_depth: 100,
-            claimed_depth: 100,
+            peer_weight: 100,
             step_back: INITIAL_STEP_BACK,
             last_progress: Instant::now() - quiet_for,
             headers: HeaderSync {
@@ -620,9 +495,8 @@ mod tests {
                 tip: None,
                 window: VecDeque::new(),
                 verified_to: 0,
-                their_work: 0,
-                our_work: 0,
-                fork_depth: 0,
+                verified_weight: 0,
+                work_floor: im::Vector::new(),
                 queue: VecDeque::new(),
                 verifying,
                 next_fetch: 0,

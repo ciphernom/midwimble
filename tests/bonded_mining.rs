@@ -6,12 +6,16 @@
 
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 use midwimble::core::bond::{
-    devnet_registration, est_midstate_height, MinerBond, MIN_REMAINING_BOND_LOCK,
+    devnet_registration, devnet_registrations, est_midstate_height, MinerBond, MAX_BOND_HORIZON,
+    MIN_REMAINING_BOND_LOCK,
 };
-use midwimble::core::state::current_timestamp;
 use midwimble::core::mw::WalletKeys;
-use midwimble::core::types::{hash, GENESIS_TARGET};
+use midwimble::core::state::{apply_batch, current_timestamp};
+use midwimble::core::template::build_template_bonded;
+use midwimble::core::types::{hash, Batch, BlockEffects, State, GENESIS_TARGET, GENESIS_TIMESTAMP};
 use midwimble::node::{Node, NodeConfig, NodeHandle};
+use midwimble::storage::Storage;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod support;
@@ -34,7 +38,24 @@ async fn start_full(
     peers: Vec<String>,
     midstate_rpc: Option<String>,
 ) -> TestNode {
-    let dir = tempfile::tempdir().unwrap();
+    start_in(
+        tempfile::tempdir().unwrap(),
+        bond,
+        mine,
+        peers,
+        midstate_rpc,
+    )
+    .await
+}
+
+/// [`start_full`] on an existing data directory.
+async fn start_in(
+    dir: tempfile::TempDir,
+    bond: Option<MinerBond>,
+    mine: bool,
+    peers: Vec<String>,
+    midstate_rpc: Option<String>,
+) -> TestNode {
     let mut config = NodeConfig::new(dir.path(), "/ip4/127.0.0.1/tcp/0".parse().unwrap());
     config.bootstrap = peers.iter().map(|p| p.parse().unwrap()).collect();
     if mine {
@@ -66,6 +87,10 @@ impl TestNode {
 
     fn height(&self) -> u64 {
         self.handle.info().state.height
+    }
+
+    fn tip(&self) -> [u8; 32] {
+        self.handle.info().state.header_hash
     }
 }
 
@@ -201,4 +226,135 @@ async fn a_producer_relays_the_headers_its_midstate_node_serves() {
         peer.handle.state().relay.commitment(),
         producer.handle.state().relay.commitment()
     );
+}
+
+/// Bonds registered together (one stand-in midstate holds them all), locked
+/// well past the timestamps of a chain mined on schedule from genesis.
+fn bonds_from_genesis(seeds: &[&[u8]]) -> Vec<MinerBond> {
+    let until = est_midstate_height(GENESIS_TIMESTAMP) + MAX_BOND_HORIZON / 2;
+    let secrets: Vec<Scalar> = seeds
+        .iter()
+        .map(|s| Scalar::from_bytes_mod_order(hash(s)))
+        .collect();
+    let specs: Vec<([u8; 32], u64, [u8; 32])> = seeds
+        .iter()
+        .zip(&secrets)
+        .map(|(s, k)| {
+            (
+                RistrettoPoint::mul_base(k).compress().to_bytes(),
+                until,
+                hash(s),
+            )
+        })
+        .collect();
+    let (registrations, headers) = devnet_registrations(&specs, &GENESIS_TARGET);
+    registrations
+        .into_iter()
+        .zip(secrets)
+        .map(|(registration, secret)| MinerBond {
+            secret,
+            bond_id: registration.bond_id(),
+            registration: Some(registration),
+            midstate: Some(headers.clone()),
+            co_bonds: vec![],
+        })
+        .collect()
+}
+
+/// A chain built in memory, block by block, as a node would apply it.
+#[derive(Clone)]
+struct Chain {
+    blocks: Vec<Batch>,
+    effects: Vec<Arc<BlockEffects>>,
+    state: State,
+    timestamps: Vec<u64>,
+}
+
+impl Chain {
+    fn genesis() -> Self {
+        let mut state = State::genesis();
+        apply_batch(&mut state, Batch::genesis(), &[]).unwrap();
+        Chain {
+            blocks: vec![Batch::genesis().clone()],
+            effects: vec![state.effects.clone()],
+            state,
+            timestamps: vec![Batch::genesis().timestamp],
+        }
+    }
+
+    /// Mines one block signed by `bond`, on schedule, so every block has the
+    /// genesis target's work.
+    fn extend(&mut self, bond: &MinerBond) {
+        let to = WalletKeys::random().address();
+        let (template, _) = build_template_bonded(
+            &self.state,
+            &self.timestamps,
+            &[],
+            &[(to, 1)],
+            [0; 32],
+            Some(GENESIS_TIMESTAMP + 60 * self.state.height),
+            Some(bond),
+        )
+        .unwrap();
+        let block = template.mine_blocking();
+        apply_batch(&mut self.state, &block, &self.timestamps).unwrap();
+        self.timestamps.push(block.timestamp);
+        self.effects.push(self.state.effects.clone());
+        self.blocks.push(block);
+    }
+
+    /// A node data directory holding the chain.
+    fn store(&self) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        Storage::open(dir.path())
+            .unwrap()
+            .commit_chain(0, &self.blocks, &self.effects, &self.state)
+            .unwrap();
+        dir
+    }
+}
+
+/// Sync goes by the weight fork choice goes by. Chain A is longer and has
+/// more work, but one bond signed nearly all of it, far over its cap; chain
+/// B, signed in turn by two bonds, is shorter and weighs more. A node on A
+/// syncs to B, and a node on B never starts a session to fetch A (which it
+/// would only throw away), however much more work A has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_follows_the_heavier_chain_not_the_one_with_more_work() {
+    let mut bonds = bonds_from_genesis(&[b"weight a", b"weight b"]);
+    let (a, b) = (bonds.remove(0), bonds.remove(0));
+    let mut prefix = Chain::genesis();
+    prefix.extend(&a);
+    prefix.extend(&b);
+    let (mut heavy, mut long) = (prefix.clone(), prefix);
+    for i in 0..10 {
+        heavy.extend(if i % 2 == 0 { &a } else { &b });
+    }
+    for _ in 0..14 {
+        long.extend(&a);
+    }
+    assert!(long.state.height > heavy.state.height, "A is longer");
+    assert!(long.state.depth > heavy.state.depth, "A has more work");
+    assert!(long.state.weight() < heavy.state.weight(), "B weighs more");
+    let heavy_tip = heavy.state.header_hash;
+
+    let on_b = start_in(heavy.store(), None, false, vec![], None).await;
+    let on_a = start_in(
+        long.store(),
+        None,
+        false,
+        vec![on_b.dial_addr().await],
+        None,
+    )
+    .await;
+    wait_until("the node on A to reorganise onto B", 60, || {
+        on_a.tip() == heavy_tip
+    })
+    .await;
+    assert_eq!(on_a.handle.state().weight(), heavy.state.weight());
+
+    // The node on B has heard A's tip all along and never chased it.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(on_b.tip(), heavy_tip);
+    assert_eq!(on_b.handle.info().sync_stats.sessions, 0);
 }

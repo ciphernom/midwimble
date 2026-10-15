@@ -242,6 +242,12 @@ pub struct JobProof {
     pub registrations: Option<[u8; 32]>,
     #[serde(default)]
     pub relay: Option<[u8; 32]>,
+    /// The bond every copy is signed by, and the chain weight the header
+    /// claims (the same for every copy).
+    #[serde(default)]
+    pub signer: Option<[u8; 32]>,
+    #[serde(default)]
+    pub chain_weight: u128,
     pub paying_root: [u8; 32],
     pub next_root: [u8; 32],
 }
@@ -260,6 +266,8 @@ impl JobProof {
             registrations: (!batch.registrations.is_empty())
                 .then(|| registrations_hash(&batch.registrations)),
             relay: batch.relay.as_ref().map(|r| r.hash()),
+            signer: batch.miner.as_ref().map(|m| m.bond_id),
+            chain_weight: batch.chain_weight,
             paying_root,
             next_root,
         })
@@ -293,6 +301,8 @@ impl JobProof {
             target: self.target,
             state_root: self.state_root,
             prev_header_hash: self.prev_header_hash,
+            signer: auth.and(self.signer),
+            chain_weight: self.chain_weight,
             aux_pow: None,
         })
     }

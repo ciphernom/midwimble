@@ -647,10 +647,12 @@ impl MinerAuth {
 
 /// What a bonded miner signs for `batch` on a chain whose midstate is
 /// `prev_midstate`: the mining hash the block would have without its
-/// authorisation. The signature covers every other byte of the block, and the
-/// proof of work then covers the signature, so a found block cannot be
-/// re-attributed to another bond. Merged mining keeps that property, because
-/// the midstate parent commits to the full mining hash.
+/// authorisation (and without its signer, which the authorisation names).
+/// The signature covers every other byte of the block, the chain weight its
+/// header claims included, and the proof of work then covers the signature
+/// and the signer, so a found block cannot be re-attributed to another bond.
+/// Merged mining keeps that property, because the midstate parent commits to
+/// the full mining hash.
 pub fn authorization_message(prev_midstate: &[u8; 32], batch: &Batch) -> [u8; 32] {
     let header = BatchHeader {
         height: 0,
@@ -661,6 +663,8 @@ pub fn authorization_message(prev_midstate: &[u8; 32], batch: &Batch) -> [u8; 32
         timestamp: batch.timestamp,
         target: batch.target,
         state_root: batch.state_root,
+        signer: None,
+        chain_weight: batch.chain_weight,
         aux_pow: None,
     };
     hash_domain(
@@ -1116,6 +1120,16 @@ pub fn credit_in_window(
     }
 }
 
+/// Whether a block could add `credited` to its chain's weight, given
+/// `creditable`, its work as far as the work cap allows ([`cap_work`]): all
+/// of that, or, for a signed block, the sliver an over-cap block adds
+/// ([`credit_in_window`]). Headers-first sync checks claimed chain weights
+/// with this (the work window is in the headers; the bond set is not, so
+/// which of the two is right is settled when the block is applied).
+pub fn credit_possible(creditable: u128, signed: bool, credited: u128) -> bool {
+    credited == creditable || (signed && credited == (creditable / OVER_CAP_WORK_DIVISOR).max(1))
+}
+
 /// Rebuilds the window from the signers of the blocks before `state`, oldest
 /// first (storage does this after loading or rewinding).
 pub fn rebuild_signer_window(
@@ -1137,9 +1151,10 @@ pub fn rebuild_signer_window(
 }
 
 /// Rebuilds the work window from the `(height, work)` of the blocks before
-/// `state`, oldest first (storage does this after loading or rewinding). A
-/// block left out, such as one below a snapshot's base, can only raise the
-/// floor: it loosens this node's weighting, never validity.
+/// `state`, oldest first (storage does this after loading or rewinding, and
+/// snapshots after verifying). The window decides the chain weight the next
+/// block must claim, so every block in it must be given: storage and
+/// snapshots keep a full window of headers.
 pub fn rebuild_work_floor(
     state: &mut super::types::State,
     works: impl IntoIterator<Item = (u64, u128)>,
@@ -1208,6 +1223,27 @@ mod cap_tests {
             proven_height: 0,
             proven_hash: [0; 32],
         }
+    }
+
+    /// A block adds all its work, or, if signed and over its cap, a sliver:
+    /// nothing else.
+    #[test]
+    fn possible_credits() {
+        let work = 1u128 << 40;
+        let sliver = work / OVER_CAP_WORK_DIVISOR;
+        assert!(credit_possible(work, false, work));
+        assert!(credit_possible(work, true, work));
+        assert!(credit_possible(work, true, sliver));
+        assert!(
+            !credit_possible(work, false, sliver),
+            "unsigned blocks are never capped"
+        );
+        for other in [0, sliver - 1, sliver + 1, work - 1, work + 1] {
+            assert!(!credit_possible(work, true, other), "{other}");
+        }
+        // Tiny work: the sliver is never zero, so a longer chain is heavier.
+        assert!(credit_possible(1, true, 1));
+        assert!(!credit_possible(1, true, 0));
     }
 
     /// Revocation removes exactly the bonds proven above the fork.

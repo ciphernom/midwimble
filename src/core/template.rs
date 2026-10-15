@@ -431,6 +431,22 @@ pub fn build_template_relayed(
     super::state::apply_registrations(&mut next, &registered)?;
     let state_root = next.state_root();
 
+    // The signer, and so the chain weight the header claims: the block's
+    // work as far as the work cap allows, less what the per-bond cap
+    // withholds from that signer.
+    let signer = bond.map(|b| b.choose_signer(&next.bonds, &state.signer_counts, timestamp));
+    let mut floor = state.work_floor.clone();
+    let work = crate::core::state::calculate_work(&state.target);
+    let creditable = crate::core::bond::cap_work(&mut floor, height, work);
+    let (mut recent, mut counts) = (state.recent_signers.clone(), state.signer_counts.clone());
+    let credited = crate::core::bond::credit_in_window(
+        &mut recent,
+        &mut counts,
+        &next.bonds,
+        signer,
+        creditable,
+        timestamp,
+    );
     let mut batch = Batch {
         prev_midstate: state.mw_midstate,
         prev_header_hash: state.header_hash,
@@ -439,6 +455,7 @@ pub fn build_template_relayed(
         registrations,
         miner: None,
         relay,
+        chain_weight: state.weight().saturating_add(credited),
         extension: Extension {
             nonce: 0,
             final_hash: [0u8; 32],
@@ -451,10 +468,10 @@ pub fn build_template_relayed(
     // Structural self-check (skip proofs: they were verified on admission and
     // the coinbase was just built here).
     validate_block_contents(&batch, height, true)?;
-    if let Some(bond) = bond {
+    if let (Some(bond), Some(signer)) = (bond, signer) {
         let message = authorization_message(&state.mw_midstate, &batch);
         batch.miner = Some(MinerAuth {
-            bond_id: bond.choose_signer(&next.bonds, &state.signer_counts, timestamp),
+            bond_id: signer,
             signature: bond.sign(&message),
         });
         check_miner_authorization(&next.bonds, &state.mw_midstate, &batch)?;

@@ -400,9 +400,21 @@ honest hashrate.
 Honest difficulty that rises more than a quarter within a week is credited
 late, alike on every branch that shares the window, so it never decides
 between honest branches; the cap only ever lowers a block's credit, never to
-zero. The window is rebuilt from the stored headers, like the signer window. A
-node started from a snapshot holds fewer headers below its base, which can
-only raise its floor: it loosens that node's weighting, never validity.
+zero. The window is rebuilt from the stored headers, like the signer window.
+
+Every block header names the bond that signed the block and claims the
+chain's weight with it (`BatchHeader::signer`, `chain_weight`), both under the
+proof of work. Headers-first sync checks that each claim adds the header's
+work as far as the work cap allows (the work window is in the headers too)
+or, for a signed block, the over-cap sliver of that, and compares a peer's
+chain with its own by those weights; applying the block checks the claim
+exactly, so a block that claims the wrong weight is invalid. A node therefore
+never downloads a chain that fork choice would refuse, nor ignores one it
+would take because it has less raw work. Peers' `StateInfo` reports weight as
+well as depth. Since the windows decide what the next block must claim, they
+are consensus state: a snapshot carries a week of headers (10,080), from
+which an importing node rebuilds both exactly (`docs/PRUNING.md` §4), and
+storage treats a missing signer or header in either window as corruption.
 
 A registration must lock at least `MIN_MINING_BOND`, and no further than a year
 (`MAX_BOND_HORIZON`) past the block's estimated midstate height, so a forged

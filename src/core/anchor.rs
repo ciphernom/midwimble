@@ -5,9 +5,7 @@
 use super::auxpow::{bytes32, merge_commitment, midstate_coin_id, tx_fold_item};
 use super::simd_mining::{check_pow_chains, pow_seed, PowCheck};
 use super::state::calculate_work;
-use super::types::{
-    compute_header_hash, hash_concat, hash_domain, network_anchor, BatchHeader, Extension,
-};
+use super::types::{hash_concat, hash_domain, midstate_header_hash, network_anchor, BatchHeader};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -113,20 +111,13 @@ pub fn link_key(mining_hash: &[u8; 32], link: &HeaderLink) -> [u8; 32] {
 
 /// The mining hash a Midstate header link commits its proof of work to.
 pub(crate) fn link_mining_hash(prev: [u8; 32], link: &HeaderLink) -> [u8; 32] {
-    compute_header_hash(&BatchHeader {
-        height: 0,
-        prev_midstate: [0; 32],
-        post_tx_midstate: link.post_tx_midstate,
-        extension: Extension {
-            nonce: 0,
-            final_hash: [0; 32],
-        },
-        timestamp: link.timestamp,
-        target: link.target,
-        state_root: link.state_root,
-        prev_header_hash: prev,
-        aux_pow: None,
-    })
+    midstate_header_hash(
+        &prev,
+        &link.post_tx_midstate,
+        &link.state_root,
+        link.timestamp,
+        &link.target,
+    )
 }
 
 /// Proof that a 32-byte item is folded into a Midstate block's mining hash,

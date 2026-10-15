@@ -533,6 +533,8 @@ fn apply_batch_internal(
         timestamp: batch.timestamp,
         target: batch.target,
         state_root: batch.state_root,
+        signer: batch.miner.as_ref().map(|auth| auth.bond_id),
+        chain_weight: batch.chain_weight,
         aux_pow: None,
     };
     let mining_hash = compute_header_hash(&candidate_header);
@@ -577,19 +579,59 @@ fn apply_batch_internal(
         }
     }
 
-    // 4b. Registrations against the relay as this block leaves it, then
-    //     contents: structure, balances, proofs and signatures.
+    // 4b. Registrations, against the relay as this block leaves it.
     super::bond::precheck_registrations(&base.bonds, &batch.registrations, batch.timestamp)?;
     let registered: Vec<([u8; 32], super::bond::BondEntry)> = batch
         .registrations
         .iter()
         .map(|r| Ok((r.bond_id(), r.verify(&base.relay, &batch.target)?)))
         .collect::<Result<_>>()?;
+    let mut bonds = base.bonds.clone();
+    for (id, entry) in &registered {
+        if bonds.insert(*id, *entry).is_some() {
+            bail!("bond {} is already registered", hex::encode(id));
+        }
+    }
+
+    // 5. Bonded mining. From BONDED_MINING_FROM every mined block must be
+    //     authorised by an eligible bond; before that an authorisation is
+    //     optional, but checked in full whenever a block carries one.
+    if !is_genesis && (height >= super::bond::BONDED_MINING_FROM || batch.miner.is_some()) {
+        super::bond::check_miner_authorization(&bonds, &state.mw_midstate, batch)?;
+    }
+
+    // 5a. The chain weight the header claims, which headers-first sync went
+    //     by, must be what fork choice gives the chain with this block: its
+    //     work as far as the work cap allows, less what the per-bond cap
+    //     withholds from its signer.
+    let signer = batch.miner.as_ref().map(|auth| auth.bond_id);
+    let work = calculate_work(&batch.target);
+    let mut floor = base.work_floor.clone();
+    let creditable = super::bond::cap_work(&mut floor, height, work);
+    let (mut recent, mut counts) = (base.recent_signers.clone(), base.signer_counts.clone());
+    let credited = super::bond::credit_in_window(
+        &mut recent,
+        &mut counts,
+        &bonds,
+        signer,
+        creditable,
+        batch.timestamp,
+    );
+    let weight = base.weight().saturating_add(credited);
+    if batch.chain_weight != weight {
+        bail!(
+            "block claims chain weight {}, but the chain weighs {} with it",
+            batch.chain_weight,
+            weight
+        );
+    }
+
+    // 5b. Contents: structure, balances, proofs and signatures.
     validate_block_contents(batch, height, skip_crypto)?;
 
-    // 4c. State transition and root.
+    // 6. State transition and root.
     let mut next = apply_body(&base, &batch.body, batch.coinbase.as_ref())?;
-    apply_registrations(&mut next, &registered)?;
+    next.bonds = bonds;
     next.effects = std::sync::Arc::new(BlockEffects {
         bonds_added: registered,
         bonds_removed: removed,
@@ -605,22 +647,16 @@ fn apply_batch_internal(
         );
     }
 
-    // 5. Bonded mining. From BONDED_MINING_FROM every mined block must be
-    //     authorised by an eligible bond; before that an authorisation is
-    //     optional, but checked in full whenever a block carries one.
-    if !is_genesis && (height >= super::bond::BONDED_MINING_FROM || batch.miner.is_some()) {
-        super::bond::check_miner_authorization(&next.bonds, &state.mw_midstate, batch)?;
-    }
-
-    // 6. Finalize.
+    // 7. Finalize.
     next.mw_midstate = post_tx_midstate;
     next.header_hash = batch.extension.final_hash;
     next.chain_mmr.append(&batch.extension.final_hash, true);
-    let signer = batch.miner.as_ref().map(|auth| auth.bond_id);
-    let work = calculate_work(&batch.target);
-    let credited = super::bond::credit_work(&mut next, signer, work, batch.timestamp);
+    next.recent_signers = recent;
+    next.signer_counts = counts;
+    next.work_floor = floor;
     next.depth = next.depth.saturating_add(work);
     next.capped = next.capped.saturating_add(work - credited);
+    debug_assert_eq!(next.weight(), weight);
     next.height = height + 1;
     next.timestamp = batch.timestamp;
     next.target = calculate_target(next.height, next.timestamp);

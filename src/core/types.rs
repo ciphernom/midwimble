@@ -734,6 +734,8 @@ impl State {
             target: self.target,
             state_root: self.state_root(),
             prev_header_hash: [0u8; 32],
+            signer: self.recent_signers.back().copied().flatten(),
+            chain_weight: self.weight(),
             aux_pow: None,
         }
     }
@@ -777,6 +779,11 @@ pub struct Batch {
     /// Midstate headers this block relays (`core/relay.rs`).
     #[serde(default)]
     pub relay: Option<RelayHeaders>,
+    /// The chain's fork-choice weight once this block is applied
+    /// ([`State::weight`]). Its header carries it, under the proof of work,
+    /// so headers-first sync compares chains as fork choice does.
+    #[serde(default)]
+    pub chain_weight: u128,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -789,12 +796,42 @@ pub struct BatchHeader {
     pub target: [u8; 32],
     pub state_root: [u8; 32],
     pub prev_header_hash: [u8; 32],
+    /// The bond that signed the block (`bond::MinerAuth`), if any: what the
+    /// fork-choice window counts.
+    #[serde(default)]
+    pub signer: Option<[u8; 32]>,
+    /// The chain's fork-choice weight once this block is applied
+    /// ([`State::weight`]).
+    #[serde(default)]
+    pub chain_weight: u128,
     /// Merged-mining proof (not part of the mining hash, which it proves).
     #[serde(default)]
     pub aux_pow: Option<AuxPow>,
 }
 
-/// The hash miners grind on (midstate, unchanged).
+/// Midstate's header hash, the one its miners grind on: over the previous
+/// header's hash, the post-transaction midstate, the state root, the
+/// timestamp and the target. Midstate headers (in anchor evidence, the relay
+/// and merged-mining parents) are hashed with this.
+pub fn midstate_header_hash(
+    prev_header_hash: &[u8; 32],
+    post_tx_midstate: &[u8; 32],
+    state_root: &[u8; 32],
+    timestamp: u64,
+    target: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(prev_header_hash);
+    hasher.update(post_tx_midstate);
+    hasher.update(state_root);
+    hasher.update(&timestamp.to_le_bytes());
+    hasher.update(target);
+    *hasher.finalize().as_bytes()
+}
+
+/// The hash midwimble miners grind on: midstate's header layout extended
+/// with the block's signer and the chain weight it claims, so the proof of
+/// work commits to both and a header alone says how much the chain weighs.
 pub fn compute_header_hash(header: &BatchHeader) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&header.prev_header_hash);
@@ -802,6 +839,11 @@ pub fn compute_header_hash(header: &BatchHeader) -> [u8; 32] {
     hasher.update(&header.state_root);
     hasher.update(&header.timestamp.to_le_bytes());
     hasher.update(&header.target);
+    match &header.signer {
+        None => hasher.update(&[0]),
+        Some(id) => hasher.update(&[1]).update(id),
+    };
+    hasher.update(&header.chain_weight.to_le_bytes());
     *hasher.finalize().as_bytes()
 }
 
@@ -872,6 +914,8 @@ impl Batch {
             timestamp: self.timestamp,
             target: self.target,
             state_root: self.state_root,
+            signer: self.miner.as_ref().map(|m| m.bond_id),
+            chain_weight: self.chain_weight,
             aux_pow: self.aux_pow.clone(),
         }
     }
@@ -896,6 +940,10 @@ impl Batch {
             after.height = 0;
             let state_root = after.state_root();
             let body = Transaction::empty();
+            // Genesis is unsigned, so its whole work counts.
+            let chain_weight = state
+                .weight()
+                .saturating_add(super::state::calculate_work(&state.target));
             let header = BatchHeader {
                 height: 0,
                 prev_header_hash: state.header_hash,
@@ -908,6 +956,8 @@ impl Batch {
                 timestamp: state.timestamp,
                 target: state.target,
                 state_root,
+                signer: None,
+                chain_weight,
                 aux_pow: None,
             };
             let extension = super::extension::create_extension(compute_header_hash(&header), 0);
@@ -915,6 +965,7 @@ impl Batch {
                 registrations: Vec::new(),
                 miner: None,
                 relay: None,
+                chain_weight,
                 prev_midstate: state.mw_midstate,
                 prev_header_hash: state.header_hash,
                 body,

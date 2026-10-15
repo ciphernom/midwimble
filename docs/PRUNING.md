@@ -104,20 +104,24 @@ A snapshot at checkpoint `C` (height `H`) contains:
 ```rust
 struct Snapshot {
     checkpoint: Checkpoint,
-    headers: Vec<BatchHeader>,       // the last ≤ 60 headers, ending at H-1
+    headers: Vec<BatchHeader>,       // the last ≤ max(60, CAP_WINDOW,
+                                     // WORK_CAP_WINDOW) headers (10,080 in
+                                     // production), ending at H-1
     parts: StateRootParts,           // hash to C.mw_state_root
     mmr_peaks: Vec<[u8; 32]>,        // chain MMR over blocks 0..H-2 (peaks only)
     utxos: Vec<(Point32, UtxoEntry)>,
     groups: Vec<StoredGroup>,
     kernels: Vec<Kernel>,
+    bonds: Vec<([u8; 32], BondEntry)>, // the bond set, hashing to bonds_root
+    relay: Vec<RelayEntry>,          // the midstate relay, hashing to relay_root
 }
 ```
 
 **Verification.** An importer checks each of the following:
 
 - the checkpoint id is the one it trusts;
-- the headers link, carry valid proof of work, and end at `C`'s header and
-  state root;
+- the headers link, carry valid proof of work, end at `C`'s header and
+  state root, and each claims a chain weight its block could add;
 - `parts` hash to `C`'s state root;
 - the UTXO leaves rebuild `utxo_root`;
 - every kernel signature verifies, and the kernels rebuild `kernel_root` and
@@ -130,7 +134,11 @@ struct Snapshot {
   appended.
 
 The importer then starts from that state with
-`depth = C.mw_cumulative_work`.
+`depth = C.mw_cumulative_work`, the work fork choice withheld set to `depth`
+less the chain weight `C`'s header claims, and the fork-choice windows
+rebuilt from the headers: the signers the last `CAP_WINDOW` name and the work
+of the last `WORK_CAP_WINDOW`. The next block's claimed weight depends on all
+three (`docs/BONDED_POW.md`, co-bonding and the work cap).
 
 ## 5. Sync modes
 

@@ -417,7 +417,7 @@ async fn start_forger(
                         let reply = match message {
                             Message::GetState => {
                                 let s = source.state();
-                                Message::StateInfo { height: s.height, depth: s.depth, mw_midstate: s.mw_midstate }
+                                Message::StateInfo { height: s.height, depth: s.depth, weight: s.weight(), mw_midstate: s.mw_midstate }
                             }
                             Message::GetHeaders { start_height, count } => Message::Headers {
                                 start_height,

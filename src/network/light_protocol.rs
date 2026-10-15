@@ -11,8 +11,8 @@ use libp2p::StreamProtocol;
 use serde::{Deserialize, Serialize};
 use std::io;
 
-pub const LIGHT_PROTOCOL: StreamProtocol = StreamProtocol::new("/midwimble/light/1.0.0");
-pub const LIGHT_PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/midwimble/light-push/1.0.0");
+pub const LIGHT_PROTOCOL: StreamProtocol = StreamProtocol::new("/midwimble/light/2.0.0");
+pub const LIGHT_PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/midwimble/light-push/2.0.0");
 
 const MAX_LIGHT_MSG_SIZE: usize = 2_000_000;
 

@@ -50,7 +50,7 @@
 use super::extension::{create_extension, verify_extension};
 use super::simd_mining::pow_seed;
 use super::types::{
-    compute_header_hash, hash, hash_concat, hash_domain, BatchHeader, Extension, NETWORK_MAGIC,
+    hash, hash_concat, hash_domain, midstate_header_hash, Extension, NETWORK_MAGIC,
 };
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
@@ -123,20 +123,13 @@ impl AuxPow {
         if self.state_root != [0u8; 32] {
             m = hash_concat(&m, &self.state_root);
         }
-        compute_header_hash(&BatchHeader {
-            height: 0,
-            prev_midstate: [0u8; 32],
-            post_tx_midstate: m,
-            extension: Extension {
-                nonce: 0,
-                final_hash: [0u8; 32],
-            },
-            timestamp: self.timestamp,
-            target: self.target,
-            state_root: self.state_root,
-            prev_header_hash: self.prev_header_hash,
-            aux_pow: None,
-        })
+        midstate_header_hash(
+            &self.prev_header_hash,
+            &m,
+            &self.state_root,
+            self.timestamp,
+            &self.target,
+        )
     }
 
     /// Seed of the parent's hash chain (for batched SIMD verification).
@@ -576,20 +569,7 @@ mod tests {
             &hash_concat(&m, &midstate_coin_id(&[14; 32], 32, &salt)),
             &[15; 32],
         );
-        let expected = compute_header_hash(&BatchHeader {
-            height: 0,
-            prev_midstate: [0; 32],
-            post_tx_midstate: m,
-            extension: Extension {
-                nonce: 0,
-                final_hash: [0; 32],
-            },
-            timestamp: 123,
-            target: [0xff; 32],
-            state_root: [15; 32],
-            prev_header_hash: [16; 32],
-            aux_pow: None,
-        });
+        let expected = midstate_header_hash(&[16; 32], &m, &[15; 32], 123, &[0xff; 32]);
         parent.check(&aux_hash, &expected).unwrap();
         assert!(parent.check(&[0; 32], &expected).is_err());
         // The commitment may only sit in the coinbase's last output.

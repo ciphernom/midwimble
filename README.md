@@ -39,8 +39,11 @@ recovery design.
   the lower midstate. Each bond's blocks count in full up to its share of the
   day (four blocks once 360 bonds are eligible), and no block counts for more
   than a quarter above the lowest of the week before it (`docs/BONDED_POW.md`).
+  Each header claims its chain's weight under its proof of work, so sync
+  compares chains by it too.
 - **State root:** covers the UTXO set, the kernel set, the chain MMR, the
-  running excess sum, the total offset and the supply.
+  running excess sum, the total offset, the supply, the bond set and the
+  midstate relay.
 
 ### Emission (`core/types.rs`, `docs/LAUNCH.md`)
 

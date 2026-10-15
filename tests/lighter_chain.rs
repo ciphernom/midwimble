@@ -1,6 +1,6 @@
-//! A peer offering a chain deeper than ours but lighter. We fetch and judge
-//! it once, leave it alone while it announces the same chain, and follow it
-//! as soon as it could be heavier.
+//! A peer offering a chain deeper than ours but lighter. Its announcements
+//! say what its chain weighs, so we never fetch it, however often it is
+//! announced; ours says what ours weighs, so the peer moves onto it.
 //!
 //! `cargo test --features fast-mining --test lighter_chain`
 #![cfg(feature = "fast-mining")]
@@ -133,7 +133,7 @@ async fn wait_until(what: &str, secs: u64, mut done: impl FnMut() -> bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_deeper_but_lighter_chain_is_judged_once_until_it_could_be_heavier() {
+async fn a_deeper_but_lighter_chain_is_never_fetched_and_its_holder_moves() {
     let mut both = bonds(&[b"bond a", b"bond b"]);
     let (a, b) = (both.remove(0), both.remove(0));
 
@@ -166,23 +166,30 @@ async fn a_deeper_but_lighter_chain_is_judged_once_until_it_could_be_heavier() {
     let peer = TestNode::start(&their_dir, Some(b), vec![]).await;
     let node = TestNode::start(&our_dir, None, vec![peer.dial_addr().await]).await;
 
-    // One session judges their chain. Announced again and again, it starts
-    // no other.
-    wait_until("the node to set their chain aside", 60, || node.stats().lighter_skipped >= 6)
-        .await;
-    assert_eq!(node.stats().sessions, 1, "{:?}", node.stats());
-    assert_eq!(node.tip(), ours.header_hash);
-
-    // One more full-weight block makes theirs the heavier chain, and the
-    // node follows it.
-    peer.handle.set_mining(Some(WalletKeys::random().address()));
-    wait_until("the node to follow the heavier chain", 60, || {
-        node.handle.state().weight() > ours.weight() && node.tip() != ours.header_hash
+    // The peer hears that ours weighs more and moves onto it. Their chain,
+    // announced again and again until then and for six polls after, starts
+    // no session on our node: the announcement says it weighs less.
+    wait_until("the peer to move onto our chain", 60, || {
+        peer.tip() == ours.header_hash
     })
     .await;
-    assert!(node.handle.state().depth > theirs.depth, "their chain, grown");
-    let first_of_theirs = node.handle.storage().load_batch(3).unwrap();
-    assert_eq!(first_of_theirs.as_ref(), Some(&theirs_blocks[2]));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(node.stats().sessions, 0, "{:?}", node.stats());
+    assert_eq!(node.tip(), ours.header_hash);
+
+    // The peer mines on with bond b, and the node follows on the one chain.
+    peer.handle.set_mining(Some(WalletKeys::random().address()));
+    wait_until("the node to follow the peer", 60, || {
+        node.handle.state().height > ours.height && node.tip() == peer.tip()
+    })
+    .await;
+    assert!(node.handle.state().weight() > ours.weight());
+    let third = node.handle.storage().load_batch(3).unwrap();
+    assert_eq!(
+        third.as_ref(),
+        Some(&ours_blocks[2]),
+        "theirs was never adopted"
+    );
 
     node.handle.shutdown();
     peer.handle.shutdown();
