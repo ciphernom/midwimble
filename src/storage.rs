@@ -21,6 +21,7 @@
 //! | `group_members` | commitment | `(group id, index)` of an unspent output |
 //! | `undo` | height | [`BlockUndo`] |
 //! | `bonds` | bond id | `BondEntry` of a bond that can still sign |
+//! | `relay` | midstate height | `RelayEntry` of the midstate relay's chain |
 //! | `meta` | `state_meta` / `base` / `finality` | [`StateMeta`] / [`SnapshotBase`] / [`FinalityInfo`] |
 //! | `sync_headers` | height | verified headers of an unfinished sync |
 //! | `peers` | multiaddr | empty |
@@ -35,6 +36,7 @@ use crate::core::mw::{Kernel, StoredGroup};
 use crate::core::snapshot::{mmr_from_peaks, mmr_peak_values, Snapshot, SNAPSHOT_HEADERS};
 use crate::core::state::{calculate_target, calculate_work};
 use crate::core::bond::BondSet;
+use crate::core::relay::{Relay, RelayEntry};
 use crate::core::types::{block_reward, utxo_leaf, BlockEffects, UtxoEntry};
 use crate::core::{Batch, BatchHeader, State};
 use anyhow::{anyhow, bail, Context, Result};
@@ -54,6 +56,9 @@ const UNDO: TableDefinition<u64, &[u8]> = TableDefinition::new("undo");
 /// The bond set: every registered bond that can still sign. Blocks change
 /// it by the diffs in their undo records, so it is never copied whole.
 const BONDS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("bonds");
+/// The midstate relay's window, by midstate height. Changed by the diffs in
+/// undo records, like the bond set.
+const RELAY: TableDefinition<u64, &[u8]> = TableDefinition::new("relay");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// Each block's signer (bond id; empty if unsigned). Never pruned: the
 /// fork-choice window needs signers after their bodies are gone.
@@ -224,6 +229,20 @@ fn read_bonds(table: &impl ReadableTable<&'static [u8], &'static [u8]>) -> Resul
     Ok(bonds)
 }
 
+/// The midstate relay as a table holds it. An empty table (a database from
+/// before the relay) is the relay's genesis.
+fn read_relay(table: &impl ReadableTable<u64, &'static [u8]>) -> Result<Relay> {
+    let mut entries: Vec<RelayEntry> = Vec::new();
+    for entry in table.iter()? {
+        let (_, v) = entry?;
+        entries.push(bincode::deserialize(v.value())?);
+    }
+    if entries.is_empty() {
+        return Ok(Relay::genesis());
+    }
+    Relay::from_entries(entries).context("the stored midstate relay is corrupt")
+}
+
 /// Applies a block's bond diff to an in-memory set.
 fn apply_bond_effects(bonds: &mut BondSet, effects: &BlockEffects) {
     for (id, _) in &effects.bonds_removed {
@@ -303,6 +322,7 @@ impl Storage {
             txn.open_table(CAPPED)?;
             txn.open_table(DEPTHS)?;
             txn.open_table(BONDS)?;
+            txn.open_table(RELAY)?;
         }
         txn.commit()?;
         Ok(Self { db: Arc::new(db) })
@@ -448,6 +468,7 @@ impl Storage {
             kernel_ids.insert(id);
         }
         let bonds = read_bonds(&txn.open_table(BONDS)?)?;
+        let relay = read_relay(&txn.open_table(RELAY)?)?;
 
         // Chain MMR over every block but the tip (which the tip header's
         // state root excludes), starting from the snapshot base if any.
@@ -477,6 +498,7 @@ impl Storage {
         let mut state = State {
             mw_midstate: meta.mw_midstate,
             bonds,
+            relay,
             recent_signers: Default::default(),
             signer_counts: Default::default(),
             work_floor: Default::default(),
@@ -542,6 +564,9 @@ impl Storage {
                 state.kernels.remove(k, true);
             }
             undo_bond_effects(&mut state.bonds, &undo.effects);
+            state
+                .relay
+                .revert_change(&undo.effects.relay_removed, &undo.effects.relay_added);
             let p = undo.prev;
             state.mw_midstate = p.mw_midstate;
             state.kernel_excess_sum = p.kernel_excess_sum;
@@ -653,6 +678,12 @@ impl Storage {
             let mut capped_table = txn.open_table(CAPPED)?;
             let mut depth_table = txn.open_table(DEPTHS)?;
             let mut bond_table = txn.open_table(BONDS)?;
+            let mut relay_table = txn.open_table(RELAY)?;
+            if relay_table.is_empty()? {
+                // A new database: the relay starts at its root.
+                let root = RelayEntry::root();
+                relay_table.insert(root.height, enc(&root)?.as_slice())?;
+            }
 
             let stored: Option<StateMeta> = match meta_table.get("state_meta")? {
                 Some(v) => Some(bincode::deserialize(v.value())?),
@@ -701,6 +732,12 @@ impl Storage {
                 }
                 for (id, entry) in &undo.effects.bonds_removed {
                     bond_table.insert(id.as_slice(), enc(entry)?.as_slice())?;
+                }
+                for e in &undo.effects.relay_added {
+                    relay_table.remove(e.height)?;
+                }
+                for e in &undo.effects.relay_removed {
+                    relay_table.insert(e.height, enc(e)?.as_slice())?;
                 }
                 blocks.remove(h)?;
                 headers.remove(h)?;
@@ -846,6 +883,12 @@ impl Storage {
                 for (id, entry) in &block_effects.bonds_added {
                     bond_table.insert(id.as_slice(), enc(entry)?.as_slice())?;
                 }
+                for e in &block_effects.relay_removed {
+                    relay_table.remove(e.height)?;
+                }
+                for e in &block_effects.relay_added {
+                    relay_table.insert(e.height, enc(e)?.as_slice())?;
+                }
                 let signer = batch.miner.as_ref().map(|auth| auth.bond_id);
                 let work = calculate_work(&batch.target);
                 let creditable = crate::core::bond::cap_work(&mut floor, height, work);
@@ -889,6 +932,15 @@ impl Storage {
             }
             if bonds.root() != state.bonds.root() || bond_table.len()? != state.bonds.len() as u64 {
                 bail!("commit_chain: stored bond diffs disagree with the supplied state");
+            }
+            let relay_tip = match relay_table.last()? {
+                Some((_, v)) => Some(bincode::deserialize::<RelayEntry>(v.value())?),
+                None => None,
+            };
+            if relay_tip.as_ref() != Some(state.relay.tip())
+                || relay_table.len()? != state.relay.len() as u64
+            {
+                bail!("commit_chain: stored relay diffs disagree with the supplied state");
             }
             meta_table.insert("state_meta", enc(&meta)?.as_slice())?;
 
@@ -1061,6 +1113,7 @@ impl Storage {
             groups,
             kernels,
             bonds: state.bonds.iter().map(|(id, e)| (*id, *e)).collect(),
+            relay: state.relay.entries().copied().collect(),
         })
     }
 
@@ -1101,6 +1154,10 @@ impl Storage {
             let mut bonds = txn.open_table(BONDS)?;
             for (id, entry) in state.bonds.iter() {
                 bonds.insert(id.as_slice(), enc(entry)?.as_slice())?;
+            }
+            let mut relay = txn.open_table(RELAY)?;
+            for e in state.relay.entries() {
+                relay.insert(e.height, enc(e)?.as_slice())?;
             }
             let mut meta = txn.open_table(META)?;
             meta.insert("state_meta", enc(&StateMeta::of(state))?.as_slice())?;
@@ -1241,28 +1298,51 @@ mod tests {
 
     /// A producer signing with its own devnet bond, registered in its first block.
     fn devnet_bond(seed: &[u8], target: &[u8; 32]) -> crate::core::bond::MinerBond {
-        let until = crate::core::bond::est_midstate_height(crate::core::types::GENESIS_TIMESTAMP)
-            + crate::core::bond::MAX_BOND_HORIZON / 2;
-        bond_until(seed, until, target)
+        devnet_bonds(&[seed], target).remove(0)
     }
 
-    /// [`devnet_bond`] locked until midstate height `until`.
-    fn bond_until(seed: &[u8], until: u64, target: &[u8; 32]) -> crate::core::bond::MinerBond {
+    fn genesis_lock() -> u64 {
+        crate::core::bond::est_midstate_height(crate::core::types::GENESIS_TIMESTAMP)
+            + crate::core::bond::MAX_BOND_HORIZON / 2
+    }
+
+    /// Producers whose bonds share one stand-in midstate (so the headers
+    /// their blocks relay agree), locked for a long time.
+    fn devnet_bonds(seeds: &[&[u8]], target: &[u8; 32]) -> Vec<crate::core::bond::MinerBond> {
+        let specs: Vec<(&[u8], u64)> = seeds.iter().map(|s| (*s, genesis_lock())).collect();
+        bonds_until(&specs, target)
+    }
+
+    /// [`devnet_bonds`] locked until the given midstate heights.
+    fn bonds_until(specs: &[(&[u8], u64)], target: &[u8; 32]) -> Vec<crate::core::bond::MinerBond> {
         use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
-        let secret = Scalar::from_bytes_mod_order(crate::core::types::hash(seed));
-        let mining_key = RistrettoPoint::mul_base(&secret).compress().to_bytes();
-        let registration = crate::core::bond::devnet_registration(
-            mining_key,
-            until,
-            crate::core::types::hash(seed),
-            target,
-        );
-        crate::core::bond::MinerBond {
-            secret,
-            bond_id: registration.bond_id(),
-            registration: Some(registration),
-            co_bonds: Vec::new(),
-        }
+        let secrets: Vec<Scalar> = specs
+            .iter()
+            .map(|(seed, _)| Scalar::from_bytes_mod_order(crate::core::types::hash(seed)))
+            .collect();
+        let bonds: Vec<([u8; 32], u64, [u8; 32])> = specs
+            .iter()
+            .zip(&secrets)
+            .map(|((seed, until), secret)| {
+                (
+                    RistrettoPoint::mul_base(secret).compress().to_bytes(),
+                    *until,
+                    crate::core::types::hash(seed),
+                )
+            })
+            .collect();
+        let (registrations, headers) = crate::core::bond::devnet_registrations(&bonds, target);
+        registrations
+            .into_iter()
+            .zip(secrets)
+            .map(|(registration, secret)| crate::core::bond::MinerBond {
+                secret,
+                bond_id: registration.bond_id(),
+                registration: Some(registration),
+                midstate: Some(headers.clone()),
+                co_bonds: Vec::new(),
+            })
+            .collect()
     }
 
     /// Mines a block signed by `bond` and commits it, as the node does.
@@ -1360,16 +1440,20 @@ mod tests {
         let (storage, mut state, mut ts) = fresh(dir.path());
         let to = WalletKeys::random().address();
         let t0 = crate::core::state::current_timestamp();
-        let lasting = bond_until(
-            b"lasting",
-            est_midstate_height(t0) + crate::core::bond::MAX_BOND_HORIZON / 2,
+        let mut bonds = bonds_until(
+            &[
+                (
+                    b"lasting",
+                    est_midstate_height(t0) + crate::core::bond::MAX_BOND_HORIZON / 2,
+                ),
+                (
+                    b"brief",
+                    est_midstate_height(t0 + 300) + MIN_REMAINING_BOND_LOCK,
+                ),
+            ],
             &state.target,
         );
-        let brief = bond_until(
-            b"brief",
-            est_midstate_height(t0 + 300) + MIN_REMAINING_BOND_LOCK,
-            &state.target,
-        );
+        let (lasting, brief) = (bonds.remove(0), bonds.remove(0));
         let mut at = |state: &mut State, bond: &crate::core::bond::MinerBond, t: u64| {
             let (template, _) = crate::core::template::build_template_bonded(
                 state,
@@ -1442,8 +1526,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (storage, mut state, mut ts) = fresh(dir.path());
         let to = WalletKeys::random().address();
-        let a = devnet_bond(b"bond a", &state.target);
-        let b = devnet_bond(b"bond b", &state.target);
+        let mut bonds = devnet_bonds(&[b"bond a", b"bond b"], &state.target);
+        let (a, b) = (bonds.remove(0), bonds.remove(0));
         mine_signed(&storage, &mut state, &mut ts, &to, &a);
         mine_signed(&storage, &mut state, &mut ts, &to, &b);
         let mut history = Vec::new();

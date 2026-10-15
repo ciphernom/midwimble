@@ -56,6 +56,11 @@ enum Cmd {
         /// for each. Needs --mining-bond.
         #[arg(long = "co-bond")]
         co_bonds: Vec<PathBuf>,
+        /// A midstate node's RPC (host:port). The node relays midstate's
+        /// headers in the blocks it mines, which bond registrations are
+        /// checked against: every block producer should give one.
+        #[arg(long)]
+        midstate_rpc: Option<String>,
         /// Mining threads (0 = all cores).
         #[arg(long, default_value_t = 0)]
         threads: usize,
@@ -408,7 +413,9 @@ enum BondCmd {
         until: u64,
     },
     /// Register a funded bond. The first run takes a proof against midstate's
-    /// tip; run it again once a day of midstate work is buried above it.
+    /// tip; run it again once a day of midstate work is buried above it. The
+    /// bond file then carries the proof and the midstate headers the chain's
+    /// relay needs to check it.
     Register {
         #[arg(long)]
         file: PathBuf,
@@ -425,8 +432,9 @@ enum BondCmd {
         /// Your midstate node's RPC address, e.g. 127.0.0.1:8545.
         #[arg(long)]
         midstate_rpc: String,
-        /// A midwimble node's RPC address, for its current target. Before
-        /// launch, the genesis target is used.
+        /// A midwimble node's RPC address, for its current target and the tip
+        /// of its midstate relay. Before launch, the genesis target and the
+        /// genesis's midstate anchor are used.
         #[arg(long)]
         midwimble_rpc: Option<String>,
     },
@@ -530,52 +538,115 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
                 }
             };
 
-            // 2. A day of midwimble-equivalent work buried above it, plus a margin.
-            let target = match midwimble_rpc {
-                Some(addr) => bytes32(&RpcClient::new(addr).get("/state")?["target"])?,
-                None => GENESIS_TARGET,
+            // 2. The midstate headers a block must relay for the chain to check
+            //    the proof: from the relay's tip (or the proof's header, if the
+            //    relay is past it) through a day of work above the proof, plus
+            //    a margin. Before launch the relay starts at the genesis's
+            //    midstate anchor.
+            let (target, relay_tip) = match &midwimble_rpc {
+                Some(addr) => {
+                    let mw = RpcClient::new(addr.clone());
+                    let target = bytes32(&mw.get("/state")?["target"])?;
+                    let tip = mw.get("/relay")?["tip_height"]
+                        .as_u64()
+                        .ok_or_else(|| anyhow!("the midwimble node has no relay: upgrade it"))?;
+                    (target, tip)
+                }
+                None => (
+                    GENESIS_TARGET,
+                    midwimble::core::types::MIDSTATE_BLOCK_HEIGHT,
+                ),
             };
+            if proof.midstate_height <= midwimble::core::types::MIDSTATE_BLOCK_HEIGHT {
+                anyhow::bail!(
+                    "the proof (midstate height {}) is not above the chain's midstate anchor ({}): \
+                     delete the proof from {} and run this again",
+                    proof.midstate_height,
+                    midwimble::core::types::MIDSTATE_BLOCK_HEIGHT,
+                    file.display()
+                );
+            }
+            let start = (relay_tip + 1).min(proof.midstate_height);
             let required = registration_work(&target);
             let goal = required + required / 4;
-            let cap = (required / REGISTRATION_MIN_HEADERS).max(1);
-            let (mut links, mut first_prev, mut next) = (Vec::new(), None, proof.midstate_height);
-            let (mut credited, mut enough) = (0u128, false);
+            let mut run: Option<midwimble::core::relay::MidstateHeaders> = None;
+            let mut credited = 0u128;
+            let cap = registration_cap(&target);
+            let max = midwimble::core::relay::MAX_RELAY_HEADERS_PER_BLOCK;
             'fetch: loop {
+                let next = run
+                    .as_ref()
+                    .map_or(start, |r| r.start + r.headers.len() as u64);
                 let v = midstate.get(&format!("/headers/{next}/2000"))?;
                 let headers = v["headers"].as_array().cloned().unwrap_or_default();
                 for h in &headers {
                     let (link, prev) = header_link_from_json(h)?;
-                    if first_prev.is_none() {
-                        first_prev = Some(prev);
-                    } else {
+                    let r = run.get_or_insert_with(|| midwimble::core::relay::MidstateHeaders {
+                        start,
+                        prev,
+                        headers: Vec::new(),
+                    });
+                    if r.headers
+                        .last()
+                        .map_or(prev != r.prev, |l| l.final_hash != prev)
+                    {
+                        anyhow::bail!(
+                            "midstate's headers do not link at height {}",
+                            r.start + r.headers.len() as u64
+                        );
+                    }
+                    let height = r.start + r.headers.len() as u64;
+                    if height > proof.midstate_height {
                         credited = credited.saturating_add(calculate_work(&link.target).min(cap));
                     }
-                    links.push(link);
-                    if credited >= goal {
-                        enough = true;
+                    r.headers.push(link);
+                    if credited >= goal || r.headers.len() >= max {
                         break 'fetch;
                     }
                 }
-                if headers.len() < 2000 || links.len() >= REGISTRATION_MAX_HEADERS {
+                if headers.len() < 2000 {
                     break;
                 }
-                next += headers.len() as u64;
             }
-            out!("midstate work above the proof: {}% of what registration needs (with a 25% margin)", credited * 100 / goal.max(1));
-            if !enough {
-                out!("Not buried deep enough yet: run this again later, at most a day from the proof.");
-                return Ok(());
-            }
-            let registration = BondRegistration {
-                proof,
-                prev_header_hash: first_prev.expect("headers were fetched"),
-                headers: links,
-            };
-            let bond = registration.verify(&target)?;
-            out!("✓ {} midstate headers link up and every proof of work checks", registration.headers.len());
-            out!("✓ registration valid at midwimble's current target: bond {}", hex::encode(bond.id));
+            let run =
+                run.ok_or_else(|| anyhow!("midstate returned no headers from height {start}"))?;
+            out!(
+                "midstate work above the proof: {}% of what registration needs (with a 25% margin)",
+                credited * 100 / goal.max(1)
+            );
+            let registration = BondRegistration { proof };
+            registration.check_carried(&run, &target)?;
+            out!(
+                "✓ {} midstate headers from height {} link up and every proof of work checks",
+                run.headers.len(),
+                run.start
+            );
+            out!(
+                "✓ the proof rebuilds its header's state root: bond {}",
+                hex::encode(registration.bond_id())
+            );
+            let full = run.headers.len() >= max;
             f.registration = Some(registration);
+            f.midstate_headers = Some(run);
             write(&file, &f)?;
+            if credited < goal {
+                if credited < required {
+                    if full {
+                        out!(
+                            "One block relays at most {max} midstate headers, and the chain's relay is \
+                             further behind this proof than that. Start a node with --midstate-rpc so \
+                             the relay catches up, then run this again with --midwimble-rpc."
+                        );
+                    } else {
+                        out!(
+                            "Not buried deep enough yet: run this again later (within a day of the proof), \
+                             or let a node relaying midstate (--midstate-rpc) bury it, then mine."
+                        );
+                    }
+                    return Ok(());
+                }
+                out!("Buried, but with less than the 25% margin: if midwimble's difficulty rises, run this again.");
+            }
             out!("Ready: midwimble node --mining-bond {} --mine-to <address>", file.display());
         }
     }
@@ -708,6 +779,7 @@ fn run(cli: Cli) -> Result<()> {
             peers,
             rpc,
             mine_to, mining_bond, co_bonds,
+            midstate_rpc,
             threads,
             amino,
             public_address,
@@ -736,9 +808,22 @@ fn run(cli: Cli) -> Result<()> {
             let mut config = NodeConfig::new(data_dir, listen.parse()?);
             config.bootstrap = peers.iter().map(|p| p.parse()).collect::<Result<_, _>>()?;
             config.mine_to = mine_to.as_deref().map(StealthAddress::decode).transpose()?;
+            // A bad registration or headers would make this node's blocks
+            // invalid: check what each bond file carries now, once.
+            let check = |path: &PathBuf,
+                         r: Option<&midwimble::core::bond::BondRegistration>,
+                         carried: Option<&midwimble::core::relay::MidstateHeaders>|
+             -> Result<()> {
+                if let (Some(r), Some(carried)) = (r, carried) {
+                    r.check_carried(carried, &midwimble::core::types::GENESIS_TARGET)
+                        .map_err(|e| anyhow::anyhow!("{}: {e:#}", path.display()))?;
+                }
+                Ok(())
+            };
             if let Some(path) = &mining_bond {
                 let file: midwimble::core::bond::BondFile = serde_json::from_slice(&std::fs::read(path)?)?;
                 let mut bond = file.miner_bond()?;
+                check(path, bond.registration.as_ref(), bond.midstate.as_ref())?;
                 tracing::info!("Mining as bond {}", hex::encode(bond.bond_id));
                 for path in &co_bonds {
                     let co: midwimble::core::bond::BondFile =
@@ -747,12 +832,7 @@ fn run(cli: Cli) -> Result<()> {
                         anyhow::bail!("{} names a different mining key than --mining-bond", path.display());
                     }
                     let entry = co.co_bond_entry()?;
-                    // A bad registration would make this node's blocks invalid:
-                    // check every header's work now, once, rather than lose a block.
-                    if let Some(r) = &entry.registration {
-                        r.verify(&midwimble::core::types::GENESIS_TARGET)
-                            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-                    }
+                    check(path, entry.registration.as_ref(), entry.midstate.as_ref())?;
                     tracing::info!("Co-bond {}", hex::encode(entry.bond_id));
                     bond.co_bonds.push(entry);
                 }
@@ -764,6 +844,13 @@ fn run(cli: Cli) -> Result<()> {
             {
                 anyhow::bail!("mining requires a registered bond: pass --mining-bond (see `midwimble bond`)");
             }
+            if config.mining_bond.is_some() && midstate_rpc.is_none() {
+                tracing::warn!(
+                    "no --midstate-rpc: this node will not relay midstate's headers, and bonds \
+                     can only be registered while the relay holds their headers"
+                );
+            }
+            config.midstate_rpc = midstate_rpc;
             config.mining_threads = threads;
             config.amino = amino;
             config.public_address = public_address.map(|a| a.parse()).transpose()?;

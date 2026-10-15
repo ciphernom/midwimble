@@ -298,6 +298,7 @@ fn broken_binding_cannot_inflate_a_claim() {
         total_kernel_offset: [0; 32],
         supply: 1_000_000_000,
         bonds_root: midwimble::core::bond::BondSet::default().root(),
+        relay_root: midwimble::core::relay::Relay::genesis().commitment(),
     };
     let checkpoint = Checkpoint {
         version: 1,

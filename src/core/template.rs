@@ -10,6 +10,7 @@ use super::bond::{
     authorization_message, check_miner_authorization, BondRegistration, MinerAuth, MinerBond,
     BONDED_MINING_FROM,
 };
+use super::relay::{relay_min_work, MidstateHeaders, RelayFeed, RelayHeaders, RELAY_WEIGHT_PER_HEADER};
 use super::extension::create_extension;
 use super::mw::{build_coinbase_with, PayoutReceipt, StealthAddress, Transaction};
 use super::state::{apply_body, current_timestamp, min_next_timestamp, validate_block_contents};
@@ -93,6 +94,59 @@ pub fn rebind(
         height: template.height,
         fees: template.fees,
     })
+}
+
+/// Block weight kept free for a registration when choosing what to relay.
+const REGISTRATION_ROOM: u64 = 256;
+
+/// The midstate headers a block on `state` should relay, in at most `room`
+/// headers: what the producer's feed, or else its bonds' own headers, have
+/// that extends the chain's relay and the relay would accept.
+fn choose_relay(
+    state: &State,
+    feed: Option<&RelayFeed>,
+    bond: Option<&MinerBond>,
+    room: usize,
+) -> Option<RelayHeaders> {
+    let accepts = |run: &RelayHeaders| {
+        state
+            .relay
+            .clone()
+            .extend(run, relay_min_work(&state.target))
+            .is_ok()
+    };
+    let trimmed = |mut run: RelayHeaders| {
+        run.headers.truncate(room);
+        (!run.headers.is_empty()).then_some(run)
+    };
+    if let Some(run) = feed
+        .and_then(|f| f.next_for(&state.relay))
+        .and_then(trimmed)
+    {
+        if accepts(&run) {
+            return Some(run);
+        }
+    }
+    // The bonds' own headers, for registrations the relay cannot back yet.
+    let carried: Vec<&MidstateHeaders> = bond
+        .into_iter()
+        .flat_map(|b| {
+            std::iter::once((b.bond_id, b.midstate.as_ref()))
+                .chain(b.co_bonds.iter().map(|c| (c.bond_id, c.midstate.as_ref())))
+        })
+        .filter(|(id, _)| !state.bonds.contains_key(id))
+        .filter_map(|(_, headers)| headers)
+        .collect();
+    for headers in carried {
+        let mut own = RelayFeed::default();
+        own.add(headers, true);
+        if let Some(run) = own.next_for(&state.relay).and_then(trimmed) {
+            if accepts(&run) {
+                return Some(run);
+            }
+        }
+    }
+    None
 }
 
 /// Picks transactions greedily by fee per weight until the block is full,
@@ -220,6 +274,33 @@ pub fn build_template_bonded(
     timestamp: Option<u64>,
     bond: Option<&MinerBond>,
 ) -> Result<(BlockTemplate, Vec<(StealthAddress, PayoutReceipt)>)> {
+    build_template_relayed(
+        state,
+        previous_timestamps,
+        txs,
+        payouts,
+        extra,
+        timestamp,
+        bond,
+        None,
+    )
+}
+
+/// [`build_template_bonded`] that also relays midstate headers from `feed`
+/// (a producer's midstate node) where the chain's relay lacks them. Headers
+/// the bond and its co-bonds carry for their own registrations are relayed
+/// too when needed.
+#[allow(clippy::too_many_arguments)]
+pub fn build_template_relayed(
+    state: &State,
+    previous_timestamps: &[u64],
+    txs: &[Transaction],
+    payouts: &[(StealthAddress, u64)],
+    extra: [u8; 32],
+    timestamp: Option<u64>,
+    bond: Option<&MinerBond>,
+    feed: Option<&RelayFeed>,
+) -> Result<(BlockTemplate, Vec<(StealthAddress, PayoutReceipt)>)> {
     let height = state.height;
     if height == 0 {
         bail!("genesis is not mined");
@@ -246,54 +327,7 @@ pub fn build_template_bonded(
         .bonds
         .prune_expired(min_next_timestamp(previous_timestamps));
     let state = &pruned;
-    let mut registrations: Vec<BondRegistration> = match bond {
-        Some(b) if !state.bonds.contains_key(&b.bond_id) => match &b.registration {
-            Some(registration) => {
-                // The full check (every header's proof of work) runs when the
-                // block is applied. This cheap one catches the likely mistake
-                // first: a registration assembled against an easier target
-                // than the chain's, such as a pre-launch build's placeholder.
-                let above = registration.headers.get(1..).unwrap_or(&[]);
-                if crate::core::bond::credited_work(above, &state.target)
-                    < crate::core::bond::registration_work(&state.target)
-                {
-                    bail!(
-                        "the bond's registration no longer carries a day of work at this chain's \
-                         target; re-run `midwimble bond register` with --midwimble-rpc"
-                    );
-                }
-                vec![registration.clone()]
-            }
-            None => bail!("the mining bond is not registered on this chain and no registration is configured"),
-        },
-        _ => Vec::new(),
-    };
-    // Co-bonds' registrations ride along too, one a block, once the
-    // producer's own bond is on chain. One the chain would refuse is skipped
-    // rather than allowed to stop this producer mining.
-    if registrations.is_empty() {
-        if let Some(b) = bond {
-            let pending = b
-                .co_bonds
-                .iter()
-                .filter(|c| !state.bonds.contains_key(&c.bond_id))
-                .filter_map(|c| c.registration.as_ref())
-                .find(|r| {
-                    let above = r.headers.get(1..).unwrap_or(&[]);
-                    crate::core::bond::precheck_registrations(
-                        &state.bonds,
-                        std::slice::from_ref(*r),
-                        timestamp,
-                    )
-                    .is_ok()
-                        && crate::core::bond::credited_work(above, &state.target)
-                            >= crate::core::bond::registration_work(&state.target)
-                });
-            if let Some(r) = pending {
-                registrations.push(r.clone());
-            }
-        }
-    }
+
     let body = Transaction::aggregate(txs)?;
     let fees = body.fee()?;
     let amount = block_reward(height)
@@ -311,9 +345,90 @@ pub fn build_template_bonded(
         (Some(cb), receipts)
     };
 
-    crate::core::bond::precheck_registrations(&state.bonds, &registrations, timestamp)?;
-    let mut next = apply_body(state, &body, coinbase.as_ref())?;
-    super::state::apply_registrations(&mut next, &registrations)?;
+    // Midstate headers to relay: whatever the producer's feed and its bonds'
+    // own headers have that extends the chain's relay, in the room the block
+    // has left (a registration may still need some).
+    let used = body.weight()
+        + coinbase
+            .as_ref()
+            .map_or(0, crate::core::mw::Coinbase::weight)
+        + REGISTRATION_ROOM;
+    let room = (MAX_BLOCK_WEIGHT.saturating_sub(used) / RELAY_WEIGHT_PER_HEADER) as usize;
+    let relay = choose_relay(state, feed, bond, room);
+    let mut relayed = state.clone();
+    if let Some(r) = &relay {
+        let change = relayed
+            .relay
+            .extend(r, relay_min_work(&state.target))
+            .expect("choose_relay only proposes runs the relay accepts");
+        if let Some(fork) = change.fork_from {
+            relayed.bonds.revoke_above(fork);
+        }
+    }
+    let state_after_relay = &relayed;
+
+    // The producer's own registration, until the chain has it: it must verify
+    // against the relay as this block leaves it.
+    let mut registrations: Vec<BondRegistration> = match bond {
+        Some(b) if !state_after_relay.bonds.contains_key(&b.bond_id) => match &b.registration {
+            Some(registration) => {
+                crate::core::bond::precheck_registrations(
+                    &state_after_relay.bonds,
+                    std::slice::from_ref(registration),
+                    timestamp,
+                )?;
+                registration
+                    .verify(&state_after_relay.relay, &state.target)
+                    .map_err(|e| {
+                        anyhow!(
+                            "the mining bond's registration does not verify yet ({e:#}): the \
+                             relay must hold its midstate header under a day of work. Run the \
+                             node with --midstate-rpc, or re-run `midwimble bond register` so the \
+                             bond file carries the headers"
+                        )
+                    })?;
+                vec![registration.clone()]
+            }
+            None => bail!("the mining bond is not registered on this chain and no registration is configured"),
+        },
+        _ => Vec::new(),
+    };
+    // Co-bonds' registrations ride along too, one a block, once the
+    // producer's own bond is on chain. One the chain would refuse is skipped
+    // rather than allowed to stop this producer mining.
+    if registrations.is_empty() {
+        if let Some(b) = bond {
+            let pending = b
+                .co_bonds
+                .iter()
+                .filter(|c| !state_after_relay.bonds.contains_key(&c.bond_id))
+                .filter_map(|c| c.registration.as_ref())
+                .find(|r| {
+                    crate::core::bond::precheck_registrations(
+                        &state_after_relay.bonds,
+                        std::slice::from_ref(*r),
+                        timestamp,
+                    )
+                    .is_ok()
+                        && r.verify(&state_after_relay.relay, &state.target).is_ok()
+                });
+            if let Some(r) = pending {
+                registrations.push(r.clone());
+            }
+        }
+    }
+    let registered: Vec<([u8; 32], crate::core::bond::BondEntry)> = registrations
+        .iter()
+        .map(|r| {
+            Ok((
+                r.bond_id(),
+                r.verify(&state_after_relay.relay, &state.target)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+
+    let mut next = apply_body(state_after_relay, &body, coinbase.as_ref())?;
+    super::state::apply_registrations(&mut next, &registered)?;
     let state_root = next.state_root();
 
     let mut batch = Batch {
@@ -323,6 +438,7 @@ pub fn build_template_bonded(
         coinbase,
         registrations,
         miner: None,
+        relay,
         extension: Extension {
             nonce: 0,
             final_hash: [0u8; 32],

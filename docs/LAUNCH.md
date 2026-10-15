@@ -147,7 +147,7 @@ start from, so the cap does not depend on trusting whoever served it.
 | Bonded mining | from block 1 | minimum bond 128 gMDS (2^37 units), a launch parameter |
 | Bond eligibility | more than 30 days of lock left | judged on midwimble's clock, 7-day margin |
 | Fork choice | 4 full-weight blocks a bond a day; no block counts above 1.25× the week's lowest | weight, never validity |
-| Registration | a day of work above the proof | no header counts for more than 1/60 |
+| Registration | a day of relayed midstate work above the proof's header | the header must be on the relay's chain (revoked if a heavier branch replaces it); no header counts for more than 1/60 |
 | Anchor evidence | 1,000 midstate confirmations, 2^19 a header | about an hour of midstate's network to forge |
 | Finality | 100 blocks after an anchored checkpoint | fixed for everyone |
 | Anchoring | roughly every 10,000 blocks | archival nodes, pruning off |

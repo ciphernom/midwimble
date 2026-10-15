@@ -35,16 +35,16 @@ further out.
 
 **No epochs and no snapshots.** Nothing can spend a bond before
 `bonded_until`, so a bond coin that existed at midstate height P still exists
-at every height in `[P, bonded_until)`. One proof, against one buried header,
-covers the bond's whole life. This is fortunate twice over. A midstate node
+at every height in `[P, bonded_until)`. One proof, against one buried header
+on the relay's chain, covers the bond's whole life. This is fortunate twice over. A midstate node
 keeps only its current UTXO tree, so the per-epoch proofs against past
 snapshot headers that the draft required could not have been produced at all.
 And with no snapshots there is nothing for midwimble nodes to agree on per
 epoch, so the draft's hardest problem disappears.
 
 **Midstate outages cannot stop mining.** Eligibility is judged against
-midwimble's own clock (below), so an unresponsive midstate network pauses only
-*new* registrations. Existing bonds keep mining.
+midwimble's own clock (below), so an unresponsive midstate network, or a relay
+nobody feeds, pauses only *new* registrations. Existing bonds keep mining.
 
 ## The bond
 
@@ -74,22 +74,58 @@ which is unique per coin, so one bond cannot be counted twice.
 
 ## Registering a bond (once)
 
-A registration is an item in a midwimble block carrying:
+A registration is an item in a midwimble block carrying the `BondProof`: the
+coin (script, value, salt), the SMT inclusion proof, and the four roots its
+midstate header commits to (see below). The header itself is not in the
+registration. It must be on the **midstate relay**'s chain (below), buried
+under a day of work.
 
-1. The `BondProof`: the coin (script, value, salt), the SMT inclusion proof, and
-   the four roots its midstate header commits to (see below).
-2. The proof's header `P` and the midstate headers built on it, checked for
-   linkage and proof of work by the same code that checks anchors
-   (`core/anchor.rs`). They must carry a day of work (see below).
-
-It adds `bond_id → (mining key, bonded_until, value)` to a bond set committed
-in midwimble's state root, and pays the ordinary fee by weight: about 8 KB of
-SMT proof plus the header run. A registration must be eligible at its own
-block's time. Once a bond can no longer sign, it leaves the set (see "The bond
-set" below).
+It adds `bond_id → (mining key, bonded_until, value, the header it was proven
+against)` to a bond set committed in midwimble's state root, and pays the
+ordinary fee by weight: about 8 KB of SMT proof. A registration must be
+eligible at its own block's time. Once a bond can no longer sign, it leaves the
+set (see "The bond set" below), and if a heavier midstate branch replaces its
+header, it is revoked.
 
 A block may carry the registration for its own miner's bond, which is how the
-first block after launch gets mined.
+first block after launch gets mined. The same block relays the midstate
+headers the registration needs.
+
+### The midstate relay
+
+Proof of work on a bond's header is not enough on its own: anyone can mine a
+private midstate fork whose state holds coins that were never locked, and one
+such fork, buried once, could back any number of bonds. So midwimble consensus
+keeps its own view of midstate's chain (`core/relay.rs`), fed by the blocks
+producers mine:
+
+- **Relaying.** A block may carry a run of midstate headers (at most a day's,
+  1,440) that extends the relay's tip, or that forks from a header in its
+  window and outweighs everything it replaces. Each must claim at least a
+  sixteenth of the relaying block's work (real midstate headers carry more
+  than a whole midwimble block's, since midwimble's target is easier by its
+  merged-mining share) and have valid proof of work. Linkage and claimed work
+  are checked first; the proofs of work with the block's other proofs, the
+  first alone and the rest in parallel batches.
+- **The chain.** The relay keeps the heaviest chain relayed so far, starting
+  from the midstate block the genesis commits to (`MIDSTATE_BLOCK_*`), and the
+  last two days of it (`RELAY_WINDOW`). Nothing older can be forked from or
+  proven against. Each entry carries a digest chained through every entry
+  before it, and the state root commits to the tip's.
+- **Registrations** must be proven against a header on the relay's chain,
+  buried by headers relayed above it (see "How much work a registration
+  needs"). Checking one costs an SMT proof and a sum: no extensions.
+- **Revocation.** When a heavier branch replaces relay headers, every bond
+  proven against one of them leaves the bond set: its coin is no longer known
+  to exist.
+
+Keeping a fake bond therefore means keeping a fake midstate branch heavier
+than the real one as producers relay it, which takes more than midstate's
+whole hashrate for as long as the bond is to last. That needs producers to
+relay: a node started with `--midstate-rpc` polls its midstate node and
+relays new headers in every block it mines. A bond file can also carry the
+headers its own registration needs (`midwimble bond register` writes them),
+so a producer without a midstate node can still register.
 
 ### What the proof must match
 
@@ -181,21 +217,24 @@ deterministic from midwimble's chain alone.
 | `CLOCK_MARGIN` | 10,080 blocks (7 days) | Covers midstate running ahead of its schedule. |
 | `REGISTRATION_WORK_BLOCKS` | 1,440 | A day, in blocks of the registering block's target. |
 | `REGISTRATION_MIN_HEADERS` | 60 | Caps any one header at 1/60 of the requirement. |
-| `REGISTRATION_MAX_HEADERS` | 4,000 | Bounds size (144 bytes a header) and verification cost. |
+| `MAX_RELAY_HEADERS_PER_BLOCK` | 1,440 | A day of midstate headers: enough to catch up, or to relay a launch's first bond with its burial. Bounds what a block can make every node verify. |
+| `RELAY_WINDOW` | 2,880 | Two days of midstate headers kept: registrations and forks must be this recent. |
+| `RELAY_MIN_WORK_DIVISOR` | 16 | A relayed header claims at least 1/16 of a midwimble block's work. |
 | `CAP_WINDOW`, `CAP_K` | 1,440 blocks, 360 | Four full-weight blocks a bond a day (the per-bond cap, below). |
 | `WORK_CAP_WINDOW` | 10,080 blocks (7 days) | No block counts for more than a quarter above the lowest of the week before it (the work cap, below). |
 
 ## How much work a registration needs
 
-A registration's midstate headers are checked for proof of work, not for being
-on midstate's canonical chain. Someone could create a bond coin on a *private*
-midstate fork, bury it, register it, and never lock real capital. The defence is
-to make that burial cost more than a bond is worth. The rule, implemented in
-`BondRegistration::verify`:
+A registration's header must be on the relay's chain, and the relay follows
+the heaviest midstate chain producers relay; a bond on a branch that loses is
+revoked. The burial covers the time in between: to register a bond on a
+private fork, someone must first make that fork the relay's chain (outweigh
+what honest producers relay) and keep it so under a full burial. The rule,
+implemented in `BondRegistration::verify`:
 
 ```text
 required = 1440 × work(target of the registering midwimble block)
-credited = Σ over the headers above P of min(work(header's target), required / 60)
+credited = Σ over the relay's headers above P of min(work(header's target), required / 60)
 registration is valid only if credited ≥ required
 ```
 
@@ -212,18 +251,15 @@ Three details matter:
 - **No header counts for more than 1/60 of the day.** A registration therefore
   needs at least 60 headers' worth of real work, and one improbably lucky hash
   on a very hard target cannot stand in for it.
-- **Cheap checks come first.** The work sum and the bond proof are checked
-  before any header's proof of work, and each of those costs a full extension
-  (one mining attempt). Forcing that cost onto a node costs the sender real
-  hashing.
+- **Nothing is hashed twice.** The relay checked each header's proof of work
+  once, when it was relayed. A registration costs an SMT proof and a sum, so
+  registrations cannot be used to make every node redo the same work.
 
 Strictly, this is a day of the *merged* share of midstate's hashrate rather than
-of midstate's whole network. An honest run is correspondingly about
-`1440 × share` headers. At a 50% share that is roughly 720 headers, 104 KB and
-720 extensions to verify. Midstate reports about 100 attempts a second on a
-Raspberry Pi 5, so that is around seven seconds on a Pi, once per bond. To
-demand a full midstate day instead, scale `REGISTRATION_WORK_BLOCKS` by
-`1 / share`.
+of midstate's whole network. An honest burial is correspondingly about
+`1440 × share` midstate headers: at a 50% share, roughly 720 headers, which the
+relay holds anyway. To demand a full midstate day instead, scale
+`REGISTRATION_WORK_BLOCKS` by `1 / share`.
 
 ## Privacy
 
@@ -240,7 +276,10 @@ enumerable. The wallet tooling should make the private path the default:
 Bonded mining is required from block 1. Genesis is fixed data that nobody
 mines, and block 1's producer registers its own bond in block 1 itself. The
 genesis also commits to a midstate block (`MIDSTATE_BLOCK_*`), pinning the
-midstate chain the launch was made against. Only MDS holders can mine at first,
+midstate chain the launch was made against: it is the relay's root. Block 1
+relays midstate's headers from there through the first bond's burial, so that
+bond's proof must be taken above the anchor, and the burial must fit in one
+block's relay (1,440 headers). Only MDS holders can mine at first,
 so the 30-day slow start doubles as the window to acquire MDS and register, and
 the launch script's default `--merge-share` is 0.25.
 
@@ -267,10 +306,16 @@ midwimble bond register --file bond.json --owner-pk <key> --until <height> \
 #   first run: takes the proof against midstate's tip and checks it
 #   (four roots rebuild the header's state root; the SMT proof verifies)
 #   later run: once a day of work is buried above it (plus a 25% margin),
-#   fetches the headers, verifies every link and proof of work, and writes
-#   the finished registration into bond.json
+#   fetches midstate's headers from the relay's tip (asked of the midwimble
+#   node; before launch, the genesis's anchor) through the burial, verifies
+#   every link and proof of work, and writes the registration and the
+#   headers into bond.json
 
-midwimble node --mining-bond bond.json --mine-to <payout address>
+midwimble node --mining-bond bond.json --mine-to <payout address> \
+    --midstate-rpc 127.0.0.1:8545
+#   --midstate-rpc: relay midstate's headers in the blocks this node mines.
+#   Every producer should: registrations, its own included, need them.
+#   `GET /relay` on the node's RPC shows the relay and what it would relay.
 
 # Once midstate reaches the lock height, spend the bond back to yourself:
 midstate wallet spend-script --coin <bond coin id> --bytecode <script from `bond address`> \
@@ -286,8 +331,10 @@ behind.
 The node signs every template it builds, including those served by
 `/mining/template`. The pool and the merge miner take their templates from
 the node, so they need nothing extra: run them against a node started with
-`--mining-bond`. Until the bond is on chain, the node reserves room in its
-blocks for the registration and carries it in the first block it mines.
+`--mining-bond` (and `--midstate-rpc`). Until the bond is on chain, the node
+reserves room in its blocks for the registration and carries it in the first
+block it mines whose relay holds its header under a day of work, relaying the
+headers the bond file carries if nothing else has.
 
 ## Co-bonding and the per-bond cap
 
@@ -382,9 +429,10 @@ Unbonding is the same `spend-script` as for any bond, with your own key.
 midwimble node --mining-bond bond.json --co-bond alice.json --co-bond bob.json ...
 ```
 
-The node checks every co-bond registration's work at startup, carries the
-registrations in its blocks one a block, and signs each block with whichever
-bond, its own or a co-bond, has the most quota left.
+The node checks every co-bond file's proof against the midstate headers it
+carries at startup, carries the registrations in its blocks one a block (each
+once the relay buries its header), and signs each block with whichever bond,
+its own or a co-bond, has the most quota left.
 
 ## Still to build
 

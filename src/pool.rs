@@ -228,9 +228,9 @@ impl ShareRecord {
 
 /// What anyone needs to recompute the mining hash of any miner's copy of a
 /// job: the header fields the hash covers, the running midstate after the
-/// block's body, the coinbase (whose `extra` each copy replaces), the hash of
-/// the block's bond registrations, and the two window roots each copy's
-/// `extra` commits to.
+/// block's body, the coinbase (whose `extra` each copy replaces), the hashes
+/// of the block's bond registrations and relayed midstate headers, and the
+/// two window roots each copy's `extra` commits to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobProof {
     pub prev_header_hash: [u8; 32],
@@ -240,6 +240,8 @@ pub struct JobProof {
     pub body_midstate: [u8; 32],
     pub coinbase: Coinbase,
     pub registrations: Option<[u8; 32]>,
+    #[serde(default)]
+    pub relay: Option<[u8; 32]>,
     pub paying_root: [u8; 32],
     pub next_root: [u8; 32],
 }
@@ -257,6 +259,7 @@ impl JobProof {
             coinbase: batch.coinbase.clone()?,
             registrations: (!batch.registrations.is_empty())
                 .then(|| registrations_hash(&batch.registrations)),
+            relay: batch.relay.as_ref().map(|r| r.hash()),
             paying_root,
             next_root,
         })
@@ -271,6 +274,9 @@ impl JobProof {
         midstate = hash_concat(&midstate, &self.state_root);
         if let Some(registrations) = &self.registrations {
             midstate = hash_concat(&midstate, registrations);
+        }
+        if let Some(relay) = &self.relay {
+            midstate = hash_concat(&midstate, relay);
         }
         if let Some(auth) = auth {
             midstate = hash_concat(&midstate, auth);
@@ -4270,7 +4276,7 @@ mod tests {
             .compress()
             .to_bytes();
         let now = crate::core::state::current_timestamp();
-        let registration = devnet_registration(
+        let (registration, headers) = devnet_registration(
             key,
             est_midstate_height(now) + MAX_BOND_HORIZON / 2,
             [9; 32],
@@ -4281,6 +4287,7 @@ mod tests {
             secret,
             bond_id: registration.bond_id(),
             registration: Some(registration),
+            midstate: Some(headers),
         };
         let me = WalletKeys::random().address();
         let (base, _) = crate::core::template::build_template_bonded(
@@ -4294,6 +4301,10 @@ mod tests {
         )
         .unwrap();
         assert!(!base.batch.registrations.is_empty());
+        assert!(
+            base.batch.relay.is_some(),
+            "and relays the bond's midstate headers"
+        );
         proof_matches_the_nodes_copies(&base, Some(&registering));
     }
 
@@ -4317,6 +4328,7 @@ mod tests {
             secret: curve25519_dalek::scalar::Scalar::from_bytes_mod_order(hash(b"pool audit")),
             bond_id: hash(b"pool audit bond"),
             registration: None,
+            midstate: None,
         };
         let now = crate::core::state::current_timestamp();
         state.bonds.insert(
@@ -4325,6 +4337,8 @@ mod tests {
                 mining_key: bond.mining_key(),
                 value: MIN_MINING_BOND,
                 bonded_until: est_midstate_height(now) + MIN_REMAINING_BOND_LOCK + 1_440,
+                proven_height: 0,
+                proven_hash: [0; 32],
             },
         );
         (state, vec![Batch::genesis().timestamp], bond)

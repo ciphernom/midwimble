@@ -393,9 +393,13 @@ pub async fn block(
                 "value": r.proof.coin.value,
                 "bonded_until": r.proof.coin.script.bonded_until,
                 "midstate_height": r.proof.midstate_height,
-                "headers": r.headers.len(),
             }))
             .collect::<Vec<_>>());
+        v["relayed"] = json!(b.relay.as_ref().map(|r| json!({
+            "prev": hex::encode(r.prev),
+            "headers": r.headers.len(),
+            "last": r.headers.last().map(|h| hex::encode(h.final_hash)),
+        })));
         Ok(Json(v))
     })
     .await

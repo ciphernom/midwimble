@@ -257,8 +257,8 @@ pub fn validate_block_contents(batch: &Batch, height: u64, skip_crypto: bool) ->
     let body = &batch.body;
     body.validate_structure(Context::Block)?;
 
-    // Bond registrations: at most one a block, each proving a day of midstate
-    // work above its bond, measured against this block's own target.
+    // Bond registrations: at most one a block. Each is checked against the
+    // midstate relay when the block is applied (`apply_batch`).
     if batch.registrations.len() > super::bond::MAX_REGISTRATIONS_PER_BLOCK {
         bail!(
             "block carries {} bond registrations; at most {} are allowed",
@@ -266,9 +266,20 @@ pub fn validate_block_contents(batch: &Batch, height: u64, skip_crypto: bool) ->
             super::bond::MAX_REGISTRATIONS_PER_BLOCK
         );
     }
-    if !skip_crypto {
-        for registration in &batch.registrations {
-            registration.verify(&batch.target)?;
+    // Relayed midstate headers: their linkage and claimed work are checked
+    // against the relay when the block is applied; here, every proof of work.
+    if let Some(relayed) = &batch.relay {
+        if relayed.headers.is_empty()
+            || relayed.headers.len() > super::relay::MAX_RELAY_HEADERS_PER_BLOCK
+        {
+            bail!(
+                "a block relays 1..={} midstate headers, not {}",
+                super::relay::MAX_RELAY_HEADERS_PER_BLOCK,
+                relayed.headers.len()
+            );
+        }
+        if !skip_crypto {
+            relayed.verify_pow()?;
         }
     }
 
@@ -549,25 +560,41 @@ fn apply_batch_internal(
     //    it: no timestamp this block or a later one may carry would make them
     //    eligible again.
     let mut base = state.clone();
-    let expired = base
+    let mut removed = base
         .bonds
         .prune_expired(min_next_timestamp(previous_timestamps));
 
-    // 4a. Cheap stateful registration checks, then contents: structure,
-    //    balances, proofs, signatures and registration headers.
+    // 4a. Relayed midstate headers, cheap checks first (their proofs of work
+    //     are checked with the block's other proofs below). A heavier branch
+    //     revokes every bond proven against a header it replaced.
+    let mut relay_change = super::relay::RelayChange::default();
+    if let Some(relayed) = &batch.relay {
+        relay_change = base
+            .relay
+            .extend(relayed, super::relay::relay_min_work(&batch.target))?;
+        if let Some(fork) = relay_change.fork_from {
+            removed.extend(base.bonds.revoke_above(fork));
+        }
+    }
+
+    // 4b. Registrations against the relay as this block leaves it, then
+    //     contents: structure, balances, proofs and signatures.
     super::bond::precheck_registrations(&base.bonds, &batch.registrations, batch.timestamp)?;
+    let registered: Vec<([u8; 32], super::bond::BondEntry)> = batch
+        .registrations
+        .iter()
+        .map(|r| Ok((r.bond_id(), r.verify(&base.relay, &batch.target)?)))
+        .collect::<Result<_>>()?;
     validate_block_contents(batch, height, skip_crypto)?;
 
-    // 4b. State transition and root.
+    // 4c. State transition and root.
     let mut next = apply_body(&base, &batch.body, batch.coinbase.as_ref())?;
-    apply_registrations(&mut next, &batch.registrations)?;
+    apply_registrations(&mut next, &registered)?;
     next.effects = std::sync::Arc::new(BlockEffects {
-        bonds_added: batch
-            .registrations
-            .iter()
-            .map(|r| (r.bond_id(), r.entry()))
-            .collect(),
-        bonds_removed: expired,
+        bonds_added: registered,
+        bonds_removed: removed,
+        relay_added: relay_change.added,
+        relay_removed: relay_change.removed,
     });
     let expected_root = next.state_root();
     if batch.state_root != expected_root {
@@ -717,19 +744,19 @@ mod tests {
     }
 }
 
-/// Adds a block's (already verified) bond registrations to the bond set. A
-/// bond can be registered once; after that it simply stops being eligible
-/// when its lock runs down.
+/// Adds a block's verified bond registrations
+/// (`bond::BondRegistration::verify`) to the bond set. A bond is in the set
+/// at most once; it leaves when it can no longer sign, or when the midstate
+/// header it was proven against is replaced.
 pub fn apply_registrations(
     next: &mut State,
-    registrations: &[super::bond::BondRegistration],
+    registered: &[([u8; 32], super::bond::BondEntry)],
 ) -> Result<()> {
-    for registration in registrations {
-        let id = registration.bond_id();
-        if next.bonds.contains_key(&id) {
+    for (id, entry) in registered {
+        if next.bonds.contains_key(id) {
             bail!("bond {} is already registered", hex::encode(id));
         }
-        next.bonds.insert(id, registration.entry());
+        next.bonds.insert(*id, *entry);
     }
     Ok(())
 }

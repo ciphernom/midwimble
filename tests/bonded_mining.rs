@@ -14,6 +14,9 @@ use midwimble::core::types::{hash, GENESIS_TARGET};
 use midwimble::node::{Node, NodeConfig, NodeHandle};
 use std::time::{Duration, Instant};
 
+mod support;
+use support::{mine_midstate_block, start_mock_midstate_at};
+
 struct TestNode {
     handle: NodeHandle,
     _dir: tempfile::TempDir,
@@ -21,13 +24,25 @@ struct TestNode {
 }
 
 async fn start(bond: Option<MinerBond>, peers: Vec<String>) -> TestNode {
+    let mine = bond.is_some();
+    start_full(bond, mine, peers, None).await
+}
+
+async fn start_full(
+    bond: Option<MinerBond>,
+    mine: bool,
+    peers: Vec<String>,
+    midstate_rpc: Option<String>,
+) -> TestNode {
     let dir = tempfile::tempdir().unwrap();
     let mut config = NodeConfig::new(dir.path(), "/ip4/127.0.0.1/tcp/0".parse().unwrap());
     config.bootstrap = peers.iter().map(|p| p.parse().unwrap()).collect();
-    if let Some(bond) = bond {
+    if mine {
         config.mine_to = Some(WalletKeys::random().address());
-        config.mining_bond = Some(bond);
     }
+    config.mining_bond = bond;
+    config.midstate_rpc = midstate_rpc;
+    config.relay_poll = Duration::from_millis(200);
     config.mining_threads = 1;
     config.poll_interval = Duration::from_millis(500);
     config.min_block_interval = Duration::from_millis(250);
@@ -72,13 +87,14 @@ async fn a_bonded_producer_mines_and_a_peer_validates_every_block() {
     let bonded_until = est_midstate_height(current_timestamp())
         + MIN_REMAINING_BOND_LOCK
         + 10_000;
-    let registration = devnet_registration(
+    let (registration, headers) = devnet_registration(
         mining_key, bonded_until, hash(b"integration salt"), &GENESIS_TARGET,
     );
     let bond = MinerBond {
         secret,
         bond_id: registration.bond_id(),
         registration: Some(registration),
+        midstate: Some(headers),
         co_bonds: vec![],
     };
 
@@ -134,4 +150,55 @@ async fn a_bonded_producer_mines_and_a_peer_validates_every_block() {
     let listed = miners["blocks"].as_array().unwrap();
     assert_eq!(listed[0]["registrations"][0], id.as_str());
     assert!(listed.iter().all(|b| b["bond_id"] == id.as_str()));
+}
+
+/// A producer whose node follows a midstate node relays midstate's headers
+/// in the blocks it mines, catching up and then keeping up, and a peer that
+/// validates those blocks ends with the same relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_producer_relays_the_headers_its_midstate_node_serves() {
+    use midwimble::core::relay::RelayEntry;
+    let root = RelayEntry::root();
+    let (ms, _mock) = start_mock_midstate_at(root.height + 1, root.hash).await;
+    let mine = |n: usize| {
+        let ms = ms.clone();
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..n {
+                mine_midstate_block(&ms);
+            }
+        })
+    };
+    mine(5).await.unwrap();
+
+    let producer = start_full(None, true, vec![], Some(ms.clone())).await;
+    let relay_tip = |n: &TestNode| n.handle.state().relay.tip().height;
+    wait_until("the producer to relay midstate's headers", 60, || {
+        relay_tip(&producer) == root.height + 5
+    })
+    .await;
+    mine(3).await.unwrap();
+    wait_until("the producer to keep up", 60, || {
+        relay_tip(&producer) == root.height + 8
+    })
+    .await;
+    let relayed = producer
+        .handle
+        .storage()
+        .load_batches(1, producer.height(), usize::MAX)
+        .unwrap()
+        .iter()
+        .filter_map(|b| b.relay.as_ref())
+        .map(|r| r.headers.len())
+        .sum::<usize>();
+    assert_eq!(relayed, 8, "each header relayed once");
+
+    let peer = start_full(None, false, vec![producer.dial_addr().await], None).await;
+    wait_until("the peer to sync", 60, || {
+        peer.height() >= producer.height() && relay_tip(&peer) == root.height + 8
+    })
+    .await;
+    assert_eq!(
+        peer.handle.state().relay.commitment(),
+        producer.handle.state().relay.commitment()
+    );
 }

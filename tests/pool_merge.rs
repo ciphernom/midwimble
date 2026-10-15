@@ -43,13 +43,14 @@ async fn a_pool_mines_midwimble_with_its_midstate_search() {
     let bonded_until = est_midstate_height(current_timestamp())
         + MIN_REMAINING_BOND_LOCK
         + 10_000;
-    let registration = devnet_registration(
+    let (registration, headers) = devnet_registration(
         mining_key, bonded_until, hash(b"pool bond salt"), &GENESIS_TARGET,
     );
     let bond = MinerBond {
         secret,
         bond_id: registration.bond_id(),
         registration: Some(registration),
+        midstate: Some(headers),
         co_bonds: vec![],
     };
     let bond_id = hex::encode(bond.bond_id);

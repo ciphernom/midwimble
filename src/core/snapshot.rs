@@ -35,6 +35,10 @@ pub struct Snapshot {
     /// The registered bond set, checked through the state root.
     #[serde(default)]
     pub bonds: Vec<([u8; 32], crate::core::bond::BondEntry)>,
+    /// The midstate relay's window, lowest first, checked through the state
+    /// root (its tip's digest chains through every entry).
+    #[serde(default)]
+    pub relay: Vec<crate::core::relay::RelayEntry>,
 }
 
 /// Peak values of an MMR, in position order.
@@ -231,8 +235,13 @@ impl Snapshot {
         if bonds.len() != self.bonds.len() {
             bail!("duplicate bond in snapshot");
         }
+        let relay = crate::core::relay::Relay::from_entries(self.relay.clone())?;
+        if relay.commitment() != self.parts.relay_root {
+            bail!("snapshot relay does not match the checkpoint");
+        }
         let state = State {
             bonds,
+            relay,
             recent_signers: Default::default(),
             signer_counts: Default::default(),
             work_floor: Default::default(),

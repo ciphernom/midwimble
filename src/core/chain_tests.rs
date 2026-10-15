@@ -617,9 +617,10 @@ fn heavier_fork_wins() {
 // the production rules through `apply_batch`.
 
 use super::bond::{
-    authorization_message, check_miner_authorization, est_midstate_height, devnet_registration,
+    authorization_message, check_miner_authorization, devnet_registrations, est_midstate_height,
     MinerBond, MIN_REMAINING_BOND_LOCK,
 };
+use super::relay::{RelayFeed, RelayHeaders};
 use super::state::apply_registrations;
 use super::template::{build_template_bonded, BlockTemplate};
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
@@ -631,18 +632,42 @@ fn locked_long() -> u64 {
         + super::bond::MAX_BOND_HORIZON / 2
 }
 
-/// A block producer with a fresh bond locked until `bonded_until`.
+/// A block producer with a fresh bond locked until `bonded_until`, proven on
+/// a stand-in midstate whose headers its blocks relay.
 fn bonded_miner(chain: &TestChain, seed: &[u8], bonded_until: u64) -> MinerBond {
-    let secret = Scalar::from_bytes_mod_order(hash(seed));
-    let mining_key = RistrettoPoint::mul_base(&secret).compress().to_bytes();
-    let registration =
-        devnet_registration(mining_key, bonded_until, hash(seed), &chain.state.target);
-    MinerBond {
-        co_bonds: Vec::new(),
-        secret,
-        bond_id: registration.bond_id(),
-        registration: Some(registration),
-    }
+    bonded_miners(chain, &[(seed, bonded_until)]).remove(0)
+}
+
+/// Producers whose bonds are proven on one stand-in midstate, so their
+/// headers agree (separate stand-ins would be competing branches).
+fn bonded_miners(chain: &TestChain, specs: &[(&[u8], u64)]) -> Vec<MinerBond> {
+    let secrets: Vec<Scalar> = specs
+        .iter()
+        .map(|(seed, _)| Scalar::from_bytes_mod_order(hash(seed)))
+        .collect();
+    let bonds: Vec<([u8; 32], u64, [u8; 32])> = specs
+        .iter()
+        .zip(&secrets)
+        .map(|((seed, until), secret)| {
+            (
+                RistrettoPoint::mul_base(secret).compress().to_bytes(),
+                *until,
+                hash(seed),
+            )
+        })
+        .collect();
+    let (registrations, headers) = devnet_registrations(&bonds, &chain.state.target);
+    registrations
+        .into_iter()
+        .zip(secrets)
+        .map(|(registration, secret)| MinerBond {
+            co_bonds: Vec::new(),
+            secret,
+            bond_id: registration.bond_id(),
+            registration: Some(registration),
+            midstate: Some(headers.clone()),
+        })
+        .collect()
 }
 
 fn now() -> u64 {
@@ -700,23 +725,32 @@ fn expired_bonds_leave_the_bond_set() {
     let mut chain = TestChain::new();
     let payout = TestWallet::new().address();
     let t0 = now();
-    let lasting = bonded_miner(&chain, b"lasting", locked_long());
-    // Eligible for blocks stamped up to about t0 + 300.
-    let brief = bonded_miner(
+    // `brief` is eligible for blocks stamped up to about t0 + 300.
+    let mut bonds = bonded_miners(
         &chain,
-        b"brief",
-        est_midstate_height(t0 + 300) + MIN_REMAINING_BOND_LOCK,
+        &[
+            (b"lasting", locked_long()),
+            (
+                b"brief",
+                est_midstate_height(t0 + 300) + MIN_REMAINING_BOND_LOCK,
+            ),
+        ],
     );
+    let (lasting, brief) = (bonds.remove(0), bonds.remove(0));
     chain
         .apply(chain.bonded_block_at(&lasting, &payout, t0 + 60).unwrap())
         .unwrap();
     chain
         .apply(chain.bonded_block_at(&brief, &payout, t0 + 120).unwrap())
         .unwrap();
-    assert_eq!(
-        chain.state.effects.bonds_added,
-        vec![(brief.bond_id, brief.registration.as_ref().unwrap().entry())]
-    );
+    let added: Vec<[u8; 32]> = chain
+        .state
+        .effects
+        .bonds_added
+        .iter()
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(added, vec![brief.bond_id]);
     chain
         .apply(chain.bonded_block_at(&lasting, &payout, t0 + 240).unwrap())
         .unwrap();
@@ -887,15 +921,156 @@ fn registrations_are_verified_and_limited() {
     let bond = bonded_miner(&chain, b"verified", locked_long());
     let block = chain.make_bonded_block(&bond, &payout).unwrap();
     let height = chain.state.height;
+    // The first block relays the bond's midstate headers with it.
+    let relayed = block
+        .relay
+        .as_ref()
+        .expect("the block relays the bond's headers");
+    assert_eq!(
+        relayed.headers.len(),
+        bond.midstate.as_ref().unwrap().headers.len()
+    );
     validate_block_contents(&block, height, false).unwrap();
-    // Cut short, the registration no longer carries a day of work.
-    let mut short = block.clone();
-    short.registrations[0].headers.truncate(10);
-    assert!(validate_block_contents(&short, height, false).is_err());
+    // A relayed header with a forged proof of work is caught with the
+    // block's other proofs.
+    let mut forged = block.clone();
+    forged.relay.as_mut().unwrap().headers[5].nonce ^= 1;
+    assert!(validate_block_contents(&forged, height, false).is_err());
     // Two registrations in one block are refused outright.
     let mut two = block.clone();
     two.registrations.push(block.registrations[0].clone());
     assert!(validate_block_contents(&two, height, true).is_err());
+}
+
+/// Without the relay holding its header, a registration has nothing to be
+/// checked against: a producer whose bond file carries no headers cannot
+/// register until something relays them, and then it can.
+#[test]
+fn registrations_wait_for_the_relay() {
+    let mut chain = TestChain::new();
+    let payout = TestWallet::new().address();
+    let mut bond = bonded_miner(&chain, b"patient", locked_long());
+    let headers = bond.midstate.take().unwrap();
+    let err = chain.make_bonded_block(&bond, &payout).unwrap_err();
+    assert!(err.to_string().contains("relay"), "{err}");
+    // A block from someone else relays the headers (a producer whose node
+    // follows midstate)...
+    let mut feed = RelayFeed::default();
+    feed.add(&headers, true);
+    let relaying = crate::core::template::build_template_relayed(
+        &chain.state,
+        &chain.timestamps,
+        &[],
+        &[(payout, 1)],
+        [0; 32],
+        None,
+        None,
+        Some(&feed),
+    )
+    .unwrap()
+    .0
+    .mine_blocking();
+    assert!(relaying.relay.is_some());
+    chain.apply(relaying).unwrap();
+    assert_eq!(
+        chain.state.relay.tip().hash,
+        headers.headers.last().unwrap().final_hash
+    );
+    // ...and now the registration verifies and the bond mines.
+    let first = chain.make_bonded_block(&bond, &payout).unwrap();
+    assert!(first.relay.is_none(), "nothing left to relay");
+    chain.apply(first).unwrap();
+    assert!(chain.state.bonds.contains_key(&bond.bond_id));
+}
+
+/// The review's attack: one private midstate branch, mined once, holding
+/// coins nobody locked, backs bond after bond. Here it does so only while it
+/// is the relay's chain. Once a heavier branch (midstate's real chain, as an
+/// honest producer relays it) replaces it, every bond proven on it is
+/// revoked together: its coins are no longer known to exist.
+#[test]
+fn a_heavier_midstate_branch_revokes_bonds_proven_on_the_old_one() {
+    let mut chain = TestChain::new();
+    let payout = TestWallet::new().address();
+    let mut forged = bonded_miners(
+        &chain,
+        &[
+            (b"forged 1", locked_long()),
+            (b"forged 2", locked_long()),
+            (b"forged 3", locked_long()),
+        ],
+    );
+    for bond in &forged {
+        chain
+            .apply(chain.make_bonded_block(bond, &payout).unwrap())
+            .unwrap();
+        assert!(chain.state.bonds.contains_key(&bond.bond_id));
+    }
+    assert_eq!(chain.state.bonds.len(), 3, "one branch backed three bonds");
+    let bond = forged.remove(0);
+    let replaced = chain.state.relay.tip().height;
+
+    // Another stand-in midstate from the same root, longer: heavier.
+    let mut honest = super::relay::devnet::DevnetMidstate::new();
+    honest.mine(bond.midstate.as_ref().unwrap().headers.len() as u64 + 3);
+    let mut feed = RelayFeed::default();
+    feed.add(&honest.mined, true);
+    let block = crate::core::template::build_template_relayed(
+        &chain.state,
+        &chain.timestamps,
+        &[],
+        &[(payout, 1)],
+        [0; 32],
+        None,
+        None,
+        Some(&feed),
+    )
+    .unwrap()
+    .0
+    .mine_blocking();
+    assert_eq!(
+        block.relay.as_ref().unwrap().prev,
+        super::relay::RelayEntry::root().hash
+    );
+    chain.apply(block).unwrap();
+    assert!(
+        chain.state.bonds.is_empty(),
+        "every bond on the branch is revoked"
+    );
+    let mut revoked: Vec<[u8; 32]> = chain
+        .state
+        .effects
+        .bonds_removed
+        .iter()
+        .map(|(id, _)| *id)
+        .collect();
+    let mut expected: Vec<[u8; 32]> = std::iter::once(bond.bond_id)
+        .chain(forged.iter().map(|b| b.bond_id))
+        .collect();
+    revoked.sort();
+    expected.sort();
+    assert_eq!(revoked, expected);
+    assert!(
+        chain.state.effects.relay_removed.len() as u64
+            >= replaced - super::relay::RelayEntry::root().height
+    );
+    assert!(chain.state.relay.tip().height > replaced);
+
+    // It can no longer sign, and its old registration has nothing to stand on.
+    let err = chain.make_bonded_block(&bond, &payout).unwrap_err();
+    assert!(err.to_string().contains("does not verify"), "{err}");
+    // The lighter branch cannot come back.
+    let old = bond.midstate.as_ref().unwrap();
+    let lighter = RelayHeaders {
+        prev: old.prev,
+        headers: old.headers.clone(),
+    };
+    assert!(chain
+        .state
+        .relay
+        .clone()
+        .extend(&lighter, super::relay::relay_min_work(&chain.state.target))
+        .is_err());
 }
 
 #[test]
@@ -906,6 +1081,9 @@ fn a_bond_registers_once() {
     let first = chain.make_bonded_block(&bond, &payout).unwrap();
     let registration = first.registrations[0].clone();
     chain.apply(first).unwrap();
+    let entry = registration
+        .verify(&chain.state.relay, &chain.state.target)
+        .unwrap();
     let mut state = chain.state.clone();
-    assert!(apply_registrations(&mut state, &[registration]).is_err());
+    assert!(apply_registrations(&mut state, &[(registration.bond_id(), entry)]).is_err());
 }

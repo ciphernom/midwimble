@@ -45,6 +45,7 @@ pub fn router(node: NodeHandle) -> Router {
         .route("/state", get(state))
         .route("/blocks/{start}/{count}", get(blocks))
         .route("/bonds", get(bonds))
+        .route("/relay", get(relay))
         .route("/merge/job", post(merge_job))
         .route("/merge/found", post(merge_found))
         .route("/miners/{start}/{count}", get(miners))
@@ -99,6 +100,26 @@ fn next_halving(height: u64) -> Option<u64> {
     let interval = crate::core::types::HALVING_INTERVAL;
     let next = (height / interval + 1) * interval;
     (crate::core::types::block_reward(next) > 0).then_some(next)
+}
+
+/// The midstate relay (`core/relay.rs`): the midstate chain this chain's
+/// blocks have relayed, which bond registrations are proven against.
+async fn relay(AxState(node): AxState<NodeHandle>) -> Json<Value> {
+    let state = node.state();
+    let (tip, base) = (state.relay.tip(), state.relay.base());
+    let feed = node.relay_feed();
+    let feed = feed.read().expect("relay feed lock poisoned");
+    Json(json!({
+        "tip_height": tip.height,
+        "tip_hash": hex::encode(tip.hash),
+        "chain_work": tip.chain_work.to_string(),
+        "base_height": base.height,
+        "entries": state.relay.len(),
+        "registration_work": crate::core::bond::registration_work(&state.target).to_string(),
+        "registration_cap": crate::core::bond::registration_cap(&state.target).to_string(),
+        "feed_tip_height": feed.tip_height(),
+        "would_relay": feed.next_for(&state.relay).map_or(0, |r| r.headers.len()),
+    }))
 }
 
 /// The registered mining bonds that can still sign (expired ones leave the
@@ -480,29 +501,33 @@ async fn build_mining_template(
         .map_err(bad)?;
     let pool = node.mempool().await.map_err(bad)?;
     let bond = node.mining_bond();
+    let feed = node.relay_feed();
     let (template, receipts) = tokio::task::spawn_blocking(move || {
         use crate::core::types::{KERNEL_WEIGHT, MAX_BLOCK_WEIGHT, OUTPUT_WEIGHT};
+        let feed = feed.read().expect("relay feed lock poisoned");
         let registration_weight = bond
             .as_ref()
             .filter(|b| !state.bonds.contains_key(&b.bond_id))
             .and_then(|b| b.registration.as_ref())
             .map_or(0, |r| r.weight());
+        let relay_weight = feed.next_for(&state.relay).map_or(0, |r| r.weight());
         let budget = (MAX_BLOCK_WEIGHT - (payouts.len() as u64) * OUTPUT_WEIGHT - KERNEL_WEIGHT)
-            .saturating_sub(registration_weight);
+            .saturating_sub(registration_weight)
+            .saturating_sub(relay_weight);
         let txs = crate::core::template::select_transactions(&pool, state.height, budget);
-        crate::core::template::build_template_bonded(&state, &timestamps, &txs, &payouts, extra, None, bond.as_ref())
-            .or_else(|_| {
-                crate::core::template::build_template_bonded(
-                    &state,
-                    &timestamps,
-                    &[],
-                    &payouts,
-                    extra,
-                    None,
-                    bond.as_ref(),
-                )
-            })
-            .map(|(t, r)| (t, r))
+        let build = |txs: &[crate::core::mw::Transaction]| {
+            crate::core::template::build_template_relayed(
+                &state,
+                &timestamps,
+                txs,
+                &payouts,
+                extra,
+                None,
+                bond.as_ref(),
+                Some(&feed),
+            )
+        };
+        build(&txs).or_else(|_| build(&[]))
     })
     .await
     .map_err(bad)?

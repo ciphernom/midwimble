@@ -7,7 +7,7 @@
 
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 use midwimble::core::bond::{
-    devnet_registration, est_midstate_height, MinerBond, MIN_REMAINING_BOND_LOCK,
+    devnet_registrations, est_midstate_height, MinerBond, MIN_REMAINING_BOND_LOCK,
 };
 use midwimble::core::mw::WalletKeys;
 use midwimble::core::state::{apply_batch, current_timestamp};
@@ -18,18 +18,35 @@ use midwimble::node::{Node, NodeConfig, NodeHandle};
 use midwimble::storage::Storage;
 use std::time::{Duration, Instant};
 
-/// A bond eligible both at the chain's old timestamps and now.
-fn bond(seed: &[u8]) -> MinerBond {
-    let secret = Scalar::from_bytes_mod_order(hash(seed));
-    let mining_key = RistrettoPoint::mul_base(&secret).compress().to_bytes();
+/// Bonds eligible both at the chain's old timestamps and now, registered
+/// together: they share one stand-in midstate, whose headers the first block
+/// relays.
+fn bonds(seeds: &[&[u8]]) -> Vec<MinerBond> {
     let until = est_midstate_height(current_timestamp()) + MIN_REMAINING_BOND_LOCK + 10_000;
-    let registration = devnet_registration(mining_key, until, hash(seed), &GENESIS_TARGET);
-    MinerBond {
-        secret,
-        bond_id: registration.bond_id(),
-        registration: Some(registration),
-        co_bonds: vec![],
-    }
+    let secrets: Vec<Scalar> = seeds
+        .iter()
+        .map(|seed| Scalar::from_bytes_mod_order(hash(seed)))
+        .collect();
+    let specs: Vec<([u8; 32], u64, [u8; 32])> = seeds
+        .iter()
+        .zip(&secrets)
+        .map(|(seed, secret)| {
+            let mining_key = RistrettoPoint::mul_base(secret).compress().to_bytes();
+            (mining_key, until, hash(seed))
+        })
+        .collect();
+    let (registrations, headers) = devnet_registrations(&specs, &GENESIS_TARGET);
+    registrations
+        .into_iter()
+        .zip(secrets)
+        .map(|(registration, secret)| MinerBond {
+            secret,
+            bond_id: registration.bond_id(),
+            registration: Some(registration),
+            midstate: Some(headers.clone()),
+            co_bonds: vec![],
+        })
+        .collect()
 }
 
 /// Mines a block on `state` signed by `bond` (registering it if need be),
@@ -117,7 +134,8 @@ async fn wait_until(what: &str, secs: u64, mut done: impl FnMut() -> bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deeper_but_lighter_chain_is_judged_once_until_it_could_be_heavier() {
-    let (a, b) = (bond(b"bond a"), bond(b"bond b"));
+    let mut both = bonds(&[b"bond a", b"bond b"]);
+    let (a, b) = (both.remove(0), both.remove(0));
 
     // A start both chains share, registering both bonds: each may then sign
     // 8 of any 16 blocks in full (fast-mining builds: a 16-block window).

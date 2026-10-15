@@ -250,10 +250,13 @@ class Join:
         ok("bond coin is on chain")
 
         section("4. Register it")
-        print("  A registration needs a day of the testnet's work buried above the proof.")
+        print("  A registration needs a day of the testnet's work buried above the proof,")
+        print("  on the chain's midstate relay. A node syncs first to say where the relay is;")
+        print("  the bond file then carries the midstate headers your blocks will relay.")
+        rpc = self.start(mine=False)
         cmd = [self.bin, "bond", "register", "--file", file, "--owner-pk", b["owner_pk"],
                "--until", b["until"], "--value", value, "--salt", b["salt"],
-               "--midstate-rpc", self.ms]
+               "--midstate-rpc", self.ms, "--midwimble-rpc", rpc]
         while True:
             out = run(cmd)
             print("\n".join("    " + l for l in out.strip().splitlines()))
@@ -261,10 +264,33 @@ class Join:
                 break
             print("  Checking again in 5 minutes…")
             time.sleep(300)
+        self.close()
+        self.procs.clear()
         b["registered"] = True
         self.save()
 
     # ── 5. Run ──────────────────────────────────────────────────────────────
+    def start(self, mine: bool, address: str = "") -> str:
+        """Starts the node, waits for it to sync, and returns its RPC address."""
+        cmd = [str(self.bin), "node", "--data-dir", str(self.dir / "node"),
+               "--listen", f"/ip4/0.0.0.0/tcp/{self.a.p2p_port}",
+               "--rpc", f"127.0.0.1:{self.a.rpc_port}"]
+        for seed in self.net["seeds"]:
+            cmd += ["--peer", seed]
+        if mine:
+            cmd += ["--mine-to", address, "--mining-bond", str(self.dir / "bond.json"),
+                    "--midstate-rpc", self.ms, "--threads", str(self.a.threads)]
+        log = open(self.dir / "node.log", "a")
+        print(f"  $ {' '.join(cmd)}   (log: {log.name})")
+        self.procs.append(subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT))
+        rpc = f"127.0.0.1:{self.a.rpc_port}"
+        wait_until("the node's RPC", lambda: try_get(rpc, "/state"), 2, 120)
+        wait_until("the first blocks to arrive from the seeds",
+                   lambda: (try_get(rpc, "/state") or {}).get("height", 0) > 1, 5, 900)
+        wait_until("the node to finish syncing",
+                   lambda: not (try_get(rpc, "/state") or {"syncing": True}).get("syncing"), 5, 3600)
+        return rpc
+
     def node(self) -> None:
         section("5. Join the network")
         env = dict(os.environ, MIDWIMBLE_PASSWORD=self.a.wallet_password)
@@ -274,23 +300,7 @@ class Join:
             run([self.bin, "wallet", "--wallet", wallet, "create"], env=env)
         address = re.findall(r"\bmw1[0-9a-z]{20,}",
                              run([self.bin, "wallet", "--wallet", wallet, "address"], env=env))[-1]
-        cmd = [str(self.bin), "node", "--data-dir", str(self.dir / "node"),
-               "--listen", f"/ip4/0.0.0.0/tcp/{self.a.p2p_port}",
-               "--rpc", f"127.0.0.1:{self.a.rpc_port}"]
-        for seed in self.net["seeds"]:
-            cmd += ["--peer", seed]
-        if self.a.mine:
-            cmd += ["--mine-to", address, "--mining-bond", str(self.dir / "bond.json"),
-                    "--threads", str(self.a.threads)]
-        log = open(self.dir / "node.log", "a")
-        print(f"  $ {' '.join(cmd)}   (log: {log.name})")
-        self.procs.append(subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT))
-        rpc = f"127.0.0.1:{self.a.rpc_port}"
-        st = wait_until("the node's RPC", lambda: try_get(rpc, "/state"), 2, 120)
-        if st["tip"] != self.net["genesis_block"] and st["height"] == 1:
-            pass  # still at genesis; sync has not started yet
-        wait_until("the first blocks to arrive from the seeds",
-                   lambda: (try_get(rpc, "/state") or {}).get("height", 0) > 1, 5, 900)
+        rpc = self.start(self.a.mine, address)
         st = get_json(rpc, "/state")
         ok(f"synced to height {st['height']}, {len(st['peers'])} peer(s)")
         ok(f"your payout address is {address}")

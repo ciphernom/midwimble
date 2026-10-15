@@ -3,7 +3,6 @@
 //! ordinary Commit transaction or coinbase salt.
 
 use super::auxpow::{bytes32, merge_commitment, midstate_coin_id, tx_fold_item};
-use super::extension::create_extension;
 use super::simd_mining::{check_pow_chains, pow_seed, PowCheck};
 use super::state::calculate_work;
 use super::types::{
@@ -128,13 +127,6 @@ pub(crate) fn link_mining_hash(prev: [u8; 32], link: &HeaderLink) -> [u8; 32] {
         prev_header_hash: prev,
         aux_pow: None,
     })
-}
-
-pub(crate) fn header_pow_ok(prev: [u8; 32], link: &HeaderLink, min_work: u128) -> bool {
-    let mining = link_mining_hash(prev, link);
-    link.final_hash < link.target
-        && calculate_work(&link.target) >= min_work
-        && create_extension(mining, link.nonce).final_hash == link.final_hash
 }
 
 /// Proof that a 32-byte item is folded into a Midstate block's mining hash,
@@ -356,6 +348,7 @@ pub fn midstate_header_link(batch: &Value) -> Result<HeaderLink> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::extension::create_extension;
     use crate::core::types::{hash, Batch, State};
 
     /// Genuine evidence for `payload` (a Commit) with `confirmations` more

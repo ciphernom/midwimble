@@ -351,7 +351,7 @@ class Rehearsal:
         self.s["payout"] = found[-1]
         self.save()
         producer = self.start_node("a", ["--mine-to", found[-1], "--mining-bond", self.dir / "bond.json",
-                                         "--threads", self.a.threads])
+                                         "--midstate-rpc", self.ms, "--threads", self.a.threads])
         st = wait_until("the producer's RPC", lambda: try_get(producer, "/state"), 2, 120)
         peer = self.start_node("b", ["--peer", f"/ip4/127.0.0.1/tcp/{PORTS['a'][0]}/p2p/{st['peer_id']}"])
         height = lambda rpc: (try_get(rpc, "/state") or {}).get("height", 0)  # noqa: E731
@@ -400,7 +400,7 @@ class Rehearsal:
         # Take native mining away from the producer, so any block that appears
         # now can only have come from work done on midstate.
         self.stop_node("a")
-        producer = self.start_node("a", ["--mining-bond", self.dir / "bond.json"])
+        producer = self.start_node("a", ["--mining-bond", self.dir / "bond.json", "--midstate-rpc", self.ms])
         wait_until("the producer to restart without mining", lambda: try_get(producer, "/state"), 2, 120)
         before = (try_get(producer, "/state") or {}).get("height", 0)
         ok(f"producer restarted at height {before}, native mining off")

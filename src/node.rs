@@ -48,6 +48,7 @@ use crate::core::types::{
     compute_header_hash, utxo_leaf, Batch, BatchHeader, State, DIFFICULTY_LOOKBACK, KERNEL_WEIGHT,
     MAX_BLOCK_WEIGHT, MEDIAN_TIME_PAST_WINDOW, OUTPUT_WEIGHT,
 };
+use crate::core::relay::{MidstateHeaders, RelayFeed};
 use crate::finality::{
     precheck, verify_evidence, CheckedLinks, FinalityConfig, FinalityTracker, RecordFault,
 };
@@ -68,7 +69,7 @@ use crate::sync::{
     HEADERS_PER_REQUEST, INITIAL_STEP_BACK, MAX_BATCH_REQUESTS_IN_FLIGHT, MAX_BUFFER_BYTES,
     MAX_QUEUED_HEADER_CHUNKS, MAX_REORG_DEPTH, SYNC_TIMEOUT_SECS,
 };
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use libp2p::identity::Keypair;
 use libp2p::request_response::ResponseChannel;
 use libp2p::{Multiaddr, PeerId};
@@ -139,6 +140,12 @@ pub struct NodeConfig {
     /// A sync session whose peer sends nothing for this long is dropped.
     /// Time this node spends verifying and applying does not count.
     pub sync_timeout: Duration,
+    /// A midstate node's RPC (`host:port`), polled for the headers this
+    /// node's blocks relay (`core/relay.rs`). Registrations need midstate's
+    /// chain relayed, so every producer should set one.
+    pub midstate_rpc: Option<String>,
+    /// How often the midstate node is polled.
+    pub relay_poll: Duration,
     /// Test builds only: extra time each synced header takes to verify,
     /// standing in for a slow machine.
     #[cfg(feature = "fast-mining")]
@@ -165,6 +172,8 @@ impl NodeConfig {
             checkpoint: None,
             bootstrap_timeout: Duration::from_secs(600),
             sync_timeout: Duration::from_secs(SYNC_TIMEOUT_SECS),
+            midstate_rpc: None,
+            relay_poll: Duration::from_secs(20),
             #[cfg(feature = "fast-mining")]
             header_verify_delay: Duration::ZERO,
         }
@@ -206,9 +215,15 @@ pub struct NodeHandle {
     storage: Storage,
     commands: mpsc::UnboundedSender<Command>,
     mining_bond: Option<crate::core::bond::MinerBond>,
+    relay_feed: Arc<RwLock<RelayFeed>>,
 }
 
 impl NodeHandle {
+    /// The midstate headers this node has to relay, for the template RPC.
+    pub fn relay_feed(&self) -> Arc<RwLock<RelayFeed>> {
+        self.relay_feed.clone()
+    }
+
     /// The bond this node signs templates with, for the template RPC.
     pub fn mining_bond(&self) -> Option<crate::core::bond::MinerBond> {
         self.mining_bond.clone()
@@ -392,6 +407,8 @@ enum Internal {
         records: Vec<AnchorRecord>,
         offset: u64,
     },
+    /// New midstate headers from the feeder, proof of work checked.
+    RelayFed(MidstateHeaders),
     /// A request served off the event loop; `channel` is `None` for light
     /// clients, which were answered directly.
     Served {
@@ -505,6 +522,9 @@ pub struct Node {
     /// Requests being served off the event loop, per peer and in all.
     serving: HashMap<PeerId, usize>,
     serving_total: usize,
+    /// Midstate headers to relay, from bond files and the midstate feeder.
+    relay_feed: Arc<RwLock<RelayFeed>>,
+    feeder: Option<tokio::task::JoinHandle<()>>,
     snapshot_cache: Option<([u8; 32], Arc<Vec<u8>>)>,
     snapshot_building: Option<[u8; 32]>,
 }
@@ -595,11 +615,24 @@ impl Node {
             finality: storage.finality()?,
             anchors_known: 0,
         }));
+        // Headers the producer's bond files carry, for registrations the
+        // relay cannot back yet. A live midstate node's view replaces them.
+        let mut feed = RelayFeed::default();
+        if let Some(bond) = &config.mining_bond {
+            let carried = std::iter::once(&bond.midstate)
+                .chain(bond.co_bonds.iter().map(|c| &c.midstate))
+                .flatten();
+            for headers in carried {
+                feed.add(headers, false);
+            }
+        }
+        let relay_feed = Arc::new(RwLock::new(feed));
         let handle = NodeHandle {
             mining_bond: config.mining_bond.clone(),
             info: info.clone(),
             storage: storage.clone(),
             commands: cmd_tx,
+            relay_feed: relay_feed.clone(),
         };
 
         let mut node = Node {
@@ -648,6 +681,8 @@ impl Node {
             anchor_store_batches: 0,
             serving: HashMap::new(),
             serving_total: 0,
+            relay_feed,
+            feeder: None,
             snapshot_cache: None,
             snapshot_building: None,
         };
@@ -669,6 +704,7 @@ impl Node {
         for t in [&mut fast, &mut poll, &mut slow] {
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         }
+        self.start_feeder();
         self.refresh_mining();
         self.publish_info();
 
@@ -685,6 +721,9 @@ impl Node {
                 Some(cmd) = self.commands.recv() => {
                     if matches!(cmd, Command::Shutdown) {
                         self.miner.stop();
+                        if let Some(feeder) = self.feeder.take() {
+                            feeder.abort();
+                        }
                         tracing::info!("Node shutting down");
                         return Ok(());
                     }
@@ -1099,6 +1138,17 @@ impl Node {
                 self.anchor_store_offset = offset;
                 if !records.is_empty() {
                     self.queue_anchors(AnchorSource::File, records);
+                }
+            }
+            Internal::RelayFed(headers) => {
+                let proposed_before = self.relay_proposal().map(|r| r.headers.len());
+                {
+                    let mut feed = self.relay_feed.write().expect("relay feed lock poisoned");
+                    feed.add(&headers, true);
+                    feed.prune(&self.state.relay);
+                }
+                if self.relay_proposal().map(|r| r.headers.len()) != proposed_before {
+                    self.refresh_mining();
                 }
             }
             Internal::Served { peer, reply } => {
@@ -2975,20 +3025,24 @@ impl Node {
             return;
         }
         // Signed as this node's bond, whose registration rides in its blocks
-        // (taking room from transactions) until the chain has it.
+        // (taking room from transactions) until the chain has it, as do the
+        // midstate headers the relay lacks.
         let bond = self.config.mining_bond.clone();
         let registration_weight = bond
             .as_ref()
             .filter(|b| !self.state.bonds.contains_key(&b.bond_id))
             .and_then(|b| b.registration.as_ref())
             .map_or(0, |r| r.weight());
-        let budget =
-            (MAX_BLOCK_WEIGHT - OUTPUT_WEIGHT - KERNEL_WEIGHT).saturating_sub(registration_weight);
+        let relay_weight = self.relay_proposal().map_or(0, |r| r.weight());
+        let budget = (MAX_BLOCK_WEIGHT - OUTPUT_WEIGHT - KERNEL_WEIGHT)
+            .saturating_sub(registration_weight)
+            .saturating_sub(relay_weight);
         let txs = select_transactions(&self.mempool.candidates(), self.state.height, budget);
         let payouts = [(payout, 1u64)];
         let state = &self.state;
         let timestamps: &[u64] = self.timestamps.make_contiguous();
-        let template = crate::core::template::build_template_bonded(
+        let feed = self.relay_feed.read().expect("relay feed lock poisoned");
+        let template = crate::core::template::build_template_relayed(
             state,
             timestamps,
             &txs,
@@ -2996,6 +3050,7 @@ impl Node {
             [0u8; 32],
             None,
             bond.as_ref(),
+            Some(&feed),
         )
         .or_else(|e| {
             tracing::warn!(
@@ -3003,7 +3058,7 @@ impl Node {
                 txs.len(),
                 e
             );
-            crate::core::template::build_template_bonded(
+            crate::core::template::build_template_relayed(
                 state,
                 timestamps,
                 &[],
@@ -3011,13 +3066,65 @@ impl Node {
                 [0u8; 32],
                 None,
                 bond.as_ref(),
+                Some(&feed),
             )
         })
         .map(|(t, _)| t);
+        drop(feed);
         match template {
             Ok(t) => self.miner.start(t),
             Err(e) => tracing::error!("Cannot build a block template: {:#}", e),
         }
+    }
+
+    // ── The midstate relay ──────────────────────────────────────────────
+
+    /// What the next block would relay from the feed.
+    fn relay_proposal(&self) -> Option<crate::core::relay::RelayHeaders> {
+        self.relay_feed
+            .read()
+            .expect("relay feed lock poisoned")
+            .next_for(&self.state.relay)
+    }
+
+    /// Polls the configured midstate node for headers past the relay's tip,
+    /// checking their proof of work off the event loop.
+    fn start_feeder(&mut self) {
+        let Some(addr) = self.config.midstate_rpc.clone() else {
+            return;
+        };
+        let (info, tx, every) = (
+            self.info.clone(),
+            self.internal_tx.clone(),
+            self.config.relay_poll,
+        );
+        tracing::info!("Relaying midstate headers from {}", addr);
+        self.feeder = Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let relay = info
+                    .read()
+                    .expect("node info lock poisoned")
+                    .state
+                    .relay
+                    .clone();
+                let addr = addr.clone();
+                match tokio::task::spawn_blocking(move || fetch_midstate_headers(&addr, &relay))
+                    .await
+                {
+                    Ok(Ok(Some(headers))) => {
+                        if tx.send(Internal::RelayFed(headers)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(e)) => tracing::warn!("midstate feeder: {:#}", e),
+                    Err(e) => tracing::warn!("midstate feeder stopped a round: {}", e),
+                }
+            }
+        }));
     }
 
     // ── Light clients ───────────────────────────────────────────────────
@@ -3072,6 +3179,58 @@ impl Node {
             }
         })
     }
+}
+
+/// Headers a feeder asks for at once.
+const FEED_BATCH: u64 = 2_000;
+/// Headers below the relay's tip a feeder fetches again, to notice a
+/// midstate reorganisation.
+const FEED_OVERLAP: u64 = 6;
+
+/// The midstate headers from a little below `relay`'s tip to midstate's own
+/// tip (at most `FEED_BATCH`), with their links and proofs of work checked.
+fn fetch_midstate_headers(
+    addr: &str,
+    relay: &crate::core::relay::Relay,
+) -> Result<Option<MidstateHeaders>> {
+    let client = crate::rpc::RpcClient::new(addr);
+    // Midstate's `/state` height counts blocks: its tip is one below.
+    let blocks = client.get("/state")?["height"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("midstate /state has no height"))?;
+    let from = relay
+        .tip()
+        .height
+        .saturating_sub(FEED_OVERLAP)
+        .max(relay.base().height + 1);
+    if from >= blocks {
+        return Ok(None);
+    }
+    let count = (blocks - from).min(FEED_BATCH);
+    let v = client.get(&format!("/headers/{from}/{count}"))?;
+    let listed = v["headers"].as_array().cloned().unwrap_or_default();
+    let mut run: Option<MidstateHeaders> = None;
+    for h in &listed {
+        let (link, prev) = crate::core::bond::header_link_from_json(h)?;
+        match run.as_mut() {
+            None => {
+                run = Some(MidstateHeaders {
+                    start: from,
+                    prev,
+                    headers: vec![link],
+                })
+            }
+            Some(r) => {
+                if r.headers.last().map(|l| l.final_hash) != Some(prev) {
+                    bail!("midstate's headers from {from} do not link");
+                }
+                r.headers.push(link);
+            }
+        }
+    }
+    let Some(run) = run else { return Ok(None) };
+    run.verify()?;
+    Ok(Some(run))
 }
 
 /// Light requests answered from storage alone, which may take a while.

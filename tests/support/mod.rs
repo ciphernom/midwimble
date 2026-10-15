@@ -214,6 +214,8 @@ pub const REWARD: u64 = 1_000_003; // several power-of-two outputs
 
 #[derive(Default)]
 pub struct MockChain {
+    /// Height of the first block in `blocks` (0 unless started elsewhere).
+    pub base: u64,
     pub height: u64,
     pub prev_midstate: [u8; 32],
     pub prev_header_hash: [u8; 32],
@@ -270,6 +272,12 @@ fn sample_transactions(height: u64) -> Vec<Transaction> {
 }
 
 pub async fn start_mock_midstate() -> (String, Mock) {
+    start_mock_midstate_at(0, [2; 32]).await
+}
+
+/// A mock whose first block is at `base` and builds on `prev_header_hash`
+/// (to continue a real chain, such as the relay's root).
+pub async fn start_mock_midstate_at(base: u64, prev_header_hash: [u8; 32]) -> (String, Mock) {
     use axum::{
         extract::State,
         http::StatusCode,
@@ -279,8 +287,10 @@ pub async fn start_mock_midstate() -> (String, Mock) {
     use serde_json::{json, Value};
 
     let chain: Mock = Arc::new(Mutex::new(MockChain {
+        base,
+        height: base,
         prev_midstate: [1; 32],
-        prev_header_hash: [2; 32],
+        prev_header_hash,
         ..Default::default()
     }));
 
@@ -382,13 +392,41 @@ pub async fn start_mock_midstate() -> (String, Mock) {
         axum::extract::Path(h): axum::extract::Path<u64>,
     ) -> (StatusCode, Json<Value>) {
         let c = c.lock().unwrap();
-        match c.blocks.get(h as usize) {
+        match h.checked_sub(c.base).and_then(|i| c.blocks.get(i as usize)) {
             Some(b) => (StatusCode::OK, Json(serde_json::to_value(b).unwrap())),
             None => (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": format!("Batch at height {} not found", h) })),
             ),
         }
+    }
+
+    /// midstate's `GET /headers/{start}/{count}`: header fields, with the
+    /// post-transaction midstate its mining hash folds.
+    async fn headers(
+        State(c): State<Mock>,
+        axum::extract::Path((start, count)): axum::extract::Path<(u64, u64)>,
+    ) -> Json<Value> {
+        let c = c.lock().unwrap();
+        let from = start.saturating_sub(c.base) as usize;
+        let list: Vec<Value> = c
+            .blocks
+            .iter()
+            .skip(from)
+            .take(count.min(2_000) as usize)
+            .map(|b| {
+                let (_, post_tx) = b.mining_hash();
+                json!({
+                    "prev_header_hash": hex::encode(b.prev_header_hash),
+                    "post_tx_midstate": hex::encode(post_tx),
+                    "state_root": hex::encode(b.state_root),
+                    "timestamp": b.timestamp,
+                    "target": hex::encode(b.target),
+                    "extension": { "nonce": b.extension.nonce, "final_hash": hex::encode(b.extension.final_hash) },
+                })
+            })
+            .collect();
+        Json(json!({ "headers": list }))
     }
 
     /// midstate's `evaluate_commit_pow` (fast-mining: 16 bits).
@@ -402,14 +440,21 @@ pub async fn start_mock_midstate() -> (String, Mock) {
         .unwrap();
         let spam_nonce = req["spam_nonce"].as_u64().unwrap_or(0);
         let (target_height, nonce) = ((spam_nonce >> 32) as u32, (spam_nonce & 0xFFFF_FFFF) as u32);
-        if target_height as u64 >= c.height || c.height - target_height as u64 > 1000 {
+        if target_height as u64 >= c.height
+            || c.height - target_height as u64 > 1000
+            || (target_height as u64) < c.base
+        {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": "Commit PoW anchor height must be a past block" })),
             );
         }
         let mut data = [0u8; 68];
-        data[..32].copy_from_slice(&c.blocks[target_height as usize].extension.final_hash);
+        data[..32].copy_from_slice(
+            &c.blocks[(target_height as u64 - c.base) as usize]
+                .extension
+                .final_hash,
+        );
         data[32..64].copy_from_slice(&commitment);
         data[64..].copy_from_slice(&nonce.to_le_bytes());
         let zeros = midwimble::core::types::count_leading_zeros(&hash(&data));
@@ -431,6 +476,7 @@ pub async fn start_mock_midstate() -> (String, Mock) {
     let app = Router::new()
         .route("/state", get(state))
         .route("/batch/{h}", get(batch))
+        .route("/headers/{start}/{count}", get(headers))
         .route("/commit", post(commit))
         .route("/block_template", post(template))
         .route("/submit_batch", post(submit))

@@ -45,8 +45,10 @@ It needs:
    difficulty is buried above it. The cap of 1/60 per header sets the
    requirement at about 75 midstate blocks.
 6. **Bonded mining.** A producer and a peer start on the rehearsal network.
+   The producer relays midstate's headers from your node (`--midstate-rpc`).
    The script checks, through the peer's RPC:
-   - block 1 registers the bond;
+   - block 1 registers the bond, relaying the midstate headers from the
+     rehearsal's anchor through the bond's burial;
    - every block is signed by it;
    - later blocks carry no registration;
    - the peer, which mined nothing, holds the same bond set, with the bond

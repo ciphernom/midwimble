@@ -15,8 +15,13 @@
 //! Fork choice also caps the work any one block adds, at a quarter above the
 //! lowest block of the week before (`cap_work`), so hashrate alone cannot
 //! stand in for bonds.
+//!
+//! The header a bond is proven against must be on the midstate relay's chain
+//! (`core/relay.rs`): consensus's own view of midstate, fed by blocks. A bond
+//! whose header a heavier midstate branch replaces is revoked.
 
-use super::anchor::{header_pow_ok, HeaderLink};
+use super::anchor::HeaderLink;
+use super::relay::{MidstateHeaders, Relay};
 use super::auxpow::midstate_coin_id;
 use super::mmr::{verify_utxo_proof, UtxoAccumulator, UtxoProof};
 use super::state::calculate_work;
@@ -310,84 +315,81 @@ fn eligible(value: u64, bonded_until: u64, block_timestamp: u64) -> bool {
 
 // ── Registration ─────────────────────────────────────────────────────────────
 
-/// A registration must show a day of work above its proof's header, measured
-/// in blocks of the *registering midwimble block's own target*.
+/// A registration's header must be buried under a day of work, measured in
+/// blocks of the *registering midwimble block's own target*.
 ///
-/// Why midwimble's target and not the midstate headers' own: those headers
-/// are the registrant's to choose. On a private fork they could claim easy
-/// targets and make "a day" cheap. Midwimble's target is consensus, cannot be
-/// lowered without out-hashing midwimble, and is in the same units — both
-/// chains run the same proof of work at the same 60-second spacing — so it
-/// measures the merged hashrate. Faking a registration therefore costs at least
-/// a day of midwimble's entire network's work, however midstate's block reward
-/// has decayed.
+/// The headers above it are the relay's, so they are midstate's chain as far
+/// as consensus knows it, and a bond on a branch that loses is revoked. The
+/// burial guards the time in between: hijacking the relay long enough to
+/// register a bond costs at least a day of midwimble's entire network's work,
+/// on top of outweighing what honest producers relay, however midstate's
+/// block reward has decayed.
 pub const REGISTRATION_WORK_BLOCKS: u128 = 24 * 60;
 
-/// No header counts for more than 1/60 of the requirement, so a registration
-/// needs at least 60 headers' worth of real work. Without the cap, one
-/// improbably lucky hash on a very hard target could stand in for the day.
+/// No header counts for more than 1/60 of the requirement, so a burial needs
+/// at least 60 headers' worth of real work. Without the cap, one improbably
+/// lucky hash on a very hard target could stand in for the day.
 pub const REGISTRATION_MIN_HEADERS: u128 = 60;
-
-/// Bounds a registration's size (144 bytes a header) and verification cost (a
-/// full extension per header). Honest runs are about `1440 × share` headers,
-/// where `share` is midwimble's fraction of midstate's hashrate.
-pub const REGISTRATION_MAX_HEADERS: usize = 4_000;
 
 /// The work a registration in a block with this target must show.
 pub fn registration_work(midwimble_target: &[u8; 32]) -> u128 {
     calculate_work(midwimble_target).saturating_mul(REGISTRATION_WORK_BLOCKS)
 }
 
-/// Work the headers `above` a bond's proof are credited with, towards a
-/// registration in a block with `midwimble_target`: each counts for at most
-/// 1/60 of the requirement.
+/// The most any one header above a bond's header is credited with, towards a
+/// registration in a block with this target.
+pub fn registration_cap(midwimble_target: &[u8; 32]) -> u128 {
+    (registration_work(midwimble_target) / REGISTRATION_MIN_HEADERS).max(1)
+}
+
+/// Work the headers `above` a bond's header are credited with, towards a
+/// registration in a block with `midwimble_target` (for tools that hold the
+/// headers themselves; consensus counts the relay's).
 pub fn credited_work(above: &[HeaderLink], midwimble_target: &[u8; 32]) -> u128 {
-    let cap = (registration_work(midwimble_target) / REGISTRATION_MIN_HEADERS).max(1);
+    let cap = registration_cap(midwimble_target);
     above.iter().fold(0u128, |sum, h| {
         sum.saturating_add(calculate_work(&h.target).min(cap))
     })
 }
 
-/// A bond proof plus the midstate headers that bury it.
+/// A bond proof, to be checked against the midstate relay.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BondRegistration {
     pub proof: BondProof,
-    /// `prev_header_hash` of the proof's header.
-    pub prev_header_hash: [u8; 32],
-    /// The proof's header, then the midstate headers built on it.
-    pub headers: Vec<HeaderLink>,
 }
 
 impl BondRegistration {
-    /// Verifies a registration carried by a midwimble block with target
-    /// `midwimble_target`. The cheap checks run first; each header's proof of
-    /// work costs a full extension, so it is checked last, in chain order, and
-    /// the first bad header stops it. Forcing that work on a node costs the
-    /// sender a real header's worth of hashing each time.
-    pub fn verify(&self, midwimble_target: &[u8; 32]) -> Result<Bond> {
-        if self.headers.len() > REGISTRATION_MAX_HEADERS {
-            bail!("registration carries more than {REGISTRATION_MAX_HEADERS} headers");
-        }
-        let (proven, above) = self
-            .headers
-            .split_first()
-            .ok_or_else(|| anyhow!("registration carries no midstate headers"))?;
+    /// Verifies a registration in a block with `midwimble_target`, against
+    /// the relay as that block leaves it: the proof's header is on the
+    /// relay's chain, the proof rebuilds its state root, and the headers
+    /// relayed above it carry a day of work at the block's target. Returns
+    /// the entry the bond set gains, which records the header it was proven
+    /// against.
+    ///
+    /// Nothing here hashes a chain: the relay's headers had their proof of
+    /// work checked once, when they were relayed.
+    pub fn verify(&self, relay: &Relay, midwimble_target: &[u8; 32]) -> Result<BondEntry> {
+        let height = self.proof.midstate_height;
+        let header = relay.get(height).filter(|e| !e.is_root()).ok_or_else(|| {
+            anyhow!(
+                "the bond's midstate header (height {height}) is not on the relay's chain: relay it first"
+            )
+        })?;
+        let bond = self.proof.verify(&header.state_root)?;
         let required = registration_work(midwimble_target);
-        let credited = credited_work(above, midwimble_target);
+        let credited = relay.credited_above(height, registration_cap(midwimble_target));
         if credited < required {
             bail!(
-                "{credited} units of midstate work above the bond's header; a block at this target requires {required}"
+                "{credited} units of relayed midstate work above the bond's header; a block at this target requires {required}"
             );
         }
-        let bond = self.proof.verify(&proven.state_root)?;
-        let mut prev = self.prev_header_hash;
-        for (i, header) in self.headers.iter().enumerate() {
-            if !header_pow_ok(prev, header, 0) {
-                bail!("midstate header {i} of the registration fails its proof of work");
-            }
-            prev = header.final_hash;
-        }
-        Ok(bond)
+        Ok(BondEntry {
+            mining_key: bond.mining_key,
+            value: bond.value,
+            bonded_until: bond.bonded_until,
+            proven_height: height,
+            proven_hash: header.hash,
+        })
     }
 }
 
@@ -409,10 +411,9 @@ pub const BONDED_MINING_FROM: u64 = u64::MAX;
 /// verification any one block can demand.
 pub const MAX_REGISTRATIONS_PER_BLOCK: usize = 1;
 
-/// Registration weight: four units per 144-byte header and 256 for the ~8 KB
-/// proof, in line with what transaction data weighs per byte.
-const REGISTRATION_BASE_WEIGHT: u64 = 256;
-const REGISTRATION_WEIGHT_PER_HEADER: u64 = 4;
+/// Registration weight: 256 units for the ~8 KB proof, in line with what
+/// transaction data weighs per byte.
+const REGISTRATION_WEIGHT: u64 = 256;
 
 /// A registered bond as the chain's state holds it, keyed by bond id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,6 +421,10 @@ pub struct BondEntry {
     pub mining_key: [u8; 32],
     pub value: u64,
     pub bonded_until: u64,
+    /// The relay entry the bond was proven against: if a heavier midstate
+    /// branch replaces it, the bond is revoked.
+    pub proven_height: u64,
+    pub proven_hash: [u8; 32],
 }
 
 impl BondEntry {
@@ -439,6 +444,8 @@ pub fn bond_leaf(id: &[u8; 32], entry: &BondEntry) -> [u8; 32] {
             &entry.mining_key,
             &entry.value.to_le_bytes(),
             &entry.bonded_until.to_le_bytes(),
+            &entry.proven_height.to_le_bytes(),
+            &entry.proven_hash,
         ],
     )
 }
@@ -563,6 +570,23 @@ impl BondSet {
         }
         expired
     }
+
+    /// Removes every bond proven against a midstate header above `height`,
+    /// and returns them in id order: a heavier branch from `height` replaced
+    /// those headers, so their coins are no longer known to exist.
+    pub fn revoke_above(&mut self, height: u64) -> Vec<([u8; 32], BondEntry)> {
+        let mut revoked: Vec<([u8; 32], BondEntry)> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.proven_height > height)
+            .map(|(id, e)| (*id, *e))
+            .collect();
+        revoked.sort_by_key(|(id, _)| *id);
+        for (id, _) in &revoked {
+            self.remove(id);
+        }
+        revoked
+    }
 }
 
 impl BondRegistration {
@@ -571,17 +595,36 @@ impl BondRegistration {
         self.proof.coin.coin_id()
     }
 
-    /// The state entry this registration creates, once it has verified.
-    pub fn entry(&self) -> BondEntry {
-        BondEntry {
-            mining_key: self.proof.coin.script.mining_key,
-            value: self.proof.coin.value,
-            bonded_until: self.proof.coin.script.bonded_until,
-        }
+    /// Checks a registration against the midstate headers carried with it
+    /// (a bond file's): they link and carry valid proof of work, and the
+    /// proof rebuilds the state root of its header among them. Returns the
+    /// work credited above that header at `midwimble_target`. What the chain
+    /// accepts is decided against its relay ([`BondRegistration::verify`]);
+    /// this catches a bad file before it costs a block.
+    pub fn check_carried(
+        &self,
+        carried: &MidstateHeaders,
+        midwimble_target: &[u8; 32],
+    ) -> Result<u128> {
+        let index = self
+            .proof
+            .midstate_height
+            .checked_sub(carried.start)
+            .map(|i| i as usize)
+            .filter(|i| *i < carried.headers.len())
+            .ok_or_else(|| {
+                anyhow!("the carried midstate headers do not include the proof's header")
+            })?;
+        carried.verify()?;
+        self.proof.verify(&carried.headers[index].state_root)?;
+        Ok(credited_work(
+            &carried.headers[index + 1..],
+            midwimble_target,
+        ))
     }
 
     pub fn weight(&self) -> u64 {
-        REGISTRATION_BASE_WEIGHT + REGISTRATION_WEIGHT_PER_HEADER * self.headers.len() as u64
+        REGISTRATION_WEIGHT
     }
 }
 
@@ -661,6 +704,9 @@ pub struct MinerBond {
     /// The bond's registration, carried in this producer's blocks until the
     /// chain has it.
     pub registration: Option<BondRegistration>,
+    /// Midstate headers from the proof's header through its burial, relayed
+    /// by this producer's blocks where the relay lacks them.
+    pub midstate: Option<MidstateHeaders>,
     /// Bonds others locked naming this producer's mining key. Blocks are
     /// signed with whichever bond has the most fork-choice quota left.
     pub co_bonds: Vec<CoBond>,
@@ -673,6 +719,8 @@ pub struct CoBond {
     pub bond_id: [u8; 32],
     /// Carried in this producer's blocks, one a block, until the chain has it.
     pub registration: Option<BondRegistration>,
+    /// As [`MinerBond::midstate`].
+    pub midstate: Option<MidstateHeaders>,
 }
 
 impl std::fmt::Debug for MinerBond {
@@ -716,83 +764,62 @@ impl MinerBond {
     }
 }
 
-/// A registration for `mining_key` that meets the registration rule at
-/// `midwimble_target`, over a throwaway midstate-shaped state and headers.
-/// Fast-mining (devnet and test) builds only: it mines real headers with
-/// short extensions, which a real network's registrations could never use.
+/// Test-build bonds on a stand-in midstate (`relay::devnet`): each coin is
+/// locked, one header commits to all of them, and enough headers bury it to
+/// register at `midwimble_target` (with a quarter to spare, should the target
+/// harden). Returns each bond's registration and the headers, from the relay's
+/// root on, that a block relays so the registrations verify. Bonds that are to
+/// share a chain must come from one call: separate calls mine competing
+/// branches of the same relay root.
+///
+/// Fast-mining builds only: the headers are mined with short extensions,
+/// which a real network could never accept.
+#[cfg(feature = "fast-mining")]
+pub fn devnet_registrations(
+    bonds: &[([u8; 32], u64, [u8; 32])],
+    midwimble_target: &[u8; 32],
+) -> (Vec<BondRegistration>, MidstateHeaders) {
+    let mut midstate = super::relay::devnet::DevnetMidstate::new();
+    let coins: Vec<BondCoin> = bonds
+        .iter()
+        .map(|&(mining_key, bonded_until, salt)| BondCoin {
+            script: BondScript {
+                mining_key,
+                bonded_until,
+                owner_pk: hash(b"test bond owner"),
+            },
+            value: MIN_MINING_BOND,
+            salt,
+        })
+        .collect();
+    for coin in &coins {
+        midstate.lock(coin);
+    }
+    midstate.mine(1);
+    let registrations: Vec<BondRegistration> = coins
+        .iter()
+        .map(|coin| BondRegistration {
+            proof: midstate.prove(coin),
+        })
+        .collect();
+    let required = registration_work(midwimble_target);
+    let per = calculate_work(&midstate.target).min(registration_cap(midwimble_target));
+    let burial = (required + required / 4).div_ceil(per.max(1)) as u64 + 1;
+    midstate.mine(burial);
+    (registrations, midstate.mined.clone())
+}
+
+/// [`devnet_registrations`] for one bond.
 #[cfg(feature = "fast-mining")]
 pub fn devnet_registration(
     mining_key: [u8; 32],
     bonded_until: u64,
     salt: [u8; 32],
     midwimble_target: &[u8; 32],
-) -> BondRegistration {
-    use super::anchor::link_mining_hash;
-    use super::extension::create_extension;
-    use super::mmr::UtxoAccumulator;
-    let coin = BondCoin {
-        script: BondScript {
-            mining_key,
-            bonded_until,
-            owner_pk: hash(b"test bond owner"),
-        },
-        value: MIN_MINING_BOND,
-        salt,
-    };
-    let mut coins = UtxoAccumulator::new();
-    for i in 0..8u8 {
-        coins.insert(hash(&[i, 0xb0]), true);
-    }
-    coins.insert(coin.coin_id(), true);
-    let height = 300_000;
-    let roots = MidstateRoots {
-        coins: coins.root(true),
-        commitments: hash(b"commitments"),
-        chain_mmr: hash(b"chain mmr"),
-        burned_wots: Some(hash(b"burned")),
-    };
-    let proof = BondProof {
-        coin,
-        midstate_height: height,
-        roots,
-        smt: coins.prove(&coin.coin_id(), true).expect("the bond coin is a member"),
-    };
-    // Headers worth 256 units each, or the per-header cap if that is lower.
-    let mut header_target = [0xffu8; 32];
-    header_target[0] = 0;
-    let required = registration_work(midwimble_target);
-    let per = calculate_work(&header_target).min((required / REGISTRATION_MIN_HEADERS).max(1));
-    let above = (required / per) as u64 + 1;
-    let mine = |prev: [u8; 32], state_root: [u8; 32], i: u64| {
-        let mut link = HeaderLink {
-            post_tx_midstate: hash(&i.to_le_bytes()),
-            state_root,
-            timestamp: 1_800_000_000 + 60 * i,
-            target: header_target,
-            nonce: 0,
-            final_hash: [0; 32],
-        };
-        let mining = link_mining_hash(prev, &link);
-        loop {
-            let fin = create_extension(mining, link.nonce).final_hash;
-            if fin < header_target {
-                link.final_hash = fin;
-                return link;
-            }
-            link.nonce += 1;
-        }
-    };
-    let prev = hash(b"the header below the bond's");
-    let mut headers = vec![mine(prev, roots.state_root(height).unwrap(), 0)];
-    for i in 1..=above {
-        let last = headers.last().unwrap().final_hash;
-        headers.push(mine(last, hash(&i.to_be_bytes()), i));
-    }
-    BondRegistration {
-        proof,
-        prev_header_hash: prev,
-        headers,
-    }
+) -> (BondRegistration, MidstateHeaders) {
+    let (mut registrations, headers) =
+        devnet_registrations(&[(mining_key, bonded_until, salt)], midwimble_target);
+    (registrations.remove(0), headers)
 }
 
 // ── The producer's bond file and midstate RPC parsing ──────────────────────
@@ -817,6 +844,12 @@ pub struct BondFile {
     pub proof: Option<BondProof>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration: Option<BondRegistration>,
+    /// Midstate headers from the relay's tip when the registration was made
+    /// (or the proof's header, if the relay had it) through the proof's
+    /// burial. A producer relays whatever the chain still lacks of them, so a
+    /// bond can be registered without a midstate node feeding the relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midstate_headers: Option<MidstateHeaders>,
 }
 
 impl BondFile {
@@ -861,7 +894,11 @@ impl BondFile {
         if registration.proof.coin.script.mining_key != self.mining_key()? {
             bail!("this file's mining key is not the registered bond's");
         }
-        Ok(CoBond { bond_id: registration.bond_id(), registration: Some(registration) })
+        Ok(CoBond {
+            bond_id: registration.bond_id(),
+            registration: Some(registration),
+            midstate: self.midstate_headers.clone(),
+        })
     }
 
     /// What the node mines with. Needs a finished registration.
@@ -877,6 +914,7 @@ impl BondFile {
             secret: self.secret()?,
             bond_id: registration.bond_id(),
             registration: Some(registration),
+            midstate: self.midstate_headers.clone(),
         };
         let registered_key = bond.registration.as_ref().unwrap().proof.coin.script.mining_key;
         if bond.mining_key() != registered_key {
@@ -1128,24 +1166,27 @@ pub fn precheck_registrations(
         if bonds.contains_key(&id) {
             bail!("bond {} is already registered", hex::encode(id));
         }
-        let entry = registration.entry();
-        if entry.value < MIN_MINING_BOND {
+        let (value, bonded_until) = (
+            registration.proof.coin.value,
+            registration.proof.coin.script.bonded_until,
+        );
+        if value < MIN_MINING_BOND {
             bail!(
                 "bond {} locks {} units; a mining bond is at least {}",
                 hex::encode(id),
-                entry.value,
+                value,
                 MIN_MINING_BOND
             );
         }
-        if entry.bonded_until > horizon {
+        if bonded_until > horizon {
             bail!(
                 "bond {} is locked until midstate height {}; a registration may lock at most to {}",
                 hex::encode(id),
-                entry.bonded_until,
+                bonded_until,
                 horizon
             );
         }
-        if !entry.eligible_at(block_timestamp) {
+        if !eligible(value, bonded_until, block_timestamp) {
             bail!(
                 "bond {} is not eligible at this block's time: its lock ends too soon",
                 hex::encode(id)
@@ -1160,7 +1201,28 @@ mod cap_tests {
     use super::*;
 
     fn eligible_bond() -> BondEntry {
-        BondEntry { mining_key: [0u8; 32], value: MIN_MINING_BOND, bonded_until: u64::MAX }
+        BondEntry {
+            mining_key: [0u8; 32],
+            value: MIN_MINING_BOND,
+            bonded_until: u64::MAX,
+            proven_height: 0,
+            proven_hash: [0; 32],
+        }
+    }
+
+    /// Revocation removes exactly the bonds proven above the fork.
+    #[test]
+    fn revocation_removes_bonds_proven_above_a_fork() {
+        let at = |h: u64| BondEntry {
+            proven_height: h,
+            ..eligible_bond()
+        };
+        let mut set: BondSet = (0..10).map(|i| (bond_id(i), at(100 + i as u64))).collect();
+        let revoked = set.revoke_above(104);
+        let ids: Vec<[u8; 32]> = revoked.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, (5..10).map(bond_id).collect::<Vec<_>>());
+        assert_eq!(set.len(), 5);
+        assert!(set.revoke_above(104).is_empty());
     }
 
     /// A distinct bond id for each `i`, beyond the 256 a repeated byte allows.
@@ -1435,8 +1497,6 @@ mod cap_tests {
                     .prove(&[0; 32], true)
                     .unwrap(),
             },
-            prev_header_hash: [0; 32],
-            headers: vec![],
         };
         let edge = est_midstate_height(t) + MIN_REMAINING_BOND_LOCK;
         let none = BondSet::default();
@@ -1447,14 +1507,17 @@ mod cap_tests {
 
     #[test]
     fn a_producer_signs_with_the_bond_that_has_the_most_quota_left() {
+        let co = |id: [u8; 32]| CoBond {
+            bond_id: id,
+            registration: None,
+            midstate: None,
+        };
         let mut producer = MinerBond {
             secret: Scalar::from_bytes_mod_order([7u8; 32]),
             bond_id: [1; 32],
             registration: None,
-            co_bonds: vec![
-                CoBond { bond_id: [2; 32], registration: None },
-                CoBond { bond_id: [3; 32], registration: None },
-            ],
+            midstate: None,
+            co_bonds: vec![co([2; 32]), co([3; 32])],
         };
         let mine = BondEntry { mining_key: producer.mining_key(), ..eligible_bond() };
         let mut bonds = BondSet::default();
@@ -1472,7 +1535,7 @@ mod cap_tests {
         assert_eq!(producer.choose_signer(&bonds, &counts, 0), [1; 32]);
 
         // An unregistered co-bond is skipped, however much quota it has.
-        producer.co_bonds.push(CoBond { bond_id: [4; 32], registration: None });
+        producer.co_bonds.push(co([4; 32]));
         counts.insert([1; 32], 100);
         assert_eq!(producer.choose_signer(&bonds, &counts, 0), [2; 32]);
     }
@@ -1484,7 +1547,7 @@ mod tests {
     use crate::core::mmr::UtxoAccumulator;
 
     /// A real midstate mainnet header, height 297691, checked against its
-    /// predecessor's hash with the exact code registrations use. Production
+    /// predecessor's hash with the exact code the relay uses. Production
     /// builds only: it needs the real million-step extension.
     #[cfg(not(feature = "fast-mining"))]
     #[test]
@@ -1512,10 +1575,18 @@ mod tests {
                 135, 177, 254, 193, 74, 112, 88, 28, 39, 93, 45, 106, 77, 205,
             ],
         };
-        assert!(header_pow_ok(prev, &link, 0));
+        use crate::core::relay::RelayHeaders;
+        let relayed = |link: &HeaderLink| {
+            RelayHeaders {
+                prev,
+                headers: vec![link.clone()],
+            }
+            .verify_pow()
+        };
+        relayed(&link).unwrap();
         let mut flipped = link.clone();
         flipped.state_root[31] ^= 1;
-        assert!(!header_pow_ok(prev, &flipped, 0));
+        assert!(relayed(&flipped).is_err());
     }
 
     fn script() -> BondScript {
@@ -1727,117 +1798,101 @@ mod tests {
         assert_eq!(est_midstate_height(MIDSTATE_GENESIS_TIMESTAMP), CLOCK_MARGIN);
     }
 
-    /// Registrations mine real midstate-style headers, so these run with the
-    /// test build's short extensions.
+    /// Registrations against a relay of mined midstate headers, so these run
+    /// with the test build's short extensions.
     #[cfg(feature = "fast-mining")]
     mod registration {
         use super::*;
-        use crate::core::anchor::link_mining_hash;
-        use crate::core::extension::create_extension;
+        use crate::core::relay::devnet::DevnetMidstate;
+        use crate::core::relay::{relay_min_work, Relay, RelayHeaders};
 
-        /// About 64 units of work per header.
-        const HEADER_TARGET: [u8; 32] = {
-            let mut t = [0xff; 32];
-            t[0] = 0x03;
-            t
-        };
-        /// 3 units of work: a day is 4,320 units, capped at 72 a header, so 68
-        /// ordinary headers are enough and 60 are not.
+        /// 3 units of work: a day is 4,320 units, capped at 72 a header.
         const MW_TARGET: [u8; 32] = {
             let mut t = [0; 32];
             t[0] = 0x40;
             t
         };
 
-        fn mine(prev: [u8; 32], state_root: [u8; 32], target: [u8; 32], i: u64) -> HeaderLink {
-            let mut link = HeaderLink {
-                post_tx_midstate: hash(&i.to_le_bytes()),
-                state_root,
-                timestamp: 1_800_000_000 + 60 * i,
-                target,
-                nonce: 0,
-                final_hash: [0; 32],
+        /// A relay holding the stand-in's headers, and a registration for
+        /// `coin()` proven at its first header.
+        fn relayed(above: u64) -> (Relay, BondRegistration, DevnetMidstate) {
+            let mut ms = DevnetMidstate::new();
+            ms.lock(&coin());
+            ms.mine(1);
+            let registration = BondRegistration {
+                proof: ms.prove(&coin()),
             };
-            let mining = link_mining_hash(prev, &link);
-            loop {
-                let fin = create_extension(mining, link.nonce).final_hash;
-                if fin < target {
-                    link.final_hash = fin;
-                    return link;
-                }
-                link.nonce += 1;
-            }
-        }
-
-        /// The bond's proof header, with `n` ordinary headers on top.
-        fn registration(n: u64) -> BondRegistration {
-            let (proof, root) = proven(&coin(), 300_000);
-            let prev = hash(b"the header below the proof's");
-            let mut headers = vec![mine(prev, root, HEADER_TARGET, 0)];
-            for i in 1..=n {
-                let last = headers.last().unwrap().final_hash;
-                headers.push(mine(last, hash(&i.to_be_bytes()), HEADER_TARGET, i));
-            }
-            BondRegistration {
-                proof,
-                prev_header_hash: prev,
-                headers,
-            }
+            ms.mine(above);
+            let mut relay = Relay::genesis();
+            let run = ms.from_height(ms.mined.start);
+            relay
+                .extend(
+                    &RelayHeaders {
+                        prev: run.prev,
+                        headers: run.headers,
+                    },
+                    relay_min_work(&MW_TARGET),
+                )
+                .unwrap();
+            (relay, registration, ms)
         }
 
         #[test]
-        fn a_day_of_work_registers_the_bond() {
+        fn a_day_of_relayed_work_registers_the_bond() {
             assert_eq!(registration_work(&MW_TARGET), 4_320);
-            let bond = registration(70).verify(&MW_TARGET).unwrap();
-            assert_eq!(bond.id, coin().coin_id());
-            assert_eq!(bond.mining_key, [0x11; 32]);
+            // Each stand-in header is worth over 72 units: 60 are a day.
+            let (relay, reg, _) = relayed(60);
+            let entry = reg.verify(&relay, &MW_TARGET).unwrap();
+            assert_eq!(entry.mining_key, [0x11; 32]);
+            assert_eq!(entry.proven_height, reg.proof.midstate_height);
+            assert_eq!(
+                entry.proven_hash,
+                relay.get(entry.proven_height).unwrap().hash
+            );
         }
 
         #[test]
         fn less_than_a_day_does_not() {
-            assert!(registration(60).verify(&MW_TARGET).is_err());
+            let (relay, reg, _) = relayed(59);
+            let err = reg.verify(&relay, &MW_TARGET).unwrap_err().to_string();
+            assert!(err.contains("units of relayed midstate work"), "{err}");
         }
 
         /// The yardstick is the registering block's own target: the same
-        /// headers fall short once midwimble's hashrate has doubled.
+        /// headers fall short once midwimble's hashrate has grown past what
+        /// they carry (at 64 units a block, a day is more than 60 of them).
         #[test]
         fn the_bar_rises_with_midwimbles_hashrate() {
             let mut harder = MW_TARGET;
-            harder[0] = 0x20;
-            assert!(registration(70).verify(&harder).is_err());
+            harder[0] = 0x04;
+            let (relay, reg, _) = relayed(60);
+            assert!(
+                registration_cap(&harder) > relay.tip().work,
+                "each header now counts in full"
+            );
+            assert!(reg.verify(&relay, &harder).is_err());
         }
 
+        /// The header must be on the relay's chain, and the proof must match
+        /// its state root: a proof against any other header, a header the
+        /// relay never saw, or the root, is refused.
         #[test]
-        fn one_lucky_header_cannot_carry_the_day() {
-            let mut reg = registration(59);
-            let last = reg.headers.last().unwrap().final_hash;
-            let mut hard = [0xffu8; 32];
-            hard[0] = 0;
-            hard[1] = 0x03;
-            // Uncapped, this one header would be worth several days.
-            reg.headers.push(mine(last, hash(b"lucky"), hard, 60));
-            assert!(calculate_work(&hard) > registration_work(&MW_TARGET));
-            assert!(reg.verify(&MW_TARGET).is_err());
-        }
-
-        #[test]
-        fn broken_links_bad_work_and_wrong_roots_are_caught() {
-            let good = registration(70);
-            let mut swapped = good.clone();
-            swapped.headers.swap(10, 11);
-            assert!(swapped.verify(&MW_TARGET).is_err());
-            let mut forged = good.clone();
-            forged.headers[30].nonce ^= 1;
-            assert!(forged.verify(&MW_TARGET).is_err());
-            let mut elsewhere = good.clone();
-            elsewhere.headers[0].state_root = hash(b"another state");
-            assert!(elsewhere.verify(&MW_TARGET).is_err());
-            let mut bloated = good.clone();
-            let extra = good.headers[1].clone();
-            bloated
-                .headers
-                .extend(std::iter::repeat(extra).take(REGISTRATION_MAX_HEADERS));
-            assert!(bloated.verify(&MW_TARGET).is_err());
+        fn the_header_must_be_the_relays() {
+            let (relay, reg, ms) = relayed(60);
+            let mut elsewhere = reg.clone();
+            elsewhere.proof.midstate_height += 1;
+            assert!(elsewhere.verify(&relay, &MW_TARGET).is_err());
+            let mut unseen = reg.clone();
+            unseen.proof.midstate_height = ms.height() + 10;
+            let err = unseen.verify(&relay, &MW_TARGET).unwrap_err().to_string();
+            assert!(err.contains("not on the relay's chain"), "{err}");
+            let mut at_root = reg.clone();
+            at_root.proof.midstate_height = relay.base().height;
+            assert!(at_root.verify(&relay, &MW_TARGET).is_err());
+            // A coin the header's state does not hold.
+            let mut forged = reg.clone();
+            forged.proof.coin.value *= 2;
+            assert!(forged.verify(&relay, &MW_TARGET).is_err());
         }
     }
 }

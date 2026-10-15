@@ -19,6 +19,7 @@
 //! cumulative proof-of-work.
 
 use super::bond::{BondEntry, BondRegistration, BondSet, MinerAuth};
+use super::relay::{Relay, RelayEntry, RelayHeaders};
 use super::auxpow::AuxPow;
 use super::mmr::{MerkleMountainRange, UtxoAccumulator};
 use super::mw::crypto::{self, Point32, Scalar32, IDENTITY};
@@ -514,6 +515,8 @@ pub struct StateRootParts {
     pub supply: u64,
     /// Commitment to the registered bond set ([`BondSet::root`]).
     pub bonds_root: [u8; 32],
+    /// Commitment to the midstate relay ([`Relay::commitment`]).
+    pub relay_root: [u8; 32],
 }
 
 impl StateRootParts {
@@ -528,6 +531,7 @@ impl StateRootParts {
                 &self.total_kernel_offset,
                 &self.supply.to_le_bytes(),
                 &self.bonds_root,
+                &self.relay_root,
             ],
         )
     }
@@ -573,6 +577,9 @@ pub struct State {
     /// (`core/bond.rs`).
     #[serde(default)]
     pub bonds: BondSet,
+    /// Midstate's header chain as relayed by blocks (`core/relay.rs`).
+    #[serde(default)]
+    pub relay: Relay,
     /// Signers of the last `bond::CAP_WINDOW` blocks, oldest first (`None`
     /// for an unsigned block), and how many of them each bond signed. Not in
     /// the state root: it only weights fork choice (`bond::credit_work`), and
@@ -593,15 +600,19 @@ pub struct State {
     pub effects: std::sync::Arc<BlockEffects>,
 }
 
-/// What applying one block changed in the bond set: the diff storage
-/// persists and undoes, so the set is never copied whole.
+/// What applying one block changed in the bond set and the midstate relay:
+/// the diffs storage persists and undoes, so neither is ever copied whole.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockEffects {
     /// Bonds the block registered.
     pub bonds_added: Vec<([u8; 32], BondEntry)>,
-    /// Bonds removed before or by the block (no longer able to sign), as
-    /// they were.
+    /// Bonds removed before or by the block (expired, or revoked because a
+    /// heavier midstate branch replaced their header), as they were.
     pub bonds_removed: Vec<([u8; 32], BondEntry)>,
+    /// Relay entries the block added, and those it replaced or let fall out
+    /// of the window.
+    pub relay_added: Vec<RelayEntry>,
+    pub relay_removed: Vec<RelayEntry>,
 }
 
 impl State {
@@ -627,6 +638,7 @@ impl State {
         Self {
             mw_midstate: initial,
             bonds: BondSet::default(),
+            relay: Relay::genesis(),
             recent_signers: Default::default(),
             signer_counts: Default::default(),
             work_floor: Default::default(),
@@ -671,6 +683,7 @@ impl State {
         StateRootParts {
             utxo_root: self.utxo_set.root(true),
             bonds_root: self.bonds.root(),
+            relay_root: self.relay.commitment(),
             kernel_root: self.kernels.root(true),
             chain_mmr_root: self.chain_mmr.root(true),
             kernel_excess_sum: self.kernel_excess_sum,
@@ -761,6 +774,9 @@ pub struct Batch {
     /// Bonded-mining authorisation, required from `bond::BONDED_MINING_FROM`.
     #[serde(default)]
     pub miner: Option<MinerAuth>,
+    /// Midstate headers this block relays (`core/relay.rs`).
+    #[serde(default)]
+    pub relay: Option<RelayHeaders>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -809,19 +825,22 @@ pub fn fold_midstate(
 }
 
 /// [`fold_block`] without the miner's authorisation: what a bonded miner
-/// signs over. Registrations fold in after midstate's own items.
+/// signs over. Registrations fold in after midstate's own items, then any
+/// relayed midstate headers.
 pub fn fold_unsigned(prev_midstate: &[u8; 32], batch: &Batch) -> [u8; 32] {
-    let m = fold_midstate(
+    let mut m = fold_midstate(
         prev_midstate,
         &batch.body,
         batch.coinbase.as_ref(),
         &batch.state_root,
     );
-    if batch.registrations.is_empty() {
-        m
-    } else {
-        hash_concat(&m, &registrations_hash(&batch.registrations))
+    if !batch.registrations.is_empty() {
+        m = hash_concat(&m, &registrations_hash(&batch.registrations));
     }
+    if let Some(relay) = &batch.relay {
+        m = hash_concat(&m, &relay.hash());
+    }
+    m
 }
 
 /// Folds a whole block into the running midstate: midstate's fold, then the
@@ -861,6 +880,7 @@ impl Batch {
         self.body.weight()
             + self.coinbase.as_ref().map_or(0, Coinbase::weight)
             + self.registrations.iter().map(BondRegistration::weight).sum::<u64>()
+            + self.relay.as_ref().map_or(0, RelayHeaders::weight)
     }
 
     /// The canonical genesis block: no transactions, no reward.
@@ -894,6 +914,7 @@ impl Batch {
             Batch {
                 registrations: Vec::new(),
                 miner: None,
+                relay: None,
                 prev_midstate: state.mw_midstate,
                 prev_header_hash: state.header_hash,
                 body,
