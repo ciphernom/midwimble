@@ -19,6 +19,7 @@ use crate::core::state::{calculate_target, calculate_work, current_timestamp, va
 use crate::core::types::{compute_header_hash, MEDIAN_TIME_PAST_WINDOW};
 use crate::core::{Batch, BatchHeader, State};
 use anyhow::{bail, Context as _, Result};
+use libp2p::request_response::OutboundRequestId;
 use libp2p::PeerId;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -235,12 +236,16 @@ pub struct HeaderSync {
     /// Resuming: the first header returned must be this one.
     pub expect_overlap: Option<[u8; 32]>,
     pub resumed: bool,
+    /// The outstanding header request, so its reply can be held to it.
+    pub request: Option<OutboundRequestId>,
 }
 
 pub struct InFlight {
     pub peer: PeerId,
     pub count: u64,
     pub sent: Instant,
+    /// The request, so its reply can be held to it.
+    pub request: Option<OutboundRequestId>,
 }
 
 /// Downloaded blocks waiting for their turn to be applied.
@@ -305,7 +310,8 @@ pub struct SyncSession {
     /// The peer whose chain we are adopting; headers come only from it.
     pub peer: PeerId,
     pub peer_height: u64,
-    /// The chain weight the peer claimed (`State::weight`).
+    /// The chain weight the peer claimed when the session started
+    /// (`State::weight`): what its headers must reach.
     pub peer_weight: u128,
     pub step_back: u64,
     /// When the peer last sent something useful, or our own work on the
@@ -349,6 +355,92 @@ impl SyncSession {
 impl Drop for SyncSession {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+// ── Accountability ──────────────────────────────────────────────────────────
+//
+// Claiming a heavier chain costs a peer nothing; following the claim costs us
+// a session, and only one runs at a time. So a claim has to be backed: a peer
+// whose session ends without headers that reach the weight it claimed, or
+// that goes quiet, is struck and barred from starting another session for a
+// while, longer each time, and banned at the third strike. A peer that merely
+// could not serve us is barred for a while without a strike.
+
+/// Sessions a peer may fail to back before it is banned.
+pub const SYNC_STRIKES_TO_BAN: u32 = 3;
+/// How long a peer is barred after its first strike, or after a session it
+/// could not serve (`NodeConfig::sync_cooldown`). Each further strike
+/// doubles it.
+pub const SYNC_COOLDOWN_SECS: u64 = 30;
+/// Peers whose record is kept.
+const MAX_SYNC_RECORDS: usize = 4096;
+
+/// What a session's end says about its peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Blame {
+    /// Nothing: the session finished, or showed that our chain had caught up.
+    None,
+    /// The peer could not serve us (it went away, is ahead of our clock, is
+    /// on a fork we cannot follow), or our own side failed: no misbehaviour,
+    /// but no immediate retry either.
+    Pause,
+    /// The peer claimed a heavier chain and did not back the claim.
+    Strike,
+}
+
+/// Per-peer sync record: strikes, and until when a peer may not start a
+/// session.
+#[derive(Debug, Default)]
+pub struct SyncRecord {
+    peers: HashMap<PeerId, (u32, Instant)>,
+}
+
+impl SyncRecord {
+    /// Records how a session with `peer` ended. Returns whether the peer is
+    /// now to be banned.
+    pub fn record(&mut self, peer: PeerId, blame: Blame, cooldown: Duration) -> bool {
+        if blame == Blame::None {
+            return false;
+        }
+        let now = Instant::now();
+        if self.peers.len() >= MAX_SYNC_RECORDS && !self.peers.contains_key(&peer) {
+            self.peers
+                .retain(|_, (strikes, until)| *strikes > 0 || *until > now);
+            if self.peers.len() >= MAX_SYNC_RECORDS {
+                self.peers.clear();
+            }
+        }
+        let (strikes, until) = self.peers.entry(peer).or_insert((0, now));
+        match blame {
+            Blame::None => {}
+            Blame::Pause => *until = (*until).max(now + cooldown),
+            Blame::Strike => {
+                *strikes += 1;
+                if *strikes >= SYNC_STRIKES_TO_BAN {
+                    self.peers.remove(&peer);
+                    return true;
+                }
+                *until = now + cooldown * 2u32.pow(*strikes - 1);
+            }
+        }
+        false
+    }
+
+    /// Whether `peer` may not start a session now.
+    pub fn barred(&self, peer: &PeerId) -> bool {
+        self.peers
+            .get(peer)
+            .is_some_and(|(_, until)| *until > Instant::now())
+    }
+
+    pub fn strikes(&self, peer: &PeerId) -> u32 {
+        self.peers.get(peer).map_or(0, |(strikes, _)| *strikes)
+    }
+
+    /// A session with `peer` brought us its chain: its record is clean.
+    pub fn succeeded(&mut self, peer: &PeerId) {
+        self.peers.remove(peer);
     }
 }
 
@@ -505,6 +597,7 @@ mod tests {
                 done: false,
                 expect_overlap: None,
                 resumed: false,
+                request: None,
             },
             blocks,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -530,6 +623,55 @@ mod tests {
         // A stuck task still ends the session eventually.
         let stuck = LOCAL_WORK_TIMEOUT + minute;
         assert!(session(true, None, stuck).timed_out(idle));
+    }
+
+    /// Unbacked claims are struck, barred for longer each time and banned at
+    /// the third strike; pauses bar without striking; a finished session
+    /// clears the record.
+    #[test]
+    fn peers_that_do_not_back_their_claims_are_struck_then_banned() {
+        let cooldown = Duration::from_secs(30);
+        let mut record = SyncRecord::default();
+        let liar = PeerId::random();
+        assert!(!record.barred(&liar));
+        assert!(!record.record(liar, Blame::Strike, cooldown));
+        assert!(record.barred(&liar));
+        assert_eq!(record.strikes(&liar), 1);
+        assert!(!record.record(liar, Blame::Strike, cooldown));
+        let barred_for = record.peers[&liar].1 - Instant::now();
+        assert!(
+            barred_for > cooldown && barred_for <= cooldown * 2,
+            "doubled"
+        );
+        assert!(
+            record.record(liar, Blame::Strike, cooldown),
+            "banned at the third"
+        );
+        assert_eq!(record.strikes(&liar), 0, "forgotten once banned");
+
+        let slow = PeerId::random();
+        for _ in 0..SYNC_STRIKES_TO_BAN + 1 {
+            assert!(!record.record(slow, Blame::Pause, cooldown));
+        }
+        assert!(record.barred(&slow));
+        assert_eq!(record.strikes(&slow), 0, "pauses are not strikes");
+        assert!(!record.record(slow, Blame::None, Duration::ZERO));
+        assert!(
+            record.barred(&slow),
+            "nothing lifts a bar early but success"
+        );
+
+        let honest = PeerId::random();
+        record.record(honest, Blame::Strike, cooldown);
+        record.succeeded(&honest);
+        assert!(!record.barred(&honest));
+        assert_eq!(record.strikes(&honest), 0);
+
+        // Short cooldowns expire.
+        let quick = PeerId::random();
+        record.record(quick, Blame::Pause, Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!record.barred(&quick));
     }
 
     #[test]

@@ -651,3 +651,138 @@ async fn forged_anchor_gossip_gets_the_sender_banned() {
     attacker.abort();
     a.stop().await;
 }
+
+/// How a lying peer answers the sync requests its claim draws.
+#[derive(Clone)]
+enum Lie {
+    /// An acknowledgement, whatever was asked: the review's stall.
+    Acks,
+    /// No headers at all.
+    NoHeaders,
+    /// The honest chain's headers, which weigh far less than it claims.
+    HonestHeaders(NodeHandle),
+    /// Nothing: header requests are held unanswered.
+    Silence,
+}
+
+/// A peer that dials `target` and claims the heaviest chain there can be,
+/// every 50 ms, answering as `lie` says. Returns its peer id.
+async fn start_liar(target: String, lie: Lie) -> String {
+    use midwimble::network::{Message, Network, NetworkEvent};
+    let mut net = Network::new(
+        libp2p::identity::Keypair::generate_ed25519(),
+        "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+        vec![target.parse().unwrap()],
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let id = net.local_peer_id().to_string();
+    let claim = Message::StateInfo {
+        height: 1_000_000,
+        depth: u128::MAX,
+        weight: u128::MAX,
+        mw_midstate: [0; 32],
+    };
+    tokio::spawn(async move {
+        let mut victim = None;
+        let mut held = Vec::new();
+        let mut tick = tokio::time::interval(Duration::from_millis(50));
+        loop {
+            tokio::select! {
+                event = net.next_event() => match event {
+                    NetworkEvent::PeerConnected(peer, _) => victim = Some(peer),
+                    NetworkEvent::MessageReceived { message, channel: Some(channel), .. } => {
+                        let reply = match (&lie, message) {
+                            (_, Message::GetState) => Some(claim.clone()),
+                            (Lie::NoHeaders, Message::GetHeaders { start_height, .. }) => {
+                                Some(Message::Headers { start_height, headers: vec![] })
+                            }
+                            (Lie::HonestHeaders(source), Message::GetHeaders { start_height, count }) => {
+                                Some(Message::Headers {
+                                    start_height,
+                                    headers: source.storage().load_headers(start_height, count.min(5000)).unwrap(),
+                                })
+                            }
+                            (Lie::Silence, Message::GetHeaders { .. }) => None,
+                            _ => Some(Message::Pong { nonce: 0 }),
+                        };
+                        match reply {
+                            Some(reply) => net.respond(channel, reply),
+                            None => held.push(channel),
+                        }
+                    }
+                    _ => {}
+                },
+                _ = tick.tick() => {
+                    if let Some(victim) = victim {
+                        net.send(victim, claim.clone());
+                    }
+                }
+            }
+        }
+    });
+    id
+}
+
+/// The review's stall, and the other ways a peer can claim a heavier chain
+/// and not back it. While a session with a liar only fetches headers, the
+/// node keeps taking the honest producer's blocks; and every liar is banned:
+/// at once for a wrong reply, and after three strikes for no headers,
+/// headers lighter than its claim, or silence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peers_that_lie_about_their_chain_neither_stall_the_node_nor_stay() {
+    let producer = TestNode::start(Some(WalletKeys::random().address()), vec![]).await;
+    let peers = vec![producer.dial_addr().await];
+    let follower = TestNode::start_tuned(None, peers, Duration::from_millis(250), None, |config| {
+        config.sync_timeout = Duration::from_secs(2);
+        config.sync_cooldown = Duration::from_millis(300);
+    })
+    .await;
+    wait_until("the follower to catch up", 60, || {
+        producer.height() > 5 && follower.height() + 1 >= producer.height()
+    })
+    .await;
+
+    let target = follower.dial_addr().await;
+    let liars = [
+        start_liar(target.clone(), Lie::Acks).await,
+        start_liar(target.clone(), Lie::NoHeaders).await,
+        start_liar(target.clone(), Lie::HonestHeaders(producer.handle.clone())).await,
+        start_liar(target.clone(), Lie::Silence).await,
+    ];
+    wait_until("the liars to connect", 20, || {
+        let peers = follower.handle.info().peers;
+        liars.iter().filter(|l| peers.contains(*l)).count() >= 2
+    })
+    .await;
+
+    // The follower keeps up while they lie.
+    let (start, mut worst) = (producer.height(), 0);
+    let until = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < until {
+        worst = worst.max(producer.height().saturating_sub(follower.height()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(producer.height() >= start + 10, "the producer kept mining");
+    assert!(
+        worst <= 8,
+        "the follower fell {worst} blocks behind the producer"
+    );
+    assert!(follower.stats().sessions > 0, "the liars were heard");
+
+    // And every one of them is banned.
+    producer.handle.set_mining(None);
+    wait_until("the liars to be banned", 60, || {
+        let peers = follower.handle.info().peers;
+        liars.iter().all(|l| !peers.contains(l))
+    })
+    .await;
+    wait_until("the follower to reach the producer's tip", 30, || {
+        follower.tip() == producer.tip()
+    })
+    .await;
+
+    follower.stop().await;
+    producer.stop().await;
+}

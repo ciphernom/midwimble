@@ -203,7 +203,16 @@ Midstate anchors serve as the horizon instead.
   limiter.
 - **Dandelion++:** expired stem transactions are aggregated before fluffing.
 - **Sync:**
-  - headers first, with SIMD proof-of-work checks;
+  - headers first, with SIMD proof-of-work checks, comparing chains by the
+    weight fork choice uses;
+  - while a session is only fetching and checking a peer's headers, the node
+    keeps taking blocks and mining; it stops only to download a chain whose
+    verified headers outweigh its own;
+  - a claimed heavier chain has to be backed: a peer whose headers fall short
+    of its claim, or that goes quiet, is struck and barred for a while (longer
+    each time) and banned at the third strike, and one that answers a sync
+    request with anything else is banned at once. Peers this node dialed are
+    preferred to peers that dialed it;
   - blocks downloaded from several peers at once, with resume from verified
     headers after a restart;
   - reorgs committed atomically;

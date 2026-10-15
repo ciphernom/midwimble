@@ -64,14 +64,14 @@ use crate::network::{Message, Network, NetworkEvent, MAX_GETBATCHES_COUNT, MAX_G
 use crate::storage::FinalityInfo;
 use crate::storage::Storage;
 use crate::sync::{
-    verify_header_chain_with, BlockSync, Chunk, HeaderSync, InFlight, SyncSession, SyncStats,
-    BATCH_LOOKAHEAD_BLOCKS, BATCH_REQUEST_TIMEOUT_SECS, HEADERS_PER_REQUEST, INITIAL_STEP_BACK,
-    MAX_BATCH_REQUESTS_IN_FLIGHT, MAX_BUFFER_BYTES, MAX_QUEUED_HEADER_CHUNKS, MAX_REORG_DEPTH,
-    SYNC_TIMEOUT_SECS,
+    verify_header_chain_with, Blame, BlockSync, Chunk, HeaderSync, InFlight, SyncRecord,
+    SyncSession, SyncStats, BATCH_LOOKAHEAD_BLOCKS, BATCH_REQUEST_TIMEOUT_SECS,
+    HEADERS_PER_REQUEST, INITIAL_STEP_BACK, MAX_BATCH_REQUESTS_IN_FLIGHT, MAX_BUFFER_BYTES,
+    MAX_QUEUED_HEADER_CHUNKS, MAX_REORG_DEPTH, SYNC_COOLDOWN_SECS, SYNC_TIMEOUT_SECS,
 };
 use anyhow::{anyhow, bail, Context as _, Result};
 use libp2p::identity::Keypair;
-use libp2p::request_response::ResponseChannel;
+use libp2p::request_response::{OutboundRequestId, ResponseChannel};
 use libp2p::{Multiaddr, PeerId};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -140,6 +140,10 @@ pub struct NodeConfig {
     /// A sync session whose peer sends nothing for this long is dropped.
     /// Time this node spends verifying and applying does not count.
     pub sync_timeout: Duration,
+    /// How long a peer that did not back a claimed chain, or could not
+    /// serve it, may not start another session (doubling with each strike;
+    /// `sync::SyncRecord`).
+    pub sync_cooldown: Duration,
     /// A midstate node's RPC (`host:port`), polled for the headers this
     /// node's blocks relay (`core/relay.rs`). Registrations need midstate's
     /// chain relayed, so every producer should set one.
@@ -172,6 +176,7 @@ impl NodeConfig {
             checkpoint: None,
             bootstrap_timeout: Duration::from_secs(600),
             sync_timeout: Duration::from_secs(SYNC_TIMEOUT_SECS),
+            sync_cooldown: Duration::from_secs(SYNC_COOLDOWN_SECS),
             midstate_rpc: None,
             relay_poll: Duration::from_secs(20),
             #[cfg(feature = "fast-mining")]
@@ -187,6 +192,9 @@ pub struct NodeInfo {
     pub peer_id: String,
     pub peers: Vec<String>,
     pub listen_addrs: Vec<String>,
+    /// Downloading a heavier chain's blocks: the chain is about to change,
+    /// so templates are stale. (While a session only fetches and checks a
+    /// peer's headers, the node keeps taking blocks and mining.)
     pub syncing: bool,
     pub mempool_count: usize,
     pub mempool_weight: u64,
@@ -463,7 +471,7 @@ impl OrphanPool {
 enum HeaderStep {
     Continue,
     Ban(&'static str),
-    Abort(&'static str),
+    Abort(&'static str, Blame),
     Restart { step_back: u64, allow_resume: bool },
 }
 
@@ -490,6 +498,7 @@ pub struct Node {
     sync: Option<SyncSession>,
     next_session_id: u64,
     sync_stats: SyncStats,
+    sync_record: SyncRecord,
     batch_sources: HashSet<PeerId>,
     miner: Miner,
     mined_rx: mpsc::UnboundedReceiver<MinedBlock>,
@@ -655,6 +664,7 @@ impl Node {
             sync: None,
             next_session_id: 1,
             sync_stats: SyncStats::default(),
+            sync_record: SyncRecord::default(),
             batch_sources: HashSet::new(),
             miner,
             mined_rx,
@@ -741,7 +751,7 @@ impl Node {
                 _ = fast.tick() => {
                     self.flush_stem_pool();
                     self.check_sync_timeouts();
-                    if self.config.mine_to.is_some() && !self.miner.is_running() && self.sync.is_none() {
+                    if self.config.mine_to.is_some() && !self.miner.is_running() && !self.chain_syncing() {
                         self.refresh_mining();
                     }
                     self.publish_info();
@@ -774,7 +784,7 @@ impl Node {
             .iter()
             .map(|a| a.to_string())
             .collect();
-        info.syncing = self.sync.is_some();
+        info.syncing = self.chain_syncing();
         info.mempool_count = self.mempool.len();
         info.mempool_weight = self.mempool.total_weight();
         info.mining = self.config.mine_to.is_some();
@@ -817,13 +827,14 @@ impl Node {
 
     fn ban_peer(&mut self, peer: PeerId, reason: &str) {
         tracing::warn!("Banning peer {}: {}", peer, reason);
+        // Gone before the session ends, so the next one cannot pick it.
+        self.peer_tips.remove(&peer);
+        self.network.ban_peer(peer);
         if self.sync.as_ref().map_or(false, |s| s.peer == peer) {
             // Whatever it made us verify is suspect; do not resume from it.
             let _ = self.storage.clear_sync_headers();
-            self.abort_sync("sync peer banned");
+            self.abort_sync("sync peer banned", Blame::None);
         }
-        self.peer_tips.remove(&peer);
-        self.network.ban_peer(peer);
     }
 
     fn respond(&mut self, channel: Option<ResponseChannel<Message>>, msg: Message) {
@@ -928,7 +939,16 @@ impl Node {
                 peer,
                 message,
                 channel,
-            } => self.handle_message(peer, message, channel),
+                request,
+            } => {
+                if let Some(id) = request {
+                    if !self.answers_sync_request(id, &message) {
+                        self.ban_peer(peer, "answered a sync request with something else");
+                        return;
+                    }
+                }
+                self.handle_message(peer, message, channel)
+            }
             NetworkEvent::LightRequest {
                 peer,
                 request,
@@ -1002,11 +1022,20 @@ impl Node {
             Message::GetHeaders {
                 start_height,
                 count,
-            } => self.serve(peer, channel, move |storage| Message::Headers {
-                start_height,
-                headers: storage
+            } => self.serve(peer, channel, move |storage| {
+                let mut headers = storage
                     .load_headers(start_height, count.min(MAX_GETHEADERS_COUNT))
-                    .unwrap_or_default(),
+                    .unwrap_or_default();
+                // Only a run from the height asked for: a node started from a
+                // snapshot has no headers below it, and later ones alone
+                // would look mislabelled.
+                if headers.first().is_some_and(|h| h.height != start_height) {
+                    headers.clear();
+                }
+                Message::Headers {
+                    start_height,
+                    headers,
+                }
             }),
             Message::Headers {
                 start_height,
@@ -1204,7 +1233,7 @@ impl Node {
             let _ = reply.send(Ok(()));
             return;
         }
-        if self.sync.is_some() {
+        if self.chain_syncing() {
             let _ = reply.send(Err(anyhow!("node is syncing; template is stale")));
             return;
         }
@@ -1217,8 +1246,11 @@ impl Node {
     }
 
     fn handle_new_batch(&mut self, batch: Batch, from: Option<PeerId>) {
-        // An active sync owns chain changes; it re-polls its peer at the end.
-        if self.sync.is_some() {
+        // A session downloading a heavier chain owns chain changes; it
+        // re-polls its peer at the end. One that is still checking a peer's
+        // headers does not: until they prove a heavier chain, the node keeps
+        // following the one it is on.
+        if self.chain_syncing() {
             return;
         }
         let hash = batch.extension.final_hash;
@@ -1297,7 +1329,7 @@ impl Node {
     ) {
         self.block_validation = None;
         let hash = batch.extension.final_hash;
-        if self.sync.is_some() {
+        if self.chain_syncing() {
             self.resolve_block(&hash, Err("node started syncing".into()));
         } else {
             if parent != self.state.header_hash {
@@ -1367,7 +1399,7 @@ impl Node {
             }
             return;
         }
-        if self.sync.is_some() {
+        if self.chain_syncing() {
             return;
         }
         if batch.prev_header_hash == self.state.header_hash {
@@ -1626,14 +1658,79 @@ impl Node {
         if let Some(s) = self.sync.as_mut() {
             if s.peer == peer {
                 s.peer_height = s.peer_height.max(height);
-                s.peer_weight = s.peer_weight.max(weight);
+            }
+            // Anyone can connect to us and claim a heavier chain; a peer we
+            // dialed is likelier to be honest. Until a session with an
+            // inbound peer has verified a heavier chain, an outbound peer's
+            // claim takes its place.
+            let preempt = s.peer != peer
+                && s.blocks.is_none()
+                && weight > self.state.weight()
+                && self.network.is_outbound(&peer)
+                && !self.network.is_outbound(&s.peer)
+                && !self.sync_record.barred(&peer);
+            if preempt {
+                self.abort_sync("an outbound peer claims a heavier chain", Blame::Pause);
+                return;
             }
             // A newly known peer may be able to serve blocks.
             self.schedule_batch_requests();
             return;
         }
-        if weight > self.state.weight() {
+        self.sync_from_best_peer();
+    }
+
+    /// Whether a session is downloading a heavier chain's blocks, the only
+    /// time sync keeps the node from taking blocks and mining.
+    fn chain_syncing(&self) -> bool {
+        self.sync.as_ref().is_some_and(|s| s.blocks.is_some())
+    }
+
+    /// Starts a session with the best peer to sync from, if any claims a
+    /// heavier chain than ours: peers we dialed first, then the heaviest
+    /// claim, skipping peers barred by their sync record.
+    fn sync_from_best_peer(&mut self) {
+        if self.sync.is_some() {
+            return;
+        }
+        let ours = self.state.weight();
+        let connected: HashSet<PeerId> = self.network.connected_peers().into_iter().collect();
+        let best = self
+            .peer_tips
+            .iter()
+            .filter(|(p, (_, w))| {
+                *w > ours && connected.contains(*p) && !self.sync_record.barred(p)
+            })
+            .max_by_key(|(p, (_, w))| (self.network.is_outbound(p), *w))
+            .map(|(p, (h, w))| (*p, *h, *w));
+        if let Some((peer, height, weight)) = best {
             self.start_sync(peer, height, weight, INITIAL_STEP_BACK, true);
+        }
+    }
+
+    /// Whether `message`, the response to request `id`, is the kind that
+    /// request asks for if it is one of this session's. Honest nodes answer
+    /// a header request with headers and a block request with blocks, from
+    /// the height asked, or not at all; anything else is a lie told to keep
+    /// a session open.
+    fn answers_sync_request(&self, id: OutboundRequestId, message: &Message) -> bool {
+        let Some(s) = self.sync.as_ref() else {
+            return true;
+        };
+        if s.headers.request == Some(id) {
+            return matches!(message, Message::Headers { start_height, .. }
+                if *start_height == s.headers.next_fetch);
+        }
+        let asked = s.blocks.as_ref().and_then(|b| {
+            b.in_flight
+                .iter()
+                .find(|(_, f)| f.request == Some(id))
+                .map(|(start, _)| *start)
+        });
+        match asked {
+            Some(start) => matches!(message, Message::Batches { start_height, .. }
+                if *start_height == start),
+            None => true,
         }
     }
 
@@ -1725,6 +1822,7 @@ impl Node {
                     expect_overlap: Some(last.extension.final_hash),
                     resumed: true,
                     tip: Some(last),
+                    request: None,
                 }
             }
             None => {
@@ -1762,6 +1860,7 @@ impl Node {
                     done: false,
                     expect_overlap: None,
                     resumed: false,
+                    request: None,
                 }
             }
         };
@@ -1783,26 +1882,45 @@ impl Node {
             blocks: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
-        self.miner.stop();
         self.request_headers();
         self.maybe_start_blocks();
         self.schedule_batch_requests();
         self.publish_info();
     }
 
-    fn abort_sync(&mut self, reason: &str) {
+    /// Ends the session, holds its peer to `blame` (`sync::SyncRecord`),
+    /// and starts one with the next best peer.
+    fn abort_sync(&mut self, reason: &str, blame: Blame) {
         if let Some(s) = self.sync.take() {
-            tracing::info!("Sync with {} ended: {}", s.peer, reason);
+            let peer = s.peer;
+            drop(s);
+            tracing::info!("Sync with {} ended: {}", peer, reason);
+            if self
+                .sync_record
+                .record(peer, blame, self.config.sync_cooldown)
+            {
+                self.ban_peer(
+                    peer,
+                    &format!("{reason}, again: it does not back its claims"),
+                );
+            } else if blame == Blame::Strike {
+                tracing::info!(
+                    "Peer {} did not back its claimed chain (strike {})",
+                    peer,
+                    self.sync_record.strikes(&peer)
+                );
+            }
         }
         self.refresh_mining();
         self.publish_info();
+        self.sync_from_best_peer();
     }
 
     fn peer_unavailable(&mut self, peer: PeerId) {
         let Some(s) = self.sync.as_mut() else { return };
         if s.peer == peer {
             // Keep verified headers: another session can resume from them.
-            self.abort_sync("sync peer unavailable");
+            self.abort_sync("sync peer unavailable", Blame::Pause);
             return;
         }
         if let Some(b) = s.blocks.as_mut() {
@@ -1825,7 +1943,8 @@ impl Node {
     fn check_sync_timeouts(&mut self) {
         let Some(s) = self.sync.as_mut() else { return };
         if s.timed_out(self.config.sync_timeout) {
-            self.abort_sync("timed out");
+            // The peer went quiet while we waited on it, not on ourselves.
+            self.abort_sync("timed out", Blame::Strike);
             return;
         }
         let session_peer = s.peer;
@@ -1851,7 +1970,7 @@ impl Node {
     fn maybe_finish_sync(&mut self) {
         enum Verdict {
             Wait,
-            Abort(&'static str),
+            Abort(&'static str, Blame),
             Done(PeerId),
         }
         let verdict = match self.sync.as_ref() {
@@ -1861,15 +1980,24 @@ impl Node {
                 if !(h.done && h.queue.is_empty() && !h.verifying && !h.fetch_in_flight) {
                     Verdict::Wait
                 } else {
+                    // The peer has shown all it has. An honest peer's chain
+                    // only gets heavier, so its headers reach at least what
+                    // it claimed when the session started; if ours outgrew
+                    // them meanwhile, that is no fault of the peer's.
+                    let lied = h.verified_weight < s.peer_weight;
+                    let blame = |otherwise| if lied { Blame::Strike } else { otherwise };
                     match &s.blocks {
-                        None if h.fork.is_none() => Verdict::Abort("peer has nothing new"),
-                        None => Verdict::Abort("peer chain is not heavier"),
+                        None if h.fork.is_none() => {
+                            Verdict::Abort("peer has nothing new", blame(Blame::None))
+                        }
+                        None => Verdict::Abort("peer chain is not heavier", blame(Blame::None)),
                         Some(b) if b.applying || b.rebuilding || b.cursor < h.verified_to => {
                             Verdict::Wait
                         }
-                        Some(b) if !b.committed => {
-                            Verdict::Abort("downloaded chain did not end up heavier")
-                        }
+                        Some(b) if !b.committed => Verdict::Abort(
+                            "downloaded chain did not end up heavier",
+                            blame(Blame::Pause),
+                        ),
                         Some(_) => Verdict::Done(s.peer),
                     }
                 }
@@ -1877,9 +2005,9 @@ impl Node {
         };
         match verdict {
             Verdict::Wait => {}
-            Verdict::Abort(reason) => {
+            Verdict::Abort(reason, blame) => {
                 let _ = self.storage.clear_sync_headers();
-                self.abort_sync(reason);
+                self.abort_sync(reason, blame);
             }
             Verdict::Done(peer) => {
                 tracing::info!(
@@ -1888,9 +2016,11 @@ impl Node {
                     self.state.height
                 );
                 self.sync = None;
+                self.sync_record.succeeded(&peer);
                 self.network.send(peer, Message::GetState);
                 self.refresh_mining();
                 self.publish_info();
+                self.sync_from_best_peer();
             }
         }
     }
@@ -1910,13 +2040,14 @@ impl Node {
         h.fetch_deferred = false;
         h.fetch_in_flight = true;
         let (peer, start) = (s.peer, h.next_fetch);
-        self.network.send(
+        let id = self.network.request(
             peer,
             Message::GetHeaders {
                 start_height: start,
                 count: HEADERS_PER_REQUEST,
             },
         );
+        h.request = Some(id);
     }
 
     fn on_headers(&mut self, peer: PeerId, start_height: u64, chunk: Vec<BatchHeader>) {
@@ -1928,6 +2059,7 @@ impl Node {
             return;
         }
         s.headers.fetch_in_flight = false;
+        s.headers.request = None;
         s.last_progress = Instant::now();
         let step = self.examine_headers(&mut s, chunk);
         let (height, weight) = (s.peer_height, s.peer_weight);
@@ -1939,7 +2071,7 @@ impl Node {
                 self.maybe_finish_sync();
             }
             HeaderStep::Ban(reason) => self.ban_peer(peer, reason),
-            HeaderStep::Abort(reason) => self.abort_sync(reason),
+            HeaderStep::Abort(reason, blame) => self.abort_sync(reason, blame),
             HeaderStep::Restart {
                 step_back: new_step,
                 allow_resume,
@@ -1973,7 +2105,9 @@ impl Node {
         }
         if chunk.is_empty() {
             if h.tip.is_none() {
-                return HeaderStep::Abort("peer returned no headers");
+                // It claimed a heavier chain than ours and has no headers
+                // past our tip's neighbourhood.
+                return HeaderStep::Abort("peer returned no headers", Blame::Strike);
             }
             if !full {
                 h.done = true;
@@ -1992,7 +2126,9 @@ impl Node {
                 if chunk[0].prev_header_hash != tip.extension.final_hash
                     || chunk[0].prev_midstate != tip.post_tx_midstate
                 {
-                    return HeaderStep::Ban("header chunks do not link");
+                    // A reorganisation on the peer's side between two
+                    // requests looks the same, so a strike, not a ban.
+                    return HeaderStep::Abort("header chunks do not link", Blame::Strike);
                 }
             }
             None => {
@@ -2016,7 +2152,7 @@ impl Node {
                     // The fork is deeper than we looked: step further back.
                     let step_back = s.step_back.saturating_mul(8);
                     if step_back > MAX_REORG_DEPTH.saturating_mul(8) {
-                        return HeaderStep::Abort("fork deeper than the reorg limit");
+                        return HeaderStep::Abort("fork deeper than the reorg limit", Blame::Pause);
                     }
                     return HeaderStep::Restart {
                         step_back,
@@ -2088,7 +2224,10 @@ impl Node {
             self.sync = Some(s);
             if crate::core::state::is_future_timestamp(&e) {
                 // Ahead of our clock, not invalid: try again later.
-                self.abort_sync(&format!("peer's headers are ahead of our clock: {e:#}"));
+                self.abort_sync(
+                    &format!("peer's headers are ahead of our clock: {e:#}"),
+                    Blame::Pause,
+                );
             } else {
                 self.ban_peer(peer, &format!("invalid header chain: {e:#}"));
             }
@@ -2147,6 +2286,7 @@ impl Node {
                         let _ = self.storage.clear_sync_headers();
                         self.abort_sync(
                             "reorg below the finalized checkpoint or deeper than the limit",
+                            Blame::Pause,
                         );
                         return;
                     }
@@ -2225,6 +2365,10 @@ impl Node {
             });
         }
         s.blocks = Some(blocks);
+        // From here the chain is about to change: blocks and templates built
+        // on it are stale.
+        self.miner.stop();
+        self.publish_info();
     }
 
     fn on_fork_state(&mut self, id: u64, result: Result<State>) {
@@ -2243,7 +2387,7 @@ impl Node {
             }
             Err(e) => {
                 tracing::error!("Could not derive the fork state: {:#}", e);
-                self.abort_sync("fork state unavailable");
+                self.abort_sync("fork state unavailable", Blame::Pause);
             }
         }
     }
@@ -2296,18 +2440,27 @@ impl Node {
                     peer,
                     count,
                     sent: Instant::now(),
+                    request: None,
                 },
             );
             sends.push((peer, start, count));
         }
         for (peer, start, count) in sends {
-            self.network.send(
+            let id = self.network.request(
                 peer,
                 Message::GetBatches {
                     start_height: start,
                     count,
                 },
             );
+            let in_flight = self
+                .sync
+                .as_mut()
+                .and_then(|s| s.blocks.as_mut())
+                .and_then(|b| b.in_flight.get_mut(&start));
+            if let Some(f) = in_flight {
+                f.request = Some(id);
+            }
         }
     }
 
@@ -2384,7 +2537,9 @@ impl Node {
                 self.schedule_batch_requests();
             }
             Verdict::Ban(reason) => self.ban_peer(peer, reason),
-            Verdict::Abort(reason) => self.abort_sync(reason),
+            // Lying about blocks costs real headers first; an honest peer
+            // that has pruned them is merely no use to us.
+            Verdict::Abort(reason) => self.abort_sync(reason, Blame::Pause),
         }
     }
 
@@ -2576,7 +2731,7 @@ impl Node {
                 return;
             }
             Some((false, e)) => {
-                self.abort_sync(&e);
+                self.abort_sync(&e, Blame::Pause);
                 return;
             }
             None => {}
@@ -2965,7 +3120,7 @@ impl Node {
             self.miner.stop();
             return;
         };
-        if self.sync.is_some()
+        if self.chain_syncing()
             || self.state.height == 0
             || self.last_tip_change.elapsed() < self.config.min_block_interval
         {
@@ -3290,7 +3445,7 @@ async fn bootstrap_from_checkpoint(
                 }
             }
             event = network.next_event() => {
-                let NetworkEvent::MessageReceived { peer, message, channel } = event else { continue };
+                let NetworkEvent::MessageReceived { peer, message, channel, .. } = event else { continue };
                 if let Some(ch) = channel {
                     network.respond(ch, Message::Pong { nonce: 0 });
                 }

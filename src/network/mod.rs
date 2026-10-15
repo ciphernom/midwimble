@@ -356,7 +356,10 @@ pub enum NetworkEvent {
     MessageReceived {
         peer: PeerId,
         message: Message,
+        /// Set for a request from the peer, to respond on.
         channel: Option<ResponseChannel<Message>>,
+        /// Set for a response: the request ([`Network::request`]) it answers.
+        request: Option<OutboundRequestId>,
     },
     LightRequest {
         peer: PeerId,
@@ -593,8 +596,15 @@ impl Network {
     // ── Messaging ───────────────────────────────────────────────────────
 
     pub fn send(&mut self, peer: PeerId, msg: Message) {
+        self.request(peer, msg);
+    }
+
+    /// [`Network::send`], returning the request's id, which its response
+    /// will carry ([`NetworkEvent::MessageReceived`]).
+    pub fn request(&mut self, peer: PeerId, msg: Message) -> OutboundRequestId {
         let id = self.swarm.behaviour_mut().rr.send_request(&peer, msg);
         self.pending_requests.insert(id, peer);
+        id
     }
 
     pub fn broadcast(&mut self, msg: Message) {
@@ -631,6 +641,12 @@ impl Network {
 
     pub fn outbound_peer_count(&self) -> usize {
         self.connected.values().filter(|e| e.is_dialer()).count()
+    }
+
+    /// Whether we dialed `peer`. Anyone can connect to us, but we choose
+    /// whom we dial, so an outbound peer is harder for an attacker to be.
+    pub fn is_outbound(&self, peer: &PeerId) -> bool {
+        self.connected.get(peer).is_some_and(|e| e.is_dialer())
     }
 
     pub fn connected_peers(&self) -> Vec<PeerId> {
@@ -934,6 +950,7 @@ impl Network {
                         peer,
                         message: request,
                         channel: Some(channel),
+                        request: None,
                     });
                 }
                 request_response::Message::Response {
@@ -945,6 +962,7 @@ impl Network {
                         peer,
                         message: response,
                         channel: None,
+                        request: Some(request_id),
                     });
                 }
             },
