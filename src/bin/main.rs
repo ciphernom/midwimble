@@ -42,8 +42,20 @@ enum Cmd {
         /// Peer to connect to (multiaddr with /p2p/<id>); repeatable.
         #[arg(long = "peer")]
         peers: Vec<String>,
+        /// The JSON RPC (no authentication: keep it local). It also serves
+        /// the block explorer, for this machine.
         #[arg(long, default_value = "127.0.0.1:9434")]
         rpc: String,
+        /// A host name the RPC answers to besides `localhost` and IP
+        /// addresses (as a proxy or a container network names it);
+        /// repeatable. Requests naming any other host are refused, so a web
+        /// page cannot reach the RPC by pointing its own domain at it.
+        #[arg(long = "rpc-allow-host")]
+        rpc_allow_hosts: Vec<String>,
+        /// Serve the block explorer alone, read-only, on this address too
+        /// (for example 0.0.0.0:9435 to publish it).
+        #[arg(long)]
+        explorer: Option<String>,
         /// Mine, paying rewards to this address.
         #[arg(long)]
         mine_to: Option<String>,
@@ -778,6 +790,8 @@ fn run(cli: Cli) -> Result<()> {
             listen,
             peers,
             rpc,
+            rpc_allow_hosts,
+            explorer,
             mine_to, mining_bond, co_bonds,
             midstate_rpc,
             threads,
@@ -875,15 +889,32 @@ fn run(cli: Cli) -> Result<()> {
                 })
                 .transpose()?;
             let rpc_addr: std::net::SocketAddr = rpc.parse()?;
+            let explorer_addr: Option<std::net::SocketAddr> =
+                explorer.as_deref().map(str::parse).transpose()?;
+            let rpc_options = rpc::RpcOptions {
+                allowed_hosts: rpc_allow_hosts,
+            };
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async move {
                 let (node, handle) = Node::new(config).await?;
-                let rpc_handle = handle.clone();
+                // One explorer index, whichever listener asks.
+                let index = midwimble::explorer::SharedIndex::default();
+                let (rpc_handle, rpc_index) = (handle.clone(), index.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = rpc::serve(rpc_handle, rpc_addr).await {
+                    if let Err(e) =
+                        rpc::serve_with(rpc_handle, rpc_addr, &rpc_options, rpc_index).await
+                    {
                         tracing::error!("RPC server stopped: {:#}", e);
                     }
                 });
+                if let Some(addr) = explorer_addr {
+                    let explorer_handle = handle.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = rpc::serve_explorer(explorer_handle, addr, index).await {
+                            tracing::error!("Explorer server stopped: {:#}", e);
+                        }
+                    });
+                }
                 let shutdown = handle.clone();
                 tokio::spawn(async move {
                     let _ = tokio::signal::ctrl_c().await;

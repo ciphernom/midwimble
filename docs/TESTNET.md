@@ -71,16 +71,18 @@ Every node serves a block explorer at its RPC address: open
 the block that created it to the block that spent it, and shows each bond's
 share of the fork-choice window. Its data is plain JSON under `/explorer/`.
 
-To publish a seed's explorer, forward only `GET` requests for `/`,
-`/logo.svg`, `/state` and `/explorer/`. The RPC port also accepts transactions
-and mining requests, which should stay local. With nginx:
+To publish a seed's explorer, serve it on a listener of its own:
 
-```nginx
-location ~ ^/(explorer/.*|state|logo\.svg)?$ {
-    limit_except GET { deny all; }
-    proxy_pass http://127.0.0.1:9434;
-}
+```sh
+midwimble node ... --rpc 127.0.0.1:9434 --explorer 0.0.0.0:9435
 ```
+
+That listener serves the explorer's page, `/state` and `/explorer/`, and
+nothing that changes the node. Keep the RPC port local: it accepts
+transactions and mining requests, and anyone who can reach it can redirect
+the node's rewards. It answers only requests addressed to an IP address or
+`localhost`; behind a proxy that passes its own host name, add
+`--rpc-allow-host <name>`.
 
 The first explorer request after a node starts reads every stored block to
 build its index; after that, each request reads only the blocks that are new.

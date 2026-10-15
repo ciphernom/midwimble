@@ -175,6 +175,40 @@ async fn a_bonded_producer_mines_and_a_peer_validates_every_block() {
     let listed = miners["blocks"].as_array().unwrap();
     assert_eq!(listed[0]["registrations"][0], id.as_str());
     assert!(listed.iter().all(|b| b["bond_id"] == id.as_str()));
+
+    // The explorer's own listener serves the explorer and nothing else: it
+    // can be published without handing out control of the node.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(midwimble::rpc::serve_explorer_on(
+        peer.handle.clone(),
+        listener,
+        Default::default(),
+    ));
+    let (page, state, bonds, mining, peers) = tokio::task::spawn_blocking(move || {
+        let client = midwimble::rpc::RpcClient::new(addr);
+        (
+            client.get("/").unwrap(),
+            client.get("/state").unwrap(),
+            client.get("/explorer/bonds").unwrap(),
+            client
+                .post_raw("/mining", &serde_json::json!({ "address": null }))
+                .unwrap(),
+            client
+                .post_raw(
+                    "/peers",
+                    &serde_json::json!({ "addr": "/ip4/127.0.0.1/tcp/1" }),
+                )
+                .unwrap(),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(page.as_str().is_some_and(|html| html.contains("<html")));
+    assert!(state["height"].as_u64().unwrap() > 6);
+    assert!(bonds.to_string().contains(&id));
+    assert_eq!(mining.0, 404, "no mining control on the explorer listener");
+    assert_eq!(peers.0, 404);
 }
 
 /// A producer whose node follows a midstate node relays midstate's headers

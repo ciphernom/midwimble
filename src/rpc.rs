@@ -1,7 +1,19 @@
 //! Local JSON RPC (axum, as midstate's `rpc/server.rs`).
 //!
 //! Bind it to localhost: there is no authentication. The endpoints are the
-//! ones a wallet and an operator need.
+//! ones a wallet and an operator need, and some change what the node does
+//! (`/mining` sets where its rewards go), so:
+//!
+//! * The RPC answers only requests whose `Host` is an IP address, `localhost`
+//!   or a name given with `--rpc-allow-host`. A web page the operator opens
+//!   can point a domain of its own at 127.0.0.1 (DNS rebinding) and then call
+//!   the RPC from the browser as if it were its own origin; the `Host` it
+//!   sends still names that domain. Every `POST` also takes only
+//!   `application/json`, which a page cannot send to another origin without
+//!   a CORS preflight this server never grants.
+//! * The block explorer (`/`, `/state` and `/explorer/...`) can be served on
+//!   a listener of its own (`--explorer`), which has nothing else on it and
+//!   can be published as it is.
 //!
 //! | method | path | purpose |
 //! |---|---|---|
@@ -38,7 +50,21 @@ fn bad(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     )
 }
 
+/// What the RPC listener answers to besides its routes.
+#[derive(Clone, Debug, Default)]
+pub struct RpcOptions {
+    /// Host names the RPC answers to besides `localhost` names and IP
+    /// addresses (`--rpc-allow-host`); `*` allows any.
+    pub allowed_hosts: Vec<String>,
+}
+
+/// The RPC with default options and an explorer index of its own.
 pub fn router(node: NodeHandle) -> Router {
+    router_with(node, &RpcOptions::default(), SharedIndex::default())
+}
+
+/// The RPC, sharing `index` with an explorer listener if there is one.
+pub fn router_with(node: NodeHandle, options: &RpcOptions, index: SharedIndex) -> Router {
     Router::new()
         .route("/", get(explorer))
         .route("/logo.svg", get(logo))
@@ -68,25 +94,138 @@ pub fn router(node: NodeHandle) -> Router {
         .route("/explorer/bonds", get(crate::explorer::bonds))
         .route("/explorer/bond/{id}", get(crate::explorer::bond))
         .route("/explorer/search/{q}", get(crate::explorer::search))
-        .layer(axum::Extension(crate::explorer::SharedIndex::default()))
+        .layer(axum::Extension(index))
+        .layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::new(options.allowed_hosts.clone()),
+            check_host,
+        ))
         .with_state(node)
 }
 
+/// The block explorer alone: its page and the read-only JSON it reads.
+/// Nothing on it changes the node, so it can be published as it is.
+pub fn explorer_router(node: NodeHandle, index: SharedIndex) -> Router {
+    Router::new()
+        .route("/", get(explorer))
+        .route("/logo.svg", get(logo))
+        .route("/state", get(state))
+        .route("/explorer/blocks", get(crate::explorer::blocks))
+        .route("/explorer/block/{id}", get(crate::explorer::block))
+        .route(
+            "/explorer/output/{commitment}",
+            get(crate::explorer::output),
+        )
+        .route("/explorer/kernel/{excess}", get(crate::explorer::kernel))
+        .route("/explorer/bonds", get(crate::explorer::bonds))
+        .route("/explorer/bond/{id}", get(crate::explorer::bond))
+        .route("/explorer/search/{q}", get(crate::explorer::search))
+        .layer(axum::Extension(index))
+        .with_state(node)
+}
+
+use crate::explorer::SharedIndex;
+
+/// Refuses a request whose `Host` the RPC does not answer to
+/// ([`host_allowed`]).
+async fn check_host(
+    AxState(allowed): AxState<std::sync::Arc<Vec<String>>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let host = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| request.uri().authority().map(|a| a.to_string()));
+    match host {
+        Some(host) if !host_allowed(&host, &allowed) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": format!(
+                    "this RPC does not answer to host {host:?}; \
+                     start the node with --rpc-allow-host to allow it"
+                )
+            })),
+        )
+            .into_response(),
+        _ => next.run(request).await,
+    }
+}
+
+/// Whether the RPC answers to `host` (a `Host` header: a name or address,
+/// with or without a port): an IP address, which no other site can point
+/// at, `localhost` or a name under it, which resolve only to this machine,
+/// or a name in `allowed`.
+pub fn host_allowed(host: &str, allowed: &[String]) -> bool {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest
+            .split_once(']')
+            .is_some_and(|(addr, _)| addr.parse::<std::net::Ipv6Addr>().is_ok());
+    }
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => host,
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    name.parse::<std::net::Ipv4Addr>().is_ok()
+        || name == "localhost"
+        || name.ends_with(".localhost")
+        || allowed
+            .iter()
+            .any(|a| a == "*" || a.trim_end_matches('.').eq_ignore_ascii_case(&name))
+}
+
 pub async fn serve(node: NodeHandle, addr: SocketAddr) -> Result<()> {
+    serve_with(node, addr, &RpcOptions::default(), SharedIndex::default()).await
+}
+
+/// Binds `addr` and serves the RPC on it.
+pub async fn serve_with(
+    node: NodeHandle,
+    addr: SocketAddr,
+    options: &RpcOptions,
+    index: SharedIndex,
+) -> Result<()> {
     if !addr.ip().is_loopback() {
         tracing::warn!(
-            "RPC bound to non-loopback address {} with no authentication",
+            "RPC bound to non-loopback address {} with no authentication: anyone who \
+             can reach it can redirect this node's mining rewards. Publish the explorer \
+             with --explorer instead.",
             addr
         );
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("RPC listening on http://{}", addr);
-    serve_on(node, listener).await
+    axum::serve(listener, router_with(node, options, index)).await?;
+    Ok(())
 }
 
 /// Serves on an already-bound listener (lets callers bind port 0).
 pub async fn serve_on(node: NodeHandle, listener: tokio::net::TcpListener) -> Result<()> {
     axum::serve(listener, router(node)).await?;
+    Ok(())
+}
+
+/// Binds `addr` and serves the block explorer alone on it.
+pub async fn serve_explorer(node: NodeHandle, addr: SocketAddr, index: SharedIndex) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("Explorer listening on http://{}", addr);
+    serve_explorer_on(node, listener, index).await
+}
+
+/// [`serve_explorer`] on an already-bound listener.
+pub async fn serve_explorer_on(
+    node: NodeHandle,
+    listener: tokio::net::TcpListener,
+    index: SharedIndex,
+) -> Result<()> {
+    axum::serve(listener, explorer_router(node, index)).await?;
     Ok(())
 }
 
@@ -823,5 +962,88 @@ fn dechunk(body: &str) -> Result<String> {
         rest = after
             .get(size + 2..)
             .ok_or_else(|| anyhow!("short chunk"))?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_rpc_answers_to_addresses_localhost_and_allowed_names() {
+        let none: &[String] = &[];
+        for host in [
+            "127.0.0.1:9434",
+            "127.0.0.1",
+            "192.168.1.20:9434",
+            "[::1]:9434",
+            "[::1]",
+            "localhost:9434",
+            "LOCALHOST",
+            "localhost.",
+            "node.localhost:9434",
+        ] {
+            assert!(host_allowed(host, none), "{host}");
+        }
+        for host in [
+            "evil.example:9434",
+            "evil.example",
+            "localhost.evil.example",
+            "127.0.0.1.evil.example:9434",
+            "[not-an-address]:9434",
+            "",
+            ":9434",
+        ] {
+            assert!(!host_allowed(host, none), "{host:?}");
+        }
+        let allowed = vec!["node.internal".to_string()];
+        assert!(host_allowed("node.internal:9434", &allowed));
+        assert!(host_allowed("NODE.internal", &allowed));
+        assert!(!host_allowed("other.internal", &allowed));
+        assert!(host_allowed("anything.example", &["*".to_string()]));
+    }
+
+    /// A browser that a page has pointed at this machine through its own
+    /// domain still names that domain, and is refused; local clients are not.
+    #[tokio::test]
+    async fn requests_for_other_hosts_are_refused() {
+        let app = Router::new().route("/state", get(|| async { "ok" })).layer(
+            axum::middleware::from_fn_with_state(
+                std::sync::Arc::new(vec!["node.internal".to_string()]),
+                check_host,
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let status = |host: Option<&'static str>| {
+            tokio::task::spawn_blocking(move || {
+                use std::io::{Read, Write};
+                let mut stream = std::net::TcpStream::connect(addr).unwrap();
+                let host = host.map_or(String::new(), |h| format!("Host: {h}\r\n"));
+                let version = if host.is_empty() { "1.0" } else { "1.1" };
+                write!(
+                    stream,
+                    "GET /state HTTP/{version}\r\n{host}Connection: close\r\n\r\n"
+                )
+                .unwrap();
+                let mut reply = String::new();
+                stream.read_to_string(&mut reply).unwrap();
+                reply
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .parse::<u16>()
+                    .unwrap()
+            })
+        };
+        assert_eq!(status(Some("127.0.0.1:9434")).await.unwrap(), 200);
+        assert_eq!(status(Some("localhost:9434")).await.unwrap(), 200);
+        assert_eq!(status(Some("node.internal:9434")).await.unwrap(), 200);
+        assert_eq!(status(None).await.unwrap(), 200, "HTTP/1.0 without a Host");
+        assert_eq!(
+            status(Some("rebound.evil.example:9434")).await.unwrap(),
+            403
+        );
     }
 }

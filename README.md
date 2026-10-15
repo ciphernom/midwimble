@@ -302,6 +302,15 @@ midwimble anchor-verify --depth 6
 - `GET /anchors`, `POST /anchors`
 - `GET /finality`
 
+It also serves the block explorer (`/`, `/explorer/...`) for the machine it
+runs on. The RPC answers only requests addressed to an IP address,
+`localhost`, or a name given with `--rpc-allow-host` (a proxy's or container
+network's name for the node), so a web page cannot reach it by pointing a
+domain of its own at 127.0.0.1. To publish the explorer, serve it on a
+listener of its own, which has nothing on it that changes the node:
+`--explorer 0.0.0.0:9435`. Never publish the RPC port: anyone who can reach it
+can redirect the node's mining rewards.
+
 ## Upstream bug found in midstate
 
 `mss::keygen` resumes from `mss_h{height}.checkpoint` whatever seed wrote it.
