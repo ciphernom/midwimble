@@ -1170,7 +1170,10 @@ impl Node {
                         if let Some(peer) = from {
                             // Invalid contents behind valid proof of work are
                             // costly to make: the relayer is broken or hostile.
-                            if !e.to_string().contains("timestamp") {
+                            // A timestamp ahead of our clock is the exception:
+                            // that block is merely early, and an honest peer
+                            // with a faster clock can relay it.
+                            if !crate::core::state::is_future_timestamp(&e) {
                                 self.ban_peer(peer, "relayed an invalid block");
                             }
                         }
@@ -1977,7 +1980,12 @@ impl Node {
         let peer = s.peer;
         if let Err(e) = result {
             self.sync = Some(s);
-            self.ban_peer(peer, &format!("invalid header chain: {e:#}"));
+            if crate::core::state::is_future_timestamp(&e) {
+                // Ahead of our clock, not invalid: try again later.
+                self.abort_sync(&format!("peer's headers are ahead of our clock: {e:#}"));
+            } else {
+                self.ban_peer(peer, &format!("invalid header chain: {e:#}"));
+            }
             return;
         }
         self.sync_stats.header_chunks_verified += 1;

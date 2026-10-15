@@ -91,6 +91,51 @@ pub fn current_timestamp() -> u64 {
         .unwrap_or(0)
 }
 
+/// Why a block's timestamp was refused, as a typed error inside the
+/// `anyhow::Error` that validation returns, so callers can tell the two apart
+/// without reading message text.
+///
+/// [`TimestampError::TooFarInFuture`] is relative to the validating node's
+/// own clock: the same block becomes valid a few minutes later, and an honest
+/// peer whose clock runs ahead can relay it. [`TimestampError::NotAfterMedian`]
+/// is a property of the block and its chain alone, so no honest node relays
+/// one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TimestampError {
+    TooFarInFuture { timestamp: u64, now: u64 },
+    NotAfterMedian { timestamp: u64, floor: u64 },
+}
+
+impl std::fmt::Display for TimestampError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TimestampError::TooFarInFuture { timestamp, now } => write!(
+                f,
+                "Block timestamp too far in future: {} > {} (max future: {}s)",
+                timestamp, now, MAX_FUTURE_BLOCK_TIME
+            ),
+            TimestampError::NotAfterMedian { timestamp, floor } => write!(
+                f,
+                "Block timestamp {} must be greater than {}",
+                timestamp, floor
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TimestampError {}
+
+/// Whether `e` refused a block only because its timestamp is ahead of this
+/// node's clock (the one refusal that is not the block's fault).
+pub fn is_future_timestamp(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<TimestampError>(),
+            Some(TimestampError::TooFarInFuture { .. })
+        )
+    })
+}
+
 /// Midstate's timestamp rule with its timewarp fix always active:
 /// no more than 15 minutes in the future, and strictly above the median of
 /// the last 11 blocks (or above the last block while fewer exist).
@@ -99,22 +144,21 @@ pub fn validate_timestamp(
     previous_timestamps: &[u64],
     current_time: u64,
 ) -> Result<()> {
-    if new_timestamp > current_time + MAX_FUTURE_BLOCK_TIME {
-        bail!(
-            "Block timestamp too far in future: {} > {} (max future: {}s)",
-            new_timestamp,
-            current_time,
-            MAX_FUTURE_BLOCK_TIME
-        );
+    if new_timestamp > current_time.saturating_add(MAX_FUTURE_BLOCK_TIME) {
+        return Err(TimestampError::TooFarInFuture {
+            timestamp: new_timestamp,
+            now: current_time,
+        }
+        .into());
     }
     let floor = median_time_floor(previous_timestamps);
     if let Some(floor) = floor {
         if new_timestamp <= floor {
-            bail!(
-                "Block timestamp {} must be greater than {}",
-                new_timestamp,
-                floor
-            );
+            return Err(TimestampError::NotAfterMedian {
+                timestamp: new_timestamp,
+                floor,
+            }
+            .into());
         }
     }
     Ok(())
@@ -601,6 +645,22 @@ mod tests {
         assert_eq!(min_next_timestamp(&window), 106);
         assert!(validate_timestamp(105, &window, now).is_err());
         assert!(validate_timestamp(106, &window, now).is_ok());
+        assert!(validate_timestamp(u64::MAX, &[], u64::MAX - 1).is_ok());
+    }
+
+    /// Only a clock-relative refusal is excused, and the type survives being
+    /// wrapped in context by callers.
+    #[test]
+    fn future_timestamps_are_told_apart_by_type() {
+        let now = 1_000_000;
+        let ahead = validate_timestamp(now + MAX_FUTURE_BLOCK_TIME + 1, &[], now).unwrap_err();
+        assert!(is_future_timestamp(&ahead));
+        assert!(is_future_timestamp(&ahead.context("header 7")));
+        let stale = validate_timestamp(10, &[10], now).unwrap_err();
+        assert!(!is_future_timestamp(&stale));
+        assert!(!is_future_timestamp(&anyhow!(
+            "timestamp mentioned in some other error"
+        )));
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::core::simd_mining::{pow_seed, verify_pow_batch};
 use crate::core::state::{calculate_target, calculate_work, current_timestamp, validate_timestamp};
 use crate::core::types::{compute_header_hash, MEDIAN_TIME_PAST_WINDOW};
 use crate::core::{Batch, BatchHeader, State};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use libp2p::PeerId;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -107,8 +107,11 @@ pub fn verify_header_chain_with(
             }
         }
         if header.height > 0 {
+            // `context` keeps the typed `TimestampError` reachable, so the
+            // caller can tell a header from the future (not yet valid here)
+            // from an invalid one.
             validate_timestamp(header.timestamp, window.make_contiguous(), now)
-                .map_err(|e| anyhow::anyhow!("header {}: {}", header.height, e))?;
+                .with_context(|| format!("header {}", header.height))?;
         }
         window.push_back(header.timestamp);
         while window.len() > MEDIAN_TIME_PAST_WINDOW {
