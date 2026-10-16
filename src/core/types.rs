@@ -111,31 +111,31 @@ const fn hex_digit(c: u8) -> u8 {
 /// Distinguishes this network from midstate and from other deployments of
 /// this code. Feeds the genesis midstate, every signed message, the merged-
 /// mining commitment and the DHT rendezvous key.
-pub const NETWORK_MAGIC: &[u8] = b"MIDWIMBLE_TESTNET_V1";
+pub const NETWORK_MAGIC: &[u8] = b"MIDWIMBLE_TESTNET_V2";
 
 /// Bitcoin block anchoring the genesis. Its hash could not be known before it
 /// was mined, so a chain committing to it cannot have been started (or quietly
 /// pre-mined) any earlier.
 pub const BITCOIN_BLOCK_HASH: &str =
-    "0000000000000000000040c857e566e33db423ecc6ccc06d0ea0ae9bc332e7ab";
-pub const BITCOIN_BLOCK_HEIGHT: u64 = 970015;
-/// The anchor block's own timestamp (2026-10-05 12:03 UTC). Genesis may not precede it.
-pub const BITCOIN_BLOCK_TIME: u64 = 1_791_201_787;
+    "000000000000000000013c9832795d3de8dfe6df57c6cbaa6a7cbba9ad3a40c4";
+pub const BITCOIN_BLOCK_HEIGHT: u64 = 971639;
+/// The anchor block's own timestamp (2026-10-16 00:21 UTC). Genesis may not precede it.
+pub const BITCOIN_BLOCK_TIME: u64 = 1_792_110_108;
 
 /// Midstate block anchoring the genesis: midstate's tip at launch. Like the
 /// Bitcoin anchor it could not be known before it was mined, and it pins the
 /// midstate chain that bonded mining is judged against.
 pub const MIDSTATE_BLOCK_HASH: &str =
-    "0000030d24c024652a5498ad326ee14f4999c08989a638235938a2909730548c";
-pub const MIDSTATE_BLOCK_HEIGHT: u64 = 317982;
+    "00000005edada0c006c6b8f153fcc90a85db3592c58a174e96a2a87ac7c572c2";
+pub const MIDSTATE_BLOCK_HEIGHT: u64 = 334411;
 
 /// Mainnet genesis time; see [`GENESIS_TIMESTAMP`].
-const LAUNCH_GENESIS_TIMESTAMP: u64 = 1_791_202_464; // 2026-10-05 12:14 UTC
+const LAUNCH_GENESIS_TIMESTAMP: u64 = 1_792_117_660; // 2026-10-16 02:27 UTC
 
 /// Mainnet genesis target; see [`GENESIS_TARGET`].
-/// midstate's target at height 317982 (0000030f3effffff…) divided by an expected merged-mining share of 0.01.
+/// midstate's target at height 334411 (000000133355ffff…) divided by an expected merged-mining share of 0.01.
 const LAUNCH_GENESIS_TARGET: [u8; 32] =
-    hex32("000131f49bffffffffffffffffffffffffffffffffffffffffffffffffffff9c");
+    hex32("000007800d97ffffffffffffffffffffffffffffffffffffffffffffffffff9c");
 
 /// Smallest bond that grants mining eligibility, in midstate base units.
 /// 2^24 units
