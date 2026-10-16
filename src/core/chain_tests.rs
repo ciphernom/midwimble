@@ -868,24 +868,39 @@ fn a_forged_signature_is_rejected_even_with_valid_work() {
     assert!(err.to_string().contains("signature"), "{err}");
 }
 
+/// A bond the chain has never seen, or one whose lock is too short to sign,
+/// cannot sign a block. While no registered bond can sign either, its
+/// producer's blocks are unsigned; once one can, it cannot mine at all.
 #[test]
 fn unregistered_and_short_locked_bonds_cannot_mine() {
-    let chain = TestChain::new();
+    let mut chain = TestChain::new();
     let payout = TestWallet::new().address();
-    // A bond the chain has never seen, with no registration to carry.
-    let unregistered = MinerBond {
-        co_bonds: Vec::new(),
-        registration: None,
-        ..bonded_miner(&chain, b"unregistered", locked_long())
-    };
-    assert!(chain.make_bonded_block(&unregistered, &payout).is_err());
-    // A bond whose lock runs out within the month: it would register, but
-    // cannot authorise a block.
-    let short = bonded_miner(
+    let mut bonds = bonded_miners(
         &chain,
-        b"short lock",
-        est_midstate_height(now()) + MIN_REMAINING_BOND_LOCK - 1_000,
+        &[
+            (b"unregistered", locked_long()),
+            (
+                b"short lock",
+                est_midstate_height(now()) + MIN_REMAINING_BOND_LOCK - 1_000,
+            ),
+            (b"lasting", locked_long()),
+        ],
     );
+    // A bond with no registration to carry, and one whose lock runs out
+    // within the month: it would register, but cannot authorise a block.
+    let unregistered = MinerBond {
+        registration: None,
+        ..bonds.remove(0)
+    };
+    let (short, lasting) = (bonds.remove(0), bonds.remove(0));
+    for bond in [&unregistered, &short] {
+        let block = chain.make_bonded_block(bond, &payout).unwrap();
+        assert!(block.miner.is_none() && block.registrations.is_empty());
+    }
+    chain
+        .apply(chain.make_bonded_block(&lasting, &payout).unwrap())
+        .unwrap();
+    assert!(chain.make_bonded_block(&unregistered, &payout).is_err());
     let err = chain.make_bonded_block(&short, &payout).unwrap_err();
     assert!(err.to_string().contains("not eligible"), "{err}");
 }
@@ -944,15 +959,17 @@ fn registrations_are_verified_and_limited() {
 
 /// Without the relay holding its header, a registration has nothing to be
 /// checked against: a producer whose bond file carries no headers cannot
-/// register until something relays them, and then it can.
+/// register (its blocks are unsigned while no bond can sign) until something
+/// relays them, and then it can.
 #[test]
 fn registrations_wait_for_the_relay() {
     let mut chain = TestChain::new();
     let payout = TestWallet::new().address();
     let mut bond = bonded_miner(&chain, b"patient", locked_long());
     let headers = bond.midstate.take().unwrap();
-    let err = chain.make_bonded_block(&bond, &payout).unwrap_err();
-    assert!(err.to_string().contains("relay"), "{err}");
+    let waiting = chain.make_bonded_block(&bond, &payout).unwrap();
+    assert!(waiting.miner.is_none() && waiting.registrations.is_empty());
+    assert!(waiting.relay.is_none(), "it has nothing to relay");
     // A block from someone else relays the headers (a producer whose node
     // follows midstate)...
     let mut feed = RelayFeed::default();
@@ -981,6 +998,68 @@ fn registrations_wait_for_the_relay() {
     assert!(first.relay.is_none(), "nothing left to relay");
     chain.apply(first).unwrap();
     assert!(chain.state.bonds.contains_key(&bond.bond_id));
+}
+
+/// The freeze unsigned blocks end: a bond proven further past the relay's
+/// tip than one block can relay. While a block had to be signed, nothing
+/// could be mined before the first bond registered, and no single block
+/// could relay what its registration needed. Now blocks are unsigned while
+/// no bond can sign, and relay midstate a day at a time until the proof is
+/// buried; the block that registers the bond is signed by it.
+#[test]
+fn a_bond_proven_beyond_one_blocks_relay_still_registers() {
+    use super::bond::{
+        registration_cap, registration_work, BondCoin, BondRegistration, BondScript,
+        MIN_MINING_BOND,
+    };
+    use super::relay::{devnet::DevnetMidstate, MAX_RELAY_HEADERS_PER_BLOCK};
+    let mut chain = TestChain::new();
+    let payout = TestWallet::new().address();
+    let secret = Scalar::from_bytes_mod_order(hash(b"late"));
+    let coin = BondCoin {
+        script: BondScript {
+            mining_key: RistrettoPoint::mul_base(&secret).compress().to_bytes(),
+            bonded_until: locked_long(),
+            owner_pk: hash(b"late owner"),
+        },
+        value: MIN_MINING_BOND,
+        salt: hash(b"late salt"),
+    };
+    // Midstate runs on past the root for more than a block can relay before
+    // the coin is locked, then buries it.
+    let mut midstate = DevnetMidstate::new();
+    midstate.mine(MAX_RELAY_HEADERS_PER_BLOCK as u64 + 100);
+    midstate.lock(&coin);
+    midstate.mine(1);
+    let proof = midstate.prove(&coin);
+    let required = registration_work(&chain.state.target);
+    let per =
+        super::state::calculate_work(&midstate.target).min(registration_cap(&chain.state.target));
+    midstate.mine(required.div_ceil(per) as u64 + 1);
+    let registration = BondRegistration { proof };
+    let bond = MinerBond {
+        co_bonds: Vec::new(),
+        secret,
+        bond_id: registration.bond_id(),
+        registration: Some(registration),
+        midstate: Some(midstate.mined.clone()),
+    };
+
+    let first = chain.make_bonded_block(&bond, &payout).unwrap();
+    assert!(first.miner.is_none() && first.registrations.is_empty());
+    assert_eq!(
+        first.relay.as_ref().unwrap().headers.len(),
+        MAX_RELAY_HEADERS_PER_BLOCK
+    );
+    chain.apply(first).unwrap();
+    assert!(chain.state.bonds.is_empty());
+
+    let second = chain.make_bonded_block(&bond, &payout).unwrap();
+    assert_eq!(second.registrations.len(), 1);
+    assert_eq!(second.miner.as_ref().unwrap().bond_id, bond.bond_id);
+    chain.apply(second).unwrap();
+    assert!(chain.state.bonds.contains_key(&bond.bond_id));
+    assert_eq!(chain.state.relay.tip().height, midstate.height());
 }
 
 /// The review's attack: one private midstate branch, mined once, holding
@@ -1056,21 +1135,17 @@ fn a_heavier_midstate_branch_revokes_bonds_proven_on_the_old_one() {
     );
     assert!(chain.state.relay.tip().height > replaced);
 
-    // It can no longer sign, and its old registration has nothing to stand on.
-    let err = chain.make_bonded_block(&bond, &payout).unwrap_err();
-    assert!(err.to_string().contains("does not verify"), "{err}");
+    // It can no longer sign, and its old registration has nothing to stand
+    // on: with no registered bond left, its producer's block is unsigned.
+    let block = chain.make_bonded_block(&bond, &payout).unwrap();
+    assert!(block.miner.is_none() && block.registrations.is_empty());
     // The lighter branch cannot come back.
     let old = bond.midstate.as_ref().unwrap();
     let lighter = RelayHeaders {
         prev: old.prev,
         headers: old.headers.clone(),
     };
-    assert!(chain
-        .state
-        .relay
-        .clone()
-        .extend(&lighter, super::relay::relay_min_work(&chain.state.target))
-        .is_err());
+    assert!(chain.state.relay.clone().extend(&lighter, now()).is_err());
 }
 
 #[test]

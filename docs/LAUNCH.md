@@ -32,15 +32,19 @@ chosen to arrive an hour or so before mining is meant to open.
 **The week before.** Rehearse bonded mining with real midstate
 (`scripts/rehearse.py`, see `docs/REHEARSAL.md`). This proves the full chain
 against production midwimble: locking a bond, registering it, mining, and a
-peer validating. Anyone who will mine block 1 should run it, since block 1's
-producer must already hold a registered bond.
+peer validating. Anyone who means to produce the first signed blocks should
+run it.
 
-Block-1 producers should take their bond proof early. A registration needs a
-day of work above its proof, measured against the launch target, which is
-roughly 450 midstate blocks at a 0.25 share. A proof taken days before launch
-therefore registers instantly on the day. Run `midwimble bond register` with
-the launch build: it measures against that build's genesis target, and a
-registration assembled with a pre-launch build will be refused.
+Lock bond coins before launch day, but take their proofs after the
+parameters are set. A bond's proof must be above the genesis's midstate
+anchor, and a registration needs a day of work relayed above its proof,
+measured against the launch target: roughly 360 midstate blocks at a 0.25
+share, about six hours. Run `midwimble bond register` with the launch build
+as soon as it is published (it takes the proof at midstate's tip, above the
+anchor, and measures against that build's genesis target), then start the
+producer with `--midstate-rpc`. Until the first bond registers, blocks are
+unsigned and count for a sliver; the producer's node relays midstate's
+headers in them, and its bond registers by itself once the burial is relayed.
 
 **The day before.** Make sure midstate's pool can merge-mine. Getting every
 midstate miner earning midwimble from block 1 matters more for a fair start
@@ -106,8 +110,8 @@ The two ways of getting it wrong are not symmetric:
 - **Too hard**: early blocks are slow until ASERT eases, about four hours per
   halving of the difficulty. During the slow start that costs almost nothing.
 
-So err towards hard. Bonded mining is required from block 1, so only miners
-who hold MDS and have registered a bond can take part at first. The script's
+So err towards hard. Once the first bond registers, a few hours in, only
+miners who hold MDS and have registered a bond can take part. The script's
 default `--merge-share` is therefore 0.25 rather than the 0.5 plain merged
 mining would suggest.
 
@@ -144,7 +148,8 @@ start from, so the cap does not depend on trusting whoever served it.
 | Supply | 1,000,000.00000000, 8 decimals | reached exactly |
 | Slow start | 43,200 blocks (30 days) | linear ramp |
 | Halving | every 2,100,000 blocks | Bitcoin's era length |
-| Bonded mining | from block 1 | minimum bond 128 gMDS (2^37 units), a launch parameter |
+| Bonded mining | from block 1, whenever a registered bond could sign | minimum bond 128 gMDS (2^37 units), a launch parameter; while no bond can sign, blocks are unsigned and count for 1/1,024 of their work |
+| Relayed midstate headers | midstate's own difficulty, timestamps at most 30 minutes ahead | a fake branch costs real midstate work, more the further it runs ahead |
 | Bond eligibility | more than 30 days of lock left | judged on midwimble's clock, 7-day margin |
 | Fork choice | 4 full-weight blocks a bond a day; no block counts above 1.25× the week's lowest | weight, never validity |
 | Registration | a day of relayed midstate work above the proof's header | the header must be on the relay's chain (revoked if a heavier branch replaces it); no header counts for more than 1/60 |

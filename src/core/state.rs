@@ -37,12 +37,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// `height` and `timestamp` are the *parent's*: the result is the target for
 /// block `height`.
 pub fn calculate_target(height: u64, timestamp: u64) -> [u8; 32] {
+    asert_target(&GENESIS_TARGET, GENESIS_TIMESTAMP, height, timestamp)
+}
+
+/// [`calculate_target`] for a chain whose genesis (height 0) had
+/// `genesis_target` and `genesis_timestamp`: midstate's own rule, which the
+/// midstate relay holds relayed headers to (`relay::midstate_target`).
+pub fn asert_target(
+    genesis_target: &[u8; 32],
+    genesis_timestamp: u64,
+    height: u64,
+    timestamp: u64,
+) -> [u8; 32] {
     if height == 0 {
-        return GENESIS_TARGET;
+        return *genesis_target;
     }
     let ideal_time = (height.min(i64::MAX as u64) as i64).saturating_mul(TARGET_BLOCK_TIME as i64);
     let actual_time =
-        (timestamp.min(i64::MAX as u64) as i64).saturating_sub(GENESIS_TIMESTAMP as i64);
+        (timestamp.min(i64::MAX as u64) as i64).saturating_sub(genesis_timestamp as i64);
     let drift = actual_time.saturating_sub(ideal_time);
 
     let exponent = drift.saturating_mul(65536) / ASERT_HALF_LIFE;
@@ -54,7 +66,7 @@ pub fn calculate_target(height: u64, timestamp: u64) -> [u8; 32] {
     factor += (frac * frac * 15746) >> 32;
     factor += (frac * frac * frac * 3643) >> 48;
 
-    let mut target = U256::from_big_endian(&GENESIS_TARGET);
+    let mut target = U256::from_big_endian(genesis_target);
     let f = U256::from(factor as u64);
     let base = U256::from(65536u64);
     target = target / base * f + (target % base) * f / base;
@@ -571,9 +583,7 @@ fn apply_batch_internal(
     //     revokes every bond proven against a header it replaced.
     let mut relay_change = super::relay::RelayChange::default();
     if let Some(relayed) = &batch.relay {
-        relay_change = base
-            .relay
-            .extend(relayed, super::relay::relay_min_work(&batch.target))?;
+        relay_change = base.relay.extend(relayed, batch.timestamp)?;
         if let Some(fork) = relay_change.fork_from {
             removed.extend(base.bonds.revoke_above(fork));
         }
@@ -593,17 +603,24 @@ fn apply_batch_internal(
         }
     }
 
-    // 5. Bonded mining. From BONDED_MINING_FROM every mined block must be
-    //     authorised by an eligible bond; before that an authorisation is
-    //     optional, but checked in full whenever a block carries one.
-    if !is_genesis && (height >= super::bond::BONDED_MINING_FROM || batch.miner.is_some()) {
-        super::bond::check_miner_authorization(&bonds, &state.mw_midstate, batch)?;
+    // 5. Bonded mining. An authorisation is checked in full whenever a block
+    //     carries one. From BONDED_MINING_FROM a block must carry one whenever
+    //     a registered bond (one this block registers included) could sign
+    //     it; while none can, it may be unsigned, and counts for a sliver.
+    if !is_genesis {
+        if batch.miner.is_some() {
+            super::bond::check_miner_authorization(&bonds, &state.mw_midstate, batch)?;
+        } else if height >= super::bond::BONDED_MINING_FROM
+            && super::bond::any_can_sign(&bonds, batch.timestamp)
+        {
+            bail!("block {height} is unsigned, but a registered bond could sign it");
+        }
     }
 
     // 5a. The chain weight the header claims, which headers-first sync went
     //     by, must be what fork choice gives the chain with this block: its
     //     work as far as the work cap allows, less what the per-bond cap
-    //     withholds from its signer.
+    //     withholds from its signer (or, unsigned, all but the sliver).
     let signer = batch.miner.as_ref().map(|auth| auth.bond_id);
     let work = calculate_work(&batch.target);
     let mut floor = base.work_floor.clone();
@@ -613,6 +630,7 @@ fn apply_batch_internal(
         &mut recent,
         &mut counts,
         &bonds,
+        height,
         signer,
         creditable,
         batch.timestamp,

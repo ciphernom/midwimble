@@ -216,12 +216,19 @@ pub const REWARD: u64 = 1_000_003; // several power-of-two outputs
 pub struct MockChain {
     /// Height of the first block in `blocks` (0 unless started elsewhere).
     pub base: u64,
+    /// Blocks a midwimble relay accepts: timestamped on the stand-in
+    /// midstate's schedule and carrying the target midstate's rule gives
+    /// them. Otherwise any hash meets the target (merged mining, anchors).
+    pub relayable: bool,
     pub height: u64,
     pub prev_midstate: [u8; 32],
     pub prev_header_hash: [u8; 32],
     pub accepted: u64,
     pub blocks: Vec<Batch>,
     pub pending_commits: Vec<([u8; 32], u64)>,
+    /// State roots for the blocks at these heights (a bond coin's, say), in
+    /// place of the stand-in root every other block commits to.
+    pub state_roots: std::collections::HashMap<u64, [u8; 32]>,
 }
 
 pub type Mock = Arc<Mutex<MockChain>>;
@@ -272,12 +279,17 @@ fn sample_transactions(height: u64) -> Vec<Transaction> {
 }
 
 pub async fn start_mock_midstate() -> (String, Mock) {
-    start_mock_midstate_at(0, [2; 32]).await
+    start_mock(0, [2; 32], false).await
 }
 
 /// A mock whose first block is at `base` and builds on `prev_header_hash`
-/// (to continue a real chain, such as the relay's root).
+/// (to continue a real chain, such as the relay's root), with blocks a relay
+/// accepts.
 pub async fn start_mock_midstate_at(base: u64, prev_header_hash: [u8; 32]) -> (String, Mock) {
+    start_mock(base, prev_header_hash, true).await
+}
+
+async fn start_mock(base: u64, prev_header_hash: [u8; 32], relayable: bool) -> (String, Mock) {
     use axum::{
         extract::State,
         http::StatusCode,
@@ -288,6 +300,7 @@ pub async fn start_mock_midstate_at(base: u64, prev_header_hash: [u8; 32]) -> (S
 
     let chain: Mock = Arc::new(Mutex::new(MockChain {
         base,
+        relayable,
         height: base,
         prev_midstate: [1; 32],
         prev_header_hash,
@@ -339,9 +352,24 @@ pub async fn start_mock_midstate_at(base: u64, prev_header_hash: [u8; 32]) -> (S
                 final_hash: [0; 32],
             },
             coinbase,
-            timestamp: 1_800_000_000 + c.height,
-            target: [0xff; 32],
-            state_root: hash(&[c.height as u8; 8]),
+            timestamp: if c.relayable {
+                midwimble::core::relay::devnet_timestamp(c.height)
+            } else {
+                1_800_000_000 + c.height
+            },
+            target: if c.relayable {
+                midwimble::core::relay::midstate_target(
+                    c.height,
+                    midwimble::core::relay::devnet_timestamp(c.height.saturating_sub(1)),
+                )
+            } else {
+                [0xff; 32]
+            },
+            state_root: c
+                .state_roots
+                .get(&c.height)
+                .copied()
+                .unwrap_or_else(|| hash(&[c.height as u8; 8])),
             prev_header_hash: c.prev_header_hash,
         };
         let (mining, _) = batch.mining_hash();
@@ -504,7 +532,12 @@ pub fn mine_midstate_block(addr: &str) {
         .unwrap();
     let mut batch = tpl["batch_template"].clone();
     let mining = midwimble::core::auxpow::bytes32(&tpl["mining_midstate"]).unwrap();
-    let ext = create_extension(mining, 0);
-    batch["extension"] = serde_json::json!({ "nonce": 0, "final_hash": ext.final_hash.to_vec() });
+    let target = midwimble::core::auxpow::bytes32(&tpl["target"]).unwrap();
+    let (nonce, ext) = (0u64..)
+        .map(|n| (n, create_extension(mining, n)))
+        .find(|(_, e)| e.final_hash < target)
+        .unwrap();
+    batch["extension"] =
+        serde_json::json!({ "nonce": nonce, "final_hash": ext.final_hash.to_vec() });
     client.post("/submit_batch", &batch).unwrap();
 }

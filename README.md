@@ -40,7 +40,9 @@ recovery design.
   day (four blocks once 360 bonds are eligible), and no block counts for more
   than a quarter above the lowest of the week before it (`docs/BONDED_POW.md`).
   Each header claims its chain's weight under its proof of work, so sync
-  compares chains by it too.
+  compares chains by it too. A block must be signed whenever a registered bond
+  could sign it; while none can (before the first registration), an unsigned
+  block counts for 1/1,024 of its work.
 - **State root:** covers the UTXO set, the kernel set, the chain MMR, the
   running excess sum, the total offset, the supply, the bond set and the
   midstate relay.

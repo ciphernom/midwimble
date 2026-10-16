@@ -262,6 +262,121 @@ async fn a_producer_relays_the_headers_its_midstate_node_serves() {
     );
 }
 
+/// A launch, end to end: the producer starts with a bond proven at
+/// midstate's tip, not yet buried. No bond can sign, so it mines unsigned
+/// blocks, relaying the headers its midstate node serves. Once they bury
+/// the proof, its next block registers the bond and is signed by it, as is
+/// every block after; a peer validates all of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_producer_mines_unsigned_until_its_bond_is_buried_then_signs() {
+    use midwimble::core::bond::{
+        BondCoin, BondProof, BondRegistration, BondScript, MidstateRoots, MIN_MINING_BOND,
+    };
+    use midwimble::core::mmr::UtxoAccumulator;
+    use midwimble::core::relay::RelayEntry;
+    let root = RelayEntry::root();
+    let (ms, mock) = start_mock_midstate_at(root.height + 1, root.hash).await;
+    let mine = |n: usize| {
+        let ms = ms.clone();
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..n {
+                mine_midstate_block(&ms);
+            }
+        })
+    };
+    mine(3).await.unwrap();
+
+    // The bond's coin, in the state midstate's next header commits to.
+    let secret = Scalar::from_bytes_mod_order(hash(b"launch bond"));
+    let coin = BondCoin {
+        script: BondScript {
+            mining_key: RistrettoPoint::mul_base(&secret).compress().to_bytes(),
+            bonded_until: est_midstate_height(current_timestamp()) + MAX_BOND_HORIZON / 2,
+            owner_pk: hash(b"launch owner"),
+        },
+        value: MIN_MINING_BOND,
+        salt: hash(b"launch salt"),
+    };
+    let mut coins = UtxoAccumulator::new();
+    coins.insert(coin.coin_id(), true);
+    let roots = MidstateRoots {
+        coins: coins.root(true),
+        commitments: hash(b"launch commitments"),
+        chain_mmr: hash(b"launch chain"),
+        burned_wots: Some(hash(b"launch burned")),
+    };
+    let proven = root.height + 4;
+    mock.lock()
+        .unwrap()
+        .state_roots
+        .insert(proven, roots.state_root(proven).unwrap());
+    mine(1).await.unwrap();
+    let registration = BondRegistration {
+        proof: BondProof {
+            coin,
+            midstate_height: proven,
+            roots,
+            smt: coins.prove(&coin.coin_id(), true).unwrap(),
+        },
+    };
+    let bond = MinerBond {
+        co_bonds: Vec::new(),
+        secret,
+        bond_id: registration.bond_id(),
+        registration: Some(registration),
+        midstate: None,
+    };
+
+    let producer = start_full(Some(bond.clone()), true, vec![], Some(ms.clone())).await;
+    wait_until("unsigned blocks relaying the proof's header", 60, || {
+        producer.handle.state().relay.tip().height == proven && producer.height() > 4
+    })
+    .await;
+    assert!(producer.handle.state().bonds.is_empty());
+
+    // Midstate buries the proof.
+    mine(80).await.unwrap();
+    wait_until("the bond to register", 90, || {
+        producer.handle.state().bonds.contains_key(&bond.bond_id)
+    })
+    .await;
+    let registered_at = producer.height();
+    wait_until("signed blocks after it", 60, || {
+        producer.height() > registered_at + 2
+    })
+    .await;
+    let blocks = producer
+        .handle
+        .storage()
+        .load_batches(1, producer.height() - 1, usize::MAX)
+        .unwrap();
+    let first_signed = blocks
+        .iter()
+        .position(|b| b.miner.is_some())
+        .expect("a signed block");
+    assert!(first_signed >= 3, "unsigned blocks came first");
+    assert!(blocks[..first_signed]
+        .iter()
+        .all(|b| b.miner.is_none() && b.registrations.is_empty()));
+    assert_eq!(blocks[first_signed].registrations.len(), 1);
+    assert!(blocks[first_signed..]
+        .iter()
+        .all(|b| b.miner.as_ref().is_some_and(|m| m.bond_id == bond.bond_id)));
+
+    // A peer that validates every block, unsigned and signed, ends with the
+    // same blocks and the bond.
+    let peer = start_full(None, false, vec![producer.dial_addr().await], None).await;
+    let height = producer.height();
+    wait_until("the peer to sync", 60, || peer.height() >= height).await;
+    assert!(peer.handle.state().bonds.contains_key(&bond.bond_id));
+    let synced = peer
+        .handle
+        .storage()
+        .load_batches(1, blocks.len() as u64, usize::MAX)
+        .unwrap();
+    assert!(synced == blocks, "the peer holds the producer's blocks");
+}
+
 /// Bonds registered together (one stand-in midstate holds them all), locked
 /// well past the timestamps of a chain mined on schedule from genesis.
 fn bonds_from_genesis(seeds: &[&[u8]]) -> Vec<MinerBond> {

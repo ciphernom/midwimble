@@ -739,8 +739,8 @@ fn print_params() {
             format!("2^{} units", MIN_MINING_BOND.trailing_zeros())
         };
         out!(
-            "bonded mining        every block from height {BONDED_MINING_FROM}; bonds of at least \
-             {bond}, locked {} more days to mine",
+            "bonded mining        every block from height {BONDED_MINING_FROM} that a registered \
+             bond could sign; bonds of at least {bond}, locked {} more days to mine",
             MIN_REMAINING_BOND_LOCK / 1440
         );
     }

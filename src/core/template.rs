@@ -10,7 +10,7 @@ use super::bond::{
     authorization_message, check_miner_authorization, BondRegistration, MinerAuth, MinerBond,
     BONDED_MINING_FROM,
 };
-use super::relay::{relay_min_work, MidstateHeaders, RelayFeed, RelayHeaders, RELAY_WEIGHT_PER_HEADER};
+use super::relay::{MidstateHeaders, RelayFeed, RelayHeaders, RELAY_MAX_FUTURE, RELAY_WEIGHT_PER_HEADER};
 use super::extension::create_extension;
 use super::mw::{build_coinbase_with, PayoutReceipt, StealthAddress, Transaction};
 use super::state::{apply_body, current_timestamp, min_next_timestamp, validate_block_contents};
@@ -99,24 +99,28 @@ pub fn rebind(
 /// Block weight kept free for a registration when choosing what to relay.
 const REGISTRATION_ROOM: u64 = 256;
 
-/// The midstate headers a block on `state` should relay, in at most `room`
-/// headers: what the producer's feed, or else its bonds' own headers, have
-/// that extends the chain's relay and the relay would accept.
+/// The midstate headers a block on `state` timestamped `timestamp` should
+/// relay, in at most `room` headers: what the producer's feed, or else its
+/// bonds' own headers, have that extends the chain's relay and the relay
+/// would accept. A run stops before any header timestamped too far past the
+/// block ([`RELAY_MAX_FUTURE`]); a later block relays it.
 fn choose_relay(
     state: &State,
     feed: Option<&RelayFeed>,
     bond: Option<&MinerBond>,
     room: usize,
+    timestamp: u64,
 ) -> Option<RelayHeaders> {
-    let accepts = |run: &RelayHeaders| {
-        state
-            .relay
-            .clone()
-            .extend(run, relay_min_work(&state.target))
-            .is_ok()
-    };
+    let accepts = |run: &RelayHeaders| state.relay.clone().extend(run, timestamp).is_ok();
+    let latest = timestamp.saturating_add(RELAY_MAX_FUTURE);
     let trimmed = |mut run: RelayHeaders| {
-        run.headers.truncate(room);
+        let fits = run
+            .headers
+            .iter()
+            .take(room)
+            .take_while(|h| h.timestamp <= latest)
+            .count();
+        run.headers.truncate(fits);
         (!run.headers.is_empty()).then_some(run)
     };
     if let Some(run) = feed
@@ -311,13 +315,6 @@ pub fn build_template_relayed(
             crate::core::mw::crypto::MAX_GROUP_OUTPUTS
         );
     }
-    // Bonded mining: from BONDED_MINING_FROM a template needs a bond to sign
-    // with, and carries that bond's registration until the chain has it.
-    if height >= BONDED_MINING_FROM && bond.is_none() {
-        bail!(
-            "bonded mining is required from height {BONDED_MINING_FROM}: configure a mining bond"
-        );
-    }
     let timestamp = timestamp
         .unwrap_or_else(|| current_timestamp().max(min_next_timestamp(previous_timestamps)));
     // Bonds that can no longer sign leave the set before the block is built,
@@ -354,12 +351,12 @@ pub fn build_template_relayed(
             .map_or(0, crate::core::mw::Coinbase::weight)
         + REGISTRATION_ROOM;
     let room = (MAX_BLOCK_WEIGHT.saturating_sub(used) / RELAY_WEIGHT_PER_HEADER) as usize;
-    let relay = choose_relay(state, feed, bond, room);
+    let relay = choose_relay(state, feed, bond, room, timestamp);
     let mut relayed = state.clone();
     if let Some(r) = &relay {
         let change = relayed
             .relay
-            .extend(r, relay_min_work(&state.target))
+            .extend(r, timestamp)
             .expect("choose_relay only proposes runs the relay accepts");
         if let Some(fork) = change.fork_from {
             relayed.bonds.revoke_above(fork);
@@ -368,35 +365,45 @@ pub fn build_template_relayed(
     let state_after_relay = &relayed;
 
     // The producer's own registration, until the chain has it: it must verify
-    // against the relay as this block leaves it.
-    let mut registrations: Vec<BondRegistration> = match bond {
-        Some(b) if !state_after_relay.bonds.contains_key(&b.bond_id) => match &b.registration {
+    // against the relay as this block leaves it. Until it does, the block
+    // can only be mined unsigned, which the chain allows while no registered
+    // bond could sign it (checked below).
+    let mut registrations: Vec<BondRegistration> = Vec::new();
+    let mut not_ready: Option<anyhow::Error> = None;
+    if let Some(b) = bond.filter(|b| !state_after_relay.bonds.contains_key(&b.bond_id)) {
+        match &b.registration {
             Some(registration) => {
-                crate::core::bond::precheck_registrations(
+                let ready = crate::core::bond::precheck_registrations(
                     &state_after_relay.bonds,
                     std::slice::from_ref(registration),
                     timestamp,
-                )?;
-                registration
-                    .verify(&state_after_relay.relay, &state.target)
-                    .map_err(|e| {
-                        anyhow!(
+                )
+                .and_then(|()| {
+                    registration
+                        .verify(&state_after_relay.relay, &state.target)
+                        .map(|_| ())
+                });
+                match ready {
+                    Ok(()) => registrations.push(registration.clone()),
+                    Err(e) => {
+                        not_ready = Some(anyhow!(
                             "the mining bond's registration does not verify yet ({e:#}): the \
                              relay must hold its midstate header under a day of work. Run the \
                              node with --midstate-rpc, or re-run `midwimble bond register` so the \
                              bond file carries the headers"
-                        )
-                    })?;
-                vec![registration.clone()]
+                        ))
+                    }
+                }
             }
-            None => bail!("the mining bond is not registered on this chain and no registration is configured"),
-        },
-        _ => Vec::new(),
-    };
+            None => not_ready = Some(anyhow!(
+                "the mining bond is not registered on this chain and no registration is configured"
+            )),
+        }
+    }
     // Co-bonds' registrations ride along too, one a block, once the
     // producer's own bond is on chain. One the chain would refuse is skipped
     // rather than allowed to stop this producer mining.
-    if registrations.is_empty() {
+    if registrations.is_empty() && not_ready.is_none() {
         if let Some(b) = bond {
             let pending = b
                 .co_bonds
@@ -431,10 +438,29 @@ pub fn build_template_relayed(
     super::state::apply_registrations(&mut next, &registered)?;
     let state_root = next.state_root();
 
-    // The signer, and so the chain weight the header claims: the block's
-    // work as far as the work cap allows, less what the per-bond cap
-    // withholds from that signer.
-    let signer = bond.map(|b| b.choose_signer(&next.bonds, &state.signer_counts, timestamp));
+    // The signer: whichever of the producer's bonds can sign, or none. From
+    // BONDED_MINING_FROM a block must be signed whenever any registered bond
+    // could sign it (`state::apply_batch`), so a producer none of whose bonds
+    // can sign mines only while no other bond can either. A producer with a
+    // bond holds to that before then too, rather than mine unsigned blocks
+    // its bond was configured to sign.
+    let signer = bond.and_then(|b| b.signer_for(&next.bonds, &state.signer_counts, timestamp));
+    if signer.is_none()
+        && (bond.is_some() || height >= BONDED_MINING_FROM)
+        && crate::core::bond::any_can_sign(&next.bonds, timestamp)
+    {
+        return Err(not_ready.unwrap_or_else(|| match bond {
+            Some(_) => anyhow!(
+                "none of this producer's bonds can sign at this time, and other registered bonds can"
+            ),
+            None => anyhow!(
+                "bonded mining is required from height {BONDED_MINING_FROM}: configure a mining bond"
+            ),
+        }));
+    }
+    // The chain weight the header claims: the block's work as far as the
+    // work cap allows, less what the per-bond cap withholds from its signer
+    // (or, unsigned, all but the sliver).
     let mut floor = state.work_floor.clone();
     let work = crate::core::state::calculate_work(&state.target);
     let creditable = crate::core::bond::cap_work(&mut floor, height, work);
@@ -443,6 +469,7 @@ pub fn build_template_relayed(
         &mut recent,
         &mut counts,
         &next.bonds,
+        height,
         signer,
         creditable,
         timestamp,

@@ -791,7 +791,15 @@ impl Storage {
             let window_start = first_height.saturating_sub(crate::core::bond::CAP_WINDOW as u64);
             for h in window_start..first_height {
                 let signer = logged_signer(&signer_log, &blocks, h)?;
-                crate::core::bond::credit_in_window(&mut recent, &mut counts, &bonds, signer, 0, 0);
+                crate::core::bond::credit_in_window(
+                    &mut recent,
+                    &mut counts,
+                    &bonds,
+                    h,
+                    signer,
+                    0,
+                    0,
+                );
             }
             let mut floor: im::Vector<(u64, u128)> = im::Vector::new();
             let floor_start =
@@ -923,6 +931,7 @@ impl Storage {
                     &mut recent,
                     &mut counts,
                     &bonds,
+                    height,
                     signer,
                     creditable,
                     batch.timestamp,
@@ -2203,6 +2212,69 @@ mod tests {
         assert_eq!(
             storage.load_peers().unwrap(),
             vec!["/ip4/1.2.3.4/tcp/1".to_string()]
+        );
+    }
+}
+
+/// Bonded mining on the production build's constants (test builds start it
+/// at `u64::MAX`): blocks built from templates and applied with their proof
+/// of work taken as checked.
+#[cfg(all(test, not(feature = "fast-mining")))]
+mod bonded_era_tests {
+    use super::*;
+    use crate::core::mw::WalletKeys;
+    use crate::core::state::{apply_batch, apply_batch_skip_pow, current_timestamp};
+    use crate::core::template::build_template_relayed;
+    use crate::core::types::compute_header_hash;
+
+    /// While no bond can sign, blocks are unsigned and count for a sliver.
+    /// Storage replays exactly that as it commits them (it checks each
+    /// block's claimed weight), and a reload weighs the chain the same.
+    #[test]
+    fn storage_weighs_unsigned_blocks_as_the_node_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let mut state = State::genesis();
+        apply_batch(&mut state, Batch::genesis(), &[]).unwrap();
+        storage
+            .commit_chain(
+                0,
+                std::slice::from_ref(Batch::genesis()),
+                std::slice::from_ref(&state.effects),
+                &state,
+            )
+            .unwrap();
+        let to = WalletKeys::random().address();
+        let mut ts = vec![current_timestamp() - 3_600];
+        for _ in 0..5 {
+            let at = ts.last().unwrap() + 60;
+            let (t, _) =
+                build_template_relayed(&state, &ts, &[], &[(to, 1)], [0; 32], Some(at), None, None)
+                    .unwrap();
+            assert!(t.batch.miner.is_none());
+            let mut header = t.batch.header();
+            header.height = state.height;
+            apply_batch_skip_pow(&mut state, &t.batch, &ts, compute_header_hash(&header)).unwrap();
+            ts.push(t.batch.timestamp);
+            storage
+                .commit_chain(
+                    state.height - 1,
+                    std::slice::from_ref(&t.batch),
+                    std::slice::from_ref(&state.effects),
+                    &state,
+                )
+                .unwrap();
+        }
+        assert!(state.capped > 0, "all but a sliver of each block withheld");
+        drop(storage);
+        let loaded = Storage::open(dir.path())
+            .unwrap()
+            .load_state()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (loaded.depth, loaded.capped, loaded.weight()),
+            (state.depth, state.capped, state.weight())
         );
     }
 }

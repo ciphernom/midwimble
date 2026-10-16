@@ -9,7 +9,9 @@
 //! SMT inclusion proof against a midstate header.
 //!
 //! A registered bond authorises the blocks its key signs
-//! (`check_miner_authorization`, from `BONDED_MINING_FROM`), and fork choice
+//! (`check_miner_authorization`); from `BONDED_MINING_FROM` a block must be
+//! signed whenever a registered bond could sign it, and an unsigned block
+//! counts for only a sliver of its work (`credit_in_window`). Fork choice
 //! caps how much work any one bond's blocks add (`credit_work`), so a
 //! producer's capacity scales with the bonds behind it, co-bonds included.
 //! Fork choice also caps the work any one block adds, at a quarter above the
@@ -396,8 +398,14 @@ impl BondRegistration {
 // ── Bonded mining in consensus ──────────────────────────────────────────────
 
 /// First height whose block must be authorised by a registered, eligible
-/// bond. Genesis is fixed data that nobody mines, so bonded mining begins
-/// with the first mined block.
+/// bond whenever one could sign it ([`any_can_sign`]). Genesis is fixed data
+/// that nobody mines, so bonded mining begins with the first mined block.
+///
+/// While no registered bond can sign (before the first registration, or if
+/// every bond has lapsed) a block may be unsigned, and fork choice credits
+/// it with only the over-cap sliver ([`credit_in_window`]): enough to keep
+/// the chain, and the midstate relay with it, moving until a bond registers,
+/// never enough to win against signed blocks.
 #[cfg(not(feature = "fast-mining"))]
 pub const BONDED_MINING_FROM: u64 = 1;
 /// Test builds: an authorisation is optional, but checked in full whenever a
@@ -747,6 +755,18 @@ impl MinerBond {
         counts: &im::HashMap<[u8; 32], u32>,
         block_timestamp: u64,
     ) -> [u8; 32] {
+        self.signer_for(bonds, counts, block_timestamp)
+            .unwrap_or(self.bond_id)
+    }
+
+    /// [`MinerBond::choose_signer`] among only the bonds that can sign now:
+    /// `None` when none of this producer's bonds is registered and eligible.
+    pub fn signer_for(
+        &self,
+        bonds: &BondSet,
+        counts: &im::HashMap<[u8; 32], u32>,
+        block_timestamp: u64,
+    ) -> Option<[u8; 32]> {
         let key = self.mining_key();
         std::iter::once(self.bond_id)
             .chain(self.co_bonds.iter().map(|c| c.bond_id))
@@ -756,7 +776,6 @@ impl MinerBond {
                     .is_some_and(|e| e.mining_key == key && e.eligible_at(block_timestamp))
             })
             .min_by_key(|id| counts.get(id).copied().unwrap_or(0))
-            .unwrap_or(self.bond_id)
     }
 
     pub fn mining_key(&self) -> [u8; 32] {
@@ -1029,11 +1048,25 @@ pub fn signer_cap(bonds: &BondSet, block_timestamp: u64) -> usize {
     CAP_WINDOW.div_ceil(eligible.clamp(1, CAP_K))
 }
 
+/// Whether any registered bond could sign a block timestamped
+/// `block_timestamp`. From [`BONDED_MINING_FROM`] a block must be signed
+/// exactly when one could.
+pub fn any_can_sign(bonds: &BondSet, block_timestamp: u64) -> bool {
+    bonds.values().any(|e| e.eligible_at(block_timestamp))
+}
+
+/// What fork choice credits an over-cap or unsigned block: a sliver of its
+/// work, never zero, so a longer chain is always a heavier one.
+pub fn sliver(work: u128) -> u128 {
+    (work / OVER_CAP_WORK_DIVISOR).max(1)
+}
+
 /// Records a block in the fork-choice windows and returns the work it adds to
 /// its chain's weight: its work as far as [`cap_work`] allows, all of that
 /// while the bond has signed at most `signer_cap` of the last `CAP_WINDOW`
 /// blocks, this one included, and a sliver beyond (never zero, so a longer
-/// chain is always a heavier one). `state.height` is the block's own height.
+/// chain is always a heavier one). From [`BONDED_MINING_FROM`] an unsigned
+/// block adds only the sliver. `state.height` is the block's own height.
 pub fn credit_work(
     state: &mut super::types::State,
     signer: Option<[u8; 32]>,
@@ -1045,6 +1078,7 @@ pub fn credit_work(
         &mut state.recent_signers,
         &mut state.signer_counts,
         &state.bonds,
+        state.height,
         signer,
         work,
         block_timestamp,
@@ -1082,12 +1116,14 @@ pub fn cap_work(floor: &mut im::Vector<(u64, u128)>, height: u64, work: u128) ->
     credited
 }
 
-/// The per-bond half of [`credit_work`], on a bare window. Storage replays
-/// blocks onto its own records and must weigh each one exactly as the node did.
+/// The per-bond half of [`credit_work`], on a bare window, for the block at
+/// `height`. Storage replays blocks onto its own records and must weigh each
+/// one exactly as the node did.
 pub fn credit_in_window(
     recent: &mut im::Vector<Option<[u8; 32]>>,
     counts: &mut im::HashMap<[u8; 32], u32>,
     bonds: &BondSet,
+    height: u64,
     signer: Option<[u8; 32]>,
     work: u128,
     block_timestamp: u64,
@@ -1114,20 +1150,27 @@ pub fn credit_in_window(
             if counts.get(&id).copied().unwrap_or(0) as usize
                 > signer_cap(bonds, block_timestamp) =>
         {
-            (work / OVER_CAP_WORK_DIVISOR).max(1)
+            sliver(work)
         }
+        None if height >= BONDED_MINING_FROM => sliver(work),
         _ => work,
     }
 }
 
-/// Whether a block could add `credited` to its chain's weight, given
-/// `creditable`, its work as far as the work cap allows ([`cap_work`]): all
-/// of that, or, for a signed block, the sliver an over-cap block adds
-/// ([`credit_in_window`]). Headers-first sync checks claimed chain weights
-/// with this (the work window is in the headers; the bond set is not, so
-/// which of the two is right is settled when the block is applied).
-pub fn credit_possible(creditable: u128, signed: bool, credited: u128) -> bool {
-    credited == creditable || (signed && credited == (creditable / OVER_CAP_WORK_DIVISOR).max(1))
+/// Whether the block at `height` could add `credited` to its chain's weight,
+/// given `creditable`, its work as far as the work cap allows ([`cap_work`]):
+/// for a signed block, all of that or the sliver an over-cap block adds; for
+/// an unsigned one, the sliver from [`BONDED_MINING_FROM`] and all of it
+/// before ([`credit_in_window`]). Headers-first sync checks claimed chain
+/// weights with this (the work window is in the headers; the bond set is
+/// not, so which of a signed block's two is right is settled when the block
+/// is applied).
+pub fn credit_possible(creditable: u128, signed: bool, height: u64, credited: u128) -> bool {
+    match (signed, height >= BONDED_MINING_FROM) {
+        (true, _) => credited == creditable || credited == sliver(creditable),
+        (false, true) => credited == sliver(creditable),
+        (false, false) => credited == creditable,
+    }
 }
 
 /// Rebuilds the window from the signers of the blocks before `state`, oldest
@@ -1143,6 +1186,7 @@ pub fn rebuild_signer_window(
             &mut state.recent_signers,
             &mut state.signer_counts,
             &state.bonds,
+            0,
             signer,
             0,
             0,
@@ -1225,25 +1269,69 @@ mod cap_tests {
         }
     }
 
-    /// A block adds all its work, or, if signed and over its cap, a sliver:
-    /// nothing else.
+    /// A signed block adds all its work or, over its cap, a sliver; an
+    /// unsigned one adds all of it before bonded mining begins and only the
+    /// sliver after: nothing else.
     #[test]
     fn possible_credits() {
         let work = 1u128 << 40;
         let sliver = work / OVER_CAP_WORK_DIVISOR;
-        assert!(credit_possible(work, false, work));
-        assert!(credit_possible(work, true, work));
-        assert!(credit_possible(work, true, sliver));
-        assert!(
-            !credit_possible(work, false, sliver),
-            "unsigned blocks are never capped"
-        );
-        for other in [0, sliver - 1, sliver + 1, work - 1, work + 1] {
-            assert!(!credit_possible(work, true, other), "{other}");
+        let (bonded, before) = (BONDED_MINING_FROM, BONDED_MINING_FROM - 1);
+        for h in [bonded, before] {
+            assert!(credit_possible(work, true, h, work));
+            assert!(credit_possible(work, true, h, sliver));
+            for other in [0, sliver - 1, sliver + 1, work - 1, work + 1] {
+                assert!(!credit_possible(work, true, h, other), "{other}");
+                assert!(!credit_possible(work, false, h, other), "{other}");
+            }
         }
+        assert!(credit_possible(work, false, before, work));
+        assert!(!credit_possible(work, false, before, sliver));
+        assert!(credit_possible(work, false, bonded, sliver));
+        assert!(
+            !credit_possible(work, false, bonded, work),
+            "an unsigned block counts for a sliver once bonded mining begins"
+        );
         // Tiny work: the sliver is never zero, so a longer chain is heavier.
-        assert!(credit_possible(1, true, 1));
-        assert!(!credit_possible(1, true, 0));
+        assert!(credit_possible(1, true, bonded, 1));
+        assert!(!credit_possible(1, true, bonded, 0));
+        assert!(credit_possible(1, false, bonded, 1));
+    }
+
+    /// The same rule as the block's own weighing: an unsigned block in the
+    /// bonded era is credited the sliver, before it all its work.
+    #[test]
+    fn unsigned_blocks_count_for_a_sliver_once_bonded_mining_begins() {
+        let none = BondSet::default();
+        let work = 1u128 << 30;
+        for (height, expected) in [
+            (BONDED_MINING_FROM, sliver(work)),
+            (BONDED_MINING_FROM - 1, work),
+        ] {
+            let (mut recent, mut counts) = (im::Vector::new(), im::HashMap::new());
+            let credited = credit_in_window(&mut recent, &mut counts, &none, height, None, work, 0);
+            assert_eq!(credited, expected, "height {height}");
+            assert!(credit_possible(work, false, height, credited));
+            assert_eq!(recent.back(), Some(&None), "recorded as unsigned");
+            assert!(counts.is_empty());
+        }
+        // Who could sign decides whether a block may be unsigned.
+        let t = 1_800_000_000;
+        let mut bonds = BondSet::default();
+        assert!(!any_can_sign(&bonds, t));
+        let edge = est_midstate_height(t) + MIN_REMAINING_BOND_LOCK;
+        bonds.insert(
+            [7; 32],
+            BondEntry {
+                bonded_until: edge,
+                ..eligible_bond()
+            },
+        );
+        assert!(any_can_sign(&bonds, t));
+        assert!(
+            !any_can_sign(&bonds, t + 24 * 60 * 60),
+            "a day later its lock is too short to sign"
+        );
     }
 
     /// Revocation removes exactly the bonds proven above the fork.
@@ -1840,7 +1928,7 @@ mod tests {
     mod registration {
         use super::*;
         use crate::core::relay::devnet::DevnetMidstate;
-        use crate::core::relay::{relay_min_work, Relay, RelayHeaders};
+        use crate::core::relay::{Relay, RelayHeaders};
 
         /// 3 units of work: a day is 4,320 units, capped at 72 a header.
         const MW_TARGET: [u8; 32] = {
@@ -1867,7 +1955,7 @@ mod tests {
                         prev: run.prev,
                         headers: run.headers,
                     },
-                    relay_min_work(&MW_TARGET),
+                    crate::core::state::current_timestamp(),
                 )
                 .unwrap();
             (relay, registration, ms)

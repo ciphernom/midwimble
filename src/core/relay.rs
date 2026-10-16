@@ -11,8 +11,10 @@
 //!
 //! * A block may relay a run of midstate headers ([`RelayHeaders`]) that
 //!   extends the relay's tip, or that forks from a header in its window and
-//!   outweighs everything it replaces. Each header must carry at least a
-//!   sixteenth of a midwimble block's work and valid proof of work.
+//!   outweighs everything it replaces. Each header must carry exactly the
+//!   target midstate's own difficulty rule gives it ([`midstate_target`]), a
+//!   timestamp at most [`RELAY_MAX_FUTURE`] past the relaying block's, and
+//!   valid proof of work.
 //! * A registration's header must be on the relay's chain, buried under the
 //!   work the registration rule asks for (`bond::BondRegistration::verify`).
 //! * When a heavier branch replaces relay headers, every bond proven against
@@ -26,11 +28,25 @@
 //! older can be forked from or proven against. Each entry carries a digest
 //! chained through every entry before it, and the state root commits to the
 //! tip's, so the window is authenticated by one hash.
+//!
+//! Holding relayed headers to midstate's difficulty is what keeps the window
+//! honest. Without it a producer could relay a long run of cheap headers and
+//! push the real chain out of the window, after which it could never be
+//! relayed again. With it a fake header costs what a real midstate block
+//! costs, and more the further a fake branch runs ahead of real time: its
+//! timestamps cannot pass the relaying block's by more than
+//! [`RELAY_MAX_FUTURE`], so midstate's rule doubles its difficulty every four
+//! hours of blocks it gets ahead. Running a window's length ahead of the real
+//! chain would take midstate's whole network years of work; a branch forked
+//! inside the window has to outweigh the real chain from there instead,
+//! which takes more than midstate's whole hashrate for up to two days.
 
 use super::anchor::{link_mining_hash, HeaderLink};
 use super::simd_mining::{check_pow_chains, pow_seed, PowCheck};
-use super::state::calculate_work;
-use super::types::{hash_domain, MIDSTATE_BLOCK_HASH, MIDSTATE_BLOCK_HEIGHT};
+use super::state::{asert_target, calculate_work};
+use super::types::{
+    hash_domain, MAX_FUTURE_BLOCK_TIME, MIDSTATE_BLOCK_HASH, MIDSTATE_BLOCK_HEIGHT,
+};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 
@@ -44,16 +60,72 @@ pub const RELAY_WEIGHT_PER_HEADER: u64 = 4;
 /// Midstate headers the relay keeps below its tip: two days. A registration's
 /// header must be this recent, and no branch may fork from further back.
 pub const RELAY_WINDOW: u64 = 2 * 24 * 60;
-/// A relayed header must claim at least this fraction of the relaying
-/// block's work. Real midstate headers carry more than a midwimble block's
-/// (midwimble's target is easier by its merged-mining share), so this only
-/// stops headers made to be cheap: filling a block with them costs a
-/// sixteenth of a midwimble block each.
-pub const RELAY_MIN_WORK_DIVISOR: u128 = 16;
+/// How far a relayed header's timestamp may be past the relaying block's:
+/// twice the future limit each chain allows its own blocks, so a real header
+/// relayed as soon as it is mined always fits whichever way the two clocks
+/// differ, while a fake branch cannot claim time that has not passed.
+pub const RELAY_MAX_FUTURE: u64 = 2 * MAX_FUTURE_BLOCK_TIME;
 
-/// The least work a header relayed by a block with this target may claim.
-pub fn relay_min_work(midwimble_target: &[u8; 32]) -> u128 {
-    (calculate_work(midwimble_target) / RELAY_MIN_WORK_DIVISOR).max(1)
+/// Midstate's genesis target and time, which its difficulty rule (the same
+/// ASERT as midwimble's, anchored at midstate's genesis) is computed from.
+#[cfg(not(feature = "fast-mining"))]
+const MIDSTATE_ASERT_TARGET: [u8; 32] = {
+    let mut t = [0xff; 32];
+    t[0] = 0x00;
+    t[1] = 0x11;
+    t
+};
+#[cfg(not(feature = "fast-mining"))]
+const MIDSTATE_ASERT_TIME: u64 = 1_772_274_770;
+
+/// Test builds: the stand-in midstate's ([`devnet`]), whose headers are
+/// timestamped on schedule ([`devnet_timestamp`]) and so all carry
+/// [`DEVNET_TARGET`].
+#[cfg(feature = "fast-mining")]
+const MIDSTATE_ASERT_TARGET: [u8; 32] = DEVNET_TARGET;
+#[cfg(feature = "fast-mining")]
+const MIDSTATE_ASERT_TIME: u64 = DEVNET_EPOCH - 60 - 60 * MIDSTATE_BLOCK_HEIGHT;
+
+/// About a thousand attempts a header: cheap with test extensions, and enough
+/// work that sixty of them bury a test registration.
+#[cfg(feature = "fast-mining")]
+pub const DEVNET_TARGET: [u8; 32] = {
+    let mut t = [0xff; 32];
+    t[0] = 0x00;
+    t[1] = 0x3f;
+    t
+};
+/// When the stand-in midstate's chain reaches the relay's root: long before
+/// any test chain's genesis, so its headers are never in a block's future.
+#[cfg(feature = "fast-mining")]
+pub const DEVNET_EPOCH: u64 = 1_600_000_000;
+
+/// The stand-in midstate's timestamp for its header at `height`: one a
+/// minute from the relay's root, exactly on schedule.
+#[cfg(feature = "fast-mining")]
+pub fn devnet_timestamp(height: u64) -> u64 {
+    midstate_schedule(height)
+}
+
+/// The timestamp that puts midstate's header at `height` exactly on its
+/// schedule: a header whose parent was stamped
+/// `midstate_schedule(height - 1)` carries midstate's genesis target. Each
+/// four hours earlier doubles its difficulty, each four hours later halves
+/// it.
+pub fn midstate_schedule(height: u64) -> u64 {
+    MIDSTATE_ASERT_TIME.saturating_add(60u64.saturating_mul(height.saturating_add(1)))
+}
+
+/// The target midstate's difficulty rule gives its header at `height`, whose
+/// parent is timestamped `parent_timestamp` (midstate checks exactly this:
+/// `calculate_target(prev.height + 1, prev.timestamp)`).
+pub fn midstate_target(height: u64, parent_timestamp: u64) -> [u8; 32] {
+    asert_target(
+        &MIDSTATE_ASERT_TARGET,
+        MIDSTATE_ASERT_TIME,
+        height,
+        parent_timestamp,
+    )
 }
 
 fn root_hash() -> [u8; 32] {
@@ -338,12 +410,18 @@ impl Relay {
             .fold(0u128, |sum, (_, e)| sum.saturating_add(e.work.min(cap)))
     }
 
-    /// Applies a block's relayed headers, after the cheap checks: each builds
-    /// on the one before, the first on an entry of this relay; each claims at
-    /// least `min_work` and meets its own target; and a run that forks below
-    /// the tip is new and outweighs the branch it replaces. Proof of work is
-    /// left to [`RelayHeaders::verify_pow`]. On error the relay is unchanged.
-    pub fn extend(&mut self, relayed: &RelayHeaders, min_work: u128) -> Result<RelayChange> {
+    /// Applies the headers relayed by a block timestamped `block_timestamp`,
+    /// after the cheap checks: each builds on the one before, the first on an
+    /// entry of this relay; each carries the target midstate's difficulty
+    /// rule gives it and meets that target, and is timestamped no more than
+    /// [`RELAY_MAX_FUTURE`] past the block; and a run that forks below the
+    /// tip is new and outweighs the branch it replaces. Proof of work is left
+    /// to [`RelayHeaders::verify_pow`]. On error the relay is unchanged.
+    ///
+    /// The root's own header fields are not known, only its hash, so its
+    /// child's target cannot be recomputed and is taken as claimed: one
+    /// header, whose work still counts only as far as its proof of work.
+    pub fn extend(&mut self, relayed: &RelayHeaders, block_timestamp: u64) -> Result<RelayChange> {
         let n = relayed.headers.len();
         if n == 0 {
             bail!("a block that relays midstate headers relays at least one");
@@ -364,16 +442,26 @@ impl Relay {
                 bail!("relayed headers repeat the relay's own chain");
             }
         }
+        let latest = block_timestamp.saturating_add(RELAY_MAX_FUTURE);
         let mut added = Vec::with_capacity(n);
         let mut last = base;
         for (i, link) in relayed.headers.iter().enumerate() {
             if link.final_hash >= link.target {
                 bail!("relayed midstate header {i} misses its own target");
             }
-            let work = calculate_work(&link.target);
-            if work < min_work {
-                bail!("relayed midstate header {i} claims less work than a relayed header must");
+            if link.timestamp > latest {
+                bail!(
+                    "relayed midstate header {i} is timestamped {}, more than {RELAY_MAX_FUTURE}s past the block relaying it",
+                    link.timestamp
+                );
             }
+            if !last.is_root() && link.target != midstate_target(last.height + 1, last.timestamp) {
+                bail!(
+                    "relayed midstate header {i} (height {}) does not carry the target midstate's difficulty rule gives it",
+                    last.height + 1
+                );
+            }
+            let work = calculate_work(&link.target);
             let entry = last.next(link, work);
             if self
                 .heights
@@ -560,15 +648,6 @@ pub mod devnet {
     use crate::core::mmr::UtxoAccumulator;
     use crate::core::types::hash;
 
-    /// About a thousand attempts a header: cheap with test extensions, and
-    /// well above what the relay asks of a test chain's headers.
-    const DEVNET_TARGET: [u8; 32] = {
-        let mut t = [0xff; 32];
-        t[0] = 0x00;
-        t[1] = 0x3f;
-        t
-    };
-
     /// Headers mined on top of the relay root, with a UTXO set of coins.
     #[derive(Clone, Debug)]
     pub struct DevnetMidstate {
@@ -634,7 +713,7 @@ pub mod devnet {
                     state_root: roots
                         .state_root(height)
                         .expect("devnet heights are past V4"),
-                    timestamp: 1_800_000_000 + 60 * height,
+                    timestamp: devnet_timestamp(height),
                     target: self.target,
                     nonce: 0,
                     final_hash: [0; 32],
@@ -686,56 +765,76 @@ pub mod devnet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::extension::create_extension;
     use crate::core::types::hash;
+    use primitive_types::U256;
 
-    /// Mines a run of `n` headers on `prev` at `target` (cheap with test
-    /// extensions; the few the production build mines take a moment).
-    fn run(prev: [u8; 32], n: usize, salt: u8, target: [u8; 32]) -> RelayHeaders {
-        let mut headers: Vec<HeaderLink> = Vec::new();
-        let mut last = prev;
-        for i in 0..n {
-            let mut link = HeaderLink {
-                post_tx_midstate: hash(&[salt, i as u8]),
-                state_root: hash(&[salt, i as u8, 1]),
-                timestamp: 1_800_000_000 + i as u64,
-                target,
-                nonce: 0,
-                final_hash: [0; 32],
-            };
-            let mining = link_mining_hash(last, &link);
-            loop {
-                let fin = create_extension(mining, link.nonce).final_hash;
-                if fin < target {
-                    link.final_hash = fin;
-                    break;
-                }
-                link.nonce += 1;
-            }
-            last = link.final_hash;
-            headers.push(link);
-        }
-        RelayHeaders { prev, headers }
+    /// A block timestamp no relayed header in these tests is ahead of.
+    const LATER: u64 = u64::MAX / 4;
+
+    fn on_schedule(height: u64) -> u64 {
+        midstate_schedule(height)
     }
 
-    const EASY: [u8; 32] = [0xff; 32];
-    fn harder() -> [u8; 32] {
-        let mut t = [0xff; 32];
-        t[0] = 0x7f;
-        t
+    /// A header at `height` on `prev`, timestamped `ts`, carrying `target`
+    /// and a final hash that meets it. `extend` does not check proof of work
+    /// (that is `verify_pow`'s half), so none is done.
+    fn link(prev: [u8; 32], height: u64, ts: u64, target: [u8; 32], salt: u8) -> HeaderLink {
+        let seed = hash(&[&prev[..], &height.to_le_bytes(), &[salt]].concat());
+        let below = U256::from_big_endian(&seed) % U256::from_big_endian(&target);
+        HeaderLink {
+            post_tx_midstate: hash(&[&seed[..], b"post"].concat()),
+            state_root: hash(&[&seed[..], b"root"].concat()),
+            timestamp: ts,
+            target,
+            nonce: 0,
+            final_hash: below.to_big_endian(),
+        }
+    }
+
+    /// `n` headers on `base`, each timestamped `ts(height)` and carrying the
+    /// target midstate's rule gives it.
+    fn run_with(base: &RelayEntry, n: usize, salt: u8, ts: impl Fn(u64) -> u64) -> RelayHeaders {
+        let mut headers: Vec<HeaderLink> = Vec::new();
+        let (mut prev, mut prev_ts) = (base.hash, base.timestamp);
+        for i in 0..n {
+            let height = base.height + 1 + i as u64;
+            if i == 0 && base.is_root() {
+                prev_ts = ts(height - 1);
+            }
+            let l = link(
+                prev,
+                height,
+                ts(height),
+                midstate_target(height, prev_ts),
+                salt,
+            );
+            (prev, prev_ts) = (l.final_hash, l.timestamp);
+            headers.push(l);
+        }
+        RelayHeaders {
+            prev: base.hash,
+            headers,
+        }
+    }
+
+    fn run(base: &RelayEntry, n: usize, salt: u8) -> RelayHeaders {
+        run_with(base, n, salt, on_schedule)
+    }
+
+    fn work_on_schedule() -> u128 {
+        calculate_work(&MIDSTATE_ASERT_TARGET)
     }
 
     #[test]
     fn runs_extend_the_tip_and_commit_to_everything() {
         let mut relay = Relay::genesis();
         let root = relay.commitment();
-        let a = run(RelayEntry::root().hash, 5, 1, EASY);
-        a.verify_pow().unwrap();
-        let change = relay.extend(&a, 1).unwrap();
+        let a = run(&RelayEntry::root(), 5, 1);
+        let change = relay.extend(&a, LATER).unwrap();
         assert_eq!(change.added.len(), 5);
         assert!(change.removed.is_empty() && change.fork_from.is_none());
         assert_eq!(relay.tip().height, MIDSTATE_BLOCK_HEIGHT + 5);
-        assert_eq!(relay.tip().chain_work, 5 * calculate_work(&EASY));
+        assert_eq!(relay.tip().chain_work, 5 * work_on_schedule());
         assert_ne!(relay.commitment(), root);
         // Rebuilt from its entries, it is the same relay; tampered, it is not.
         let entries: Vec<RelayEntry> = relay.entries().copied().collect();
@@ -748,43 +847,39 @@ mod tests {
         assert_eq!(back, relay);
 
         // Continuing from the tip works; from nowhere, or repeating, does not.
-        let b = run(relay.tip().hash, 2, 2, EASY);
-        relay.clone().extend(&b, 1).unwrap();
-        assert!(relay.clone().extend(&run([9; 32], 1, 3, EASY), 1).is_err());
+        let b = run(relay.tip(), 2, 2);
+        relay.clone().extend(&b, LATER).unwrap();
+        let mut nowhere = b.clone();
+        nowhere.prev = [9; 32];
+        assert!(relay.clone().extend(&nowhere, LATER).is_err());
         let again = RelayHeaders {
             prev: a.prev,
             headers: a.headers[..2].to_vec(),
         };
-        assert!(relay.clone().extend(&again, 1).is_err());
-        // Too little work, or a header that misses its own target.
-        assert!(relay.clone().extend(&b, 2).is_err());
+        assert!(relay.clone().extend(&again, LATER).is_err());
+        // A header that misses its own target.
         let mut missed = b.clone();
-        missed.headers[1].target = [0; 32];
-        assert!(relay.clone().extend(&missed, 1).is_err());
-        // A forged proof of work passes the cheap checks and fails the
-        // expensive one.
-        let mut forged = b.clone();
-        forged.headers[1].nonce += 1;
-        relay.clone().extend(&forged, 1).unwrap();
-        assert!(forged.verify_pow().is_err());
+        missed.headers[1].final_hash = [0xff; 32];
+        assert!(relay.clone().extend(&missed, LATER).is_err());
     }
 
     #[test]
     fn heavier_branches_replace_lighter_ones_and_say_where() {
         let mut relay = Relay::genesis();
         let root = RelayEntry::root();
-        relay.extend(&run(root.hash, 6, 1, EASY), 1).unwrap();
-        let fork_at = relay.get(root.height + 2).unwrap().hash;
+        relay.extend(&run(&root, 6, 1), LATER).unwrap();
+        let fork_at = *relay.get(root.height + 2).unwrap();
         let before = relay.clone();
         // Same length, same work: not heavier.
-        let level = run(fork_at, 4, 7, EASY);
-        assert!(relay.clone().extend(&level, 1).is_err());
-        // Fewer but harder headers outweigh it.
-        let heavy = run(fork_at, 3, 8, harder());
-        let change = relay.extend(&heavy, 1).unwrap();
+        let level = run(&fork_at, 4, 7);
+        assert!(relay.clone().extend(&level, LATER).is_err());
+        // One more header outweighs it (every header follows midstate's
+        // difficulty, so on schedule they all weigh the same).
+        let heavy = run(&fork_at, 5, 8);
+        let change = relay.extend(&heavy, LATER).unwrap();
         assert_eq!(change.fork_from, Some(root.height + 2));
         assert_eq!(change.removed.len(), 4);
-        assert_eq!(relay.tip().height, root.height + 5);
+        assert_eq!(relay.tip().height, root.height + 7);
         assert_eq!(
             relay.get(root.height + 3).unwrap().hash,
             heavy.headers[0].final_hash
@@ -798,20 +893,16 @@ mod tests {
         assert_eq!(redone, relay);
     }
 
-    /// Mines more than a window of headers: test builds only.
-    #[cfg(feature = "fast-mining")]
     #[test]
     fn the_window_is_kept_and_burial_is_capped() {
         let mut relay = Relay::genesis();
         let root = RelayEntry::root();
         // Fill past the window in a few blocks' worth of runs.
-        let mut prev = root.hash;
         let mut total = 0;
         while total <= RELAY_WINDOW + 10 {
             let n = (RELAY_WINDOW as usize + 20 - total as usize).min(MAX_RELAY_HEADERS_PER_BLOCK);
-            let r = run(prev, n, (total % 251) as u8, EASY);
-            prev = r.headers.last().unwrap().final_hash;
-            let change = relay.extend(&r, 1).unwrap();
+            let r = run(relay.tip(), n, (total % 251) as u8);
+            let change = relay.extend(&r, LATER).unwrap();
             total += n as u64;
             assert_eq!(relay.len() as u64, (total + 1).min(RELAY_WINDOW + 1));
             if total > RELAY_WINDOW {
@@ -824,12 +915,12 @@ mod tests {
         let h = relay.base().height;
         assert_eq!(
             relay.credited_above(h, u128::MAX),
-            RELAY_WINDOW as u128 * calculate_work(&EASY)
+            RELAY_WINDOW as u128 * work_on_schedule()
         );
         assert_eq!(relay.credited_above(h, 0), 0);
-        let from_old = run(root.hash, 1, 99, EASY);
+        let from_old = run(&root, 1, 99);
         assert!(
-            relay.clone().extend(&from_old, 1).is_err(),
+            relay.clone().extend(&from_old, LATER).is_err(),
             "the root is out of the window"
         );
     }
@@ -838,7 +929,7 @@ mod tests {
     fn a_feed_proposes_the_run_the_relay_needs() {
         let root = RelayEntry::root();
         let mut relay = Relay::genesis();
-        let chain = run(root.hash, 8, 1, EASY);
+        let chain = run(&root, 8, 1);
         let feed_run = MidstateHeaders {
             start: root.height + 1,
             prev: root.hash,
@@ -854,29 +945,267 @@ mod tests {
                     prev: chain.prev,
                     headers: chain.headers[..3].to_vec(),
                 },
-                1,
+                LATER,
             )
             .unwrap();
         let rest = feed.next_for(&relay).unwrap();
         assert_eq!(rest.headers, chain.headers[3..].to_vec());
-        relay.extend(&rest, 1).unwrap();
+        relay.extend(&rest, LATER).unwrap();
         assert!(feed.next_for(&relay).is_none(), "nothing left to relay");
 
-        // A heavier branch in the feed is proposed from where it branches off.
-        let fork_at = relay.get(root.height + 5).unwrap().hash;
-        let branch = run(fork_at, 4, 5, harder());
+        // A heavier (longer) branch in the feed is proposed from where it
+        // branches off.
+        let fork_at = *relay.get(root.height + 5).unwrap();
+        let branch = run(&fork_at, 4, 5);
         feed.add(
             &MidstateHeaders {
                 start: root.height + 6,
-                prev: fork_at,
+                prev: fork_at.hash,
                 headers: branch.headers.clone(),
             },
             true,
         );
         let proposed = feed.next_for(&relay).unwrap();
         assert_eq!(proposed, branch);
-        relay.extend(&proposed, 1).unwrap();
+        relay.extend(&proposed, LATER).unwrap();
         feed.prune(&relay);
         assert!(feed.next_for(&relay).is_none());
+    }
+
+    /// Every relayed header must carry exactly the target midstate's own
+    /// rule gives it: neither an easier one (a cheap header) nor a harder
+    /// one. Only the root's child, whose parent's timestamp is not known, is
+    /// taken as claimed.
+    #[test]
+    fn relayed_headers_carry_midstates_difficulty() {
+        let mut relay = Relay::genesis();
+        let root = RelayEntry::root();
+        // The root's child may claim any target; the next must follow it.
+        let mut child = run(&root, 2, 1);
+        let easy = [0xff; 32];
+        child.headers[0] = link(
+            root.hash,
+            root.height + 1,
+            on_schedule(root.height + 1),
+            easy,
+            1,
+        );
+        child.headers[1] = link(
+            child.headers[0].final_hash,
+            root.height + 2,
+            on_schedule(root.height + 2),
+            midstate_target(root.height + 2, on_schedule(root.height + 1)),
+            1,
+        );
+        relay.extend(&child, LATER).unwrap();
+        assert_eq!(
+            relay.get(root.height + 1).unwrap().work,
+            calculate_work(&easy)
+        );
+
+        let tip = *relay.tip();
+        let good = run(&tip, 3, 2);
+        relay.clone().extend(&good, LATER).unwrap();
+        let wanted = U256::from_big_endian(&good.headers[1].target);
+        for (claimed, what) in [(wanted << 4, "easier"), (wanted >> 1, "harder")] {
+            let mut bad = good.clone();
+            let h = tip.height + 2;
+            let l = link(
+                bad.headers[0].final_hash,
+                h,
+                on_schedule(h),
+                claimed.to_big_endian(),
+                3,
+            );
+            bad.headers[1] = l;
+            bad.headers.truncate(2);
+            let err = relay.clone().extend(&bad, LATER).unwrap_err().to_string();
+            assert!(err.contains("difficulty rule"), "{what}: {err}");
+        }
+    }
+
+    /// A relayed header may be timestamped at most RELAY_MAX_FUTURE past the
+    /// block relaying it, root's child included.
+    #[test]
+    fn relayed_headers_cannot_claim_time_that_has_not_passed() {
+        let mut relay = Relay::genesis();
+        relay
+            .extend(&run(&RelayEntry::root(), 3, 1), LATER)
+            .unwrap();
+        let tip = *relay.tip();
+        let block = tip.timestamp + 600;
+        let latest = block + RELAY_MAX_FUTURE;
+        let at = |last: u64| {
+            move |h: u64| {
+                if h == tip.height + 2 {
+                    last
+                } else {
+                    tip.timestamp + 60 * (h - tip.height)
+                }
+            }
+        };
+        relay
+            .clone()
+            .extend(&run_with(&tip, 2, 2, at(latest)), block)
+            .unwrap();
+        let err = relay
+            .clone()
+            .extend(&run_with(&tip, 2, 2, at(latest + 1)), block)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("past the block"), "{err}");
+    }
+
+    /// Test builds: proof of work on the stand-in midstate's mined headers.
+    #[cfg(feature = "fast-mining")]
+    #[test]
+    fn relayed_headers_need_their_proof_of_work() {
+        let mut ms = devnet::DevnetMidstate::new();
+        ms.mine(5);
+        let run = ms.from_height(ms.mined.start);
+        let mined = RelayHeaders {
+            prev: run.prev,
+            headers: run.headers,
+        };
+        Relay::genesis().extend(&mined, LATER).unwrap();
+        mined.verify_pow().unwrap();
+        // A forged proof of work passes the cheap checks and fails the
+        // expensive one.
+        let mut forged = mined.clone();
+        forged.headers[3].nonce += 1;
+        Relay::genesis().extend(&forged, LATER).unwrap();
+        assert!(forged.verify_pow().is_err());
+    }
+
+    /// Real midstate headers (`testdata/midstate-headers.txt`, from a mainnet
+    /// node), checked against midstate's real rule: production builds only.
+    #[cfg(not(feature = "fast-mining"))]
+    mod real {
+        use super::*;
+
+        struct Real {
+            height: u64,
+            prev: [u8; 32],
+            link: HeaderLink,
+        }
+
+        fn real_headers() -> Vec<Real> {
+            let h32 = |s: &str| -> [u8; 32] {
+                let mut out = [0u8; 32];
+                hex::decode_to_slice(s, &mut out).unwrap();
+                out
+            };
+            include_str!("testdata/midstate-headers.txt")
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .map(|l| {
+                    let f: Vec<&str> = l.split_whitespace().collect();
+                    Real {
+                        height: f[0].parse().unwrap(),
+                        prev: h32(f[2]),
+                        link: HeaderLink {
+                            post_tx_midstate: h32(f[3]),
+                            state_root: h32(f[4]),
+                            timestamp: f[1].parse().unwrap(),
+                            target: h32(f[5]),
+                            nonce: f[6].parse().unwrap(),
+                            final_hash: h32(f[7]),
+                        },
+                    }
+                })
+                .collect()
+        }
+
+        /// A relay whose lowest entry is the first real header.
+        fn relay_at(first: &Real) -> Relay {
+            let work = calculate_work(&first.link.target);
+            let entry = RelayEntry {
+                height: first.height,
+                hash: first.link.final_hash,
+                prev: first.prev,
+                state_root: first.link.state_root,
+                timestamp: first.link.timestamp,
+                work,
+                chain_work: work,
+                digest: hash(b"a real midstate header"),
+            };
+            Relay::from_entries(vec![entry]).unwrap()
+        }
+
+        #[test]
+        fn real_headers_follow_midstates_rule_and_relay() {
+            let real = real_headers();
+            assert_eq!(real.len(), 200);
+            for pair in real.windows(2) {
+                assert_eq!(pair[1].height, pair[0].height + 1);
+                assert_eq!(pair[1].prev, pair[0].link.final_hash);
+                assert_eq!(
+                    pair[1].link.target,
+                    midstate_target(pair[1].height, pair[0].link.timestamp),
+                    "height {}",
+                    pair[1].height
+                );
+            }
+            // The relay takes all of them, relayed as they would be.
+            let mut relay = relay_at(&real[0]);
+            let run = RelayHeaders {
+                prev: real[0].link.final_hash,
+                headers: real[1..].iter().map(|r| r.link.clone()).collect(),
+            };
+            let last = real.last().unwrap().link.timestamp;
+            relay.extend(&run, last).unwrap();
+            assert_eq!(relay.tip().hash, real.last().unwrap().link.final_hash);
+            // Their proofs of work hold over midstate's header hash (a few:
+            // each is a full extension).
+            RelayHeaders {
+                prev: run.prev,
+                headers: run.headers[..3].to_vec(),
+            }
+            .verify_pow()
+            .unwrap();
+        }
+
+        /// The attack this rule stops: a run of cheap headers pushing the
+        /// real chain out of the window. A header carrying less than its
+        /// rule's target is refused outright, and the cheapest run the rule
+        /// allows, timestamped as late as a block may let it, costs more
+        /// than midstate's whole network could mine in years.
+        #[test]
+        fn a_cheap_branch_cannot_push_the_real_chain_out() {
+            let real = real_headers();
+            let mut relay = relay_at(&real[0]);
+            relay
+                .extend(
+                    &RelayHeaders {
+                        prev: real[0].link.final_hash,
+                        headers: real[1..].iter().map(|r| r.link.clone()).collect(),
+                    },
+                    LATER,
+                )
+                .unwrap();
+            let tip = *relay.tip();
+
+            // Sixteen times cheaper than the rule asks: refused at once.
+            let fair = midstate_target(tip.height + 1, tip.timestamp);
+            let cheap = (U256::from_big_endian(&fair) << 4).to_big_endian();
+            let fake = RelayHeaders {
+                prev: tip.hash,
+                headers: vec![link(tip.hash, tip.height + 1, tip.timestamp + 60, cheap, 1)],
+            };
+            assert!(relay.clone().extend(&fake, tip.timestamp + 60).is_err());
+
+            // The cheapest the rule allows: every header as late as allowed.
+            let latest = tip.timestamp + 60 + RELAY_MAX_FUTURE;
+            let (mut total, mut prev_ts) = (0u128, tip.timestamp);
+            for k in 1..=RELAY_WINDOW + 1 {
+                total += calculate_work(&midstate_target(tip.height + k, prev_ts));
+                prev_ts = latest;
+            }
+            let blocks = total / tip.work;
+            assert!(
+                blocks > 365 * 1440,
+                "pushing the window out costs {blocks} real midstate blocks' work"
+            );
+        }
     }
 }

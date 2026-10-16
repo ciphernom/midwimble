@@ -105,10 +105,12 @@ build from that file, so it must carry the target itself rather than a merge
 share: a share recalculated against midstate's live target would give every
 joiner a different chain.
 
-Start a bonded producer before announcing, since block 1 needs a registered
-bond. Its proof must be above the genesis's midstate anchor, so lock the
-bond after setting the parameters and register it about 75 midstate blocks
-later; set the genesis time about two hours out to leave room for that.
+Start a bonded producer before announcing. Its bond's proof must be above
+the genesis's midstate anchor, so take it after setting the parameters
+(`midwimble bond register` with the new build) and start the producer with
+`--midstate-rpc` straight away. Its blocks are unsigned until the proof is
+buried, about 60 midstate blocks (an hour) later, while they relay midstate's
+headers; then the bond registers by itself and every block after is signed.
 
 ## Ending it
 

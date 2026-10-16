@@ -100,7 +100,12 @@ pub fn verify_header_chain_with(
             .chain_weight
             .checked_sub(weight)
             .is_some_and(|added| {
-                crate::core::bond::credit_possible(creditable, header.signer.is_some(), added)
+                crate::core::bond::credit_possible(
+                    creditable,
+                    header.signer.is_some(),
+                    header.height,
+                    added,
+                )
             });
         if !possible {
             bail!(

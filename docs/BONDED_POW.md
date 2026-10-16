@@ -11,7 +11,9 @@ minimum. There is no slashing in v1: a bond is locked capital and an admission
 ticket, nothing more.
 
 Status: bonded mining is wired into consensus and required from block 1 in
-production builds (`bond::BONDED_MINING_FROM`). The bond template, its
+production builds (`bond::BONDED_MINING_FROM`) whenever a registered bond
+could sign the block (see "Launch interaction" for the blocks before the
+first registration). The bond template, its
 midstate-side compiler, proof and registration verification, the bond set and
 block authorisation all exist and are tested (`core/bond.rs`, `core/state.rs`,
 `core/template.rs` here; `script.rs`, `mmr.rs`, `node.rs` and the RPC in
@@ -101,12 +103,15 @@ producers mine:
 
 - **Relaying.** A block may carry a run of midstate headers (at most a day's,
   1,440) that extends the relay's tip, or that forks from a header in its
-  window and outweighs everything it replaces. Each must claim at least a
-  sixteenth of the relaying block's work (real midstate headers carry more
-  than a whole midwimble block's, since midwimble's target is easier by its
-  merged-mining share) and have valid proof of work. Linkage and claimed work
-  are checked first; the proofs of work with the block's other proofs, the
-  first alone and the rest in parallel batches.
+  window and outweighs everything it replaces. Each must carry exactly the
+  target midstate's own difficulty rule gives it (the same ASERT as
+  midwimble's, anchored at midstate's genesis: `relay::midstate_target`), be
+  timestamped at most 30 minutes past the relaying block
+  (`RELAY_MAX_FUTURE`), and have valid proof of work. Linkage, targets and
+  timestamps are checked first; the proofs of work with the block's other
+  proofs, the first alone and the rest in parallel batches. Only the root's
+  child is taken at its claimed target, since the root's own timestamp is not
+  known.
 - **The chain.** The relay keeps the heaviest chain relayed so far, starting
   from the midstate block the genesis commits to (`MIDSTATE_BLOCK_*`), and the
   last two days of it (`RELAY_WINDOW`). Nothing older can be forked from or
@@ -121,11 +126,28 @@ producers mine:
 
 Keeping a fake bond therefore means keeping a fake midstate branch heavier
 than the real one as producers relay it, which takes more than midstate's
-whole hashrate for as long as the bond is to last. That needs producers to
-relay: a node started with `--midstate-rpc` polls its midstate node and
-relays new headers in every block it mines. A bond file can also carry the
-headers its own registration needs (`midwimble bond register` writes them),
-so a producer without a midstate node can still register.
+whole hashrate for as long as the bond is to last.
+
+The difficulty rule is what keeps that true. The window holds the last 2,880
+headers, and a branch can only fork from inside it. If relayed headers could
+be cheap, one producer could relay a few blocks' worth of them and push the
+real chain out of the window, and it could never be relayed again: no honest
+bond could register after that. Held to midstate's difficulty, a fake header
+costs a real midstate block's work, and more the further its branch runs
+ahead of real time: its timestamps cannot pass the relaying block's by more
+than 30 minutes, so midstate's rule doubles its difficulty for every four
+hours of blocks it gets ahead. Running a window's length ahead of the real
+chain would take midstate's whole network years of work (about 1.3 million
+blocks' worth on real headers: `relay::tests::real`). A branch forked inside
+the window has to outweigh the real chain from there instead, which takes
+more than midstate's whole hashrate for up to two days: a majority attack on
+midstate itself.
+
+That needs producers to relay: a node started with `--midstate-rpc` polls
+its midstate node and relays new headers in every block it mines. A bond
+file can also carry the headers its own registration needs (`midwimble bond
+register` writes them), so a producer without a midstate node can still
+register.
 
 ### What the proof must match
 
@@ -219,7 +241,7 @@ deterministic from midwimble's chain alone.
 | `REGISTRATION_MIN_HEADERS` | 60 | Caps any one header at 1/60 of the requirement. |
 | `MAX_RELAY_HEADERS_PER_BLOCK` | 1,440 | A day of midstate headers: enough to catch up, or to relay a launch's first bond with its burial. Bounds what a block can make every node verify. |
 | `RELAY_WINDOW` | 2,880 | Two days of midstate headers kept: registrations and forks must be this recent. |
-| `RELAY_MIN_WORK_DIVISOR` | 16 | A relayed header claims at least 1/16 of a midwimble block's work. |
+| `RELAY_MAX_FUTURE` | 30 minutes | How far a relayed header's timestamp may be past its block's: twice the future limit of either chain, so real headers always fit and fake ones cannot claim time that has not passed. |
 | `CAP_WINDOW`, `CAP_K` | 1,440 blocks, 360 | Four full-weight blocks a bond a day (the per-bond cap, below). |
 | `WORK_CAP_WINDOW` | 10,080 blocks (7 days) | No block counts for more than a quarter above the lowest of the week before it (the work cap, below). |
 
@@ -273,15 +295,30 @@ enumerable. The wallet tooling should make the private path the default:
 
 ## Launch interaction
 
-Bonded mining is required from block 1. Genesis is fixed data that nobody
-mines, and block 1's producer registers its own bond in block 1 itself. The
-genesis also commits to a midstate block (`MIDSTATE_BLOCK_*`), pinning the
-midstate chain the launch was made against: it is the relay's root. Block 1
-relays midstate's headers from there through the first bond's burial, so that
-bond's proof must be taken above the anchor, and the burial must fit in one
-block's relay (1,440 headers). Only MDS holders can mine at first,
-so the 30-day slow start doubles as the window to acquire MDS and register, and
-the launch script's default `--merge-share` is 0.25.
+From block 1 a block must be signed whenever a registered bond could sign it
+(a bond the block itself registers included). While none can, a block may be
+unsigned, and fork choice credits it with only the over-cap sliver (1/1,024
+of its work): enough to keep the chain moving, never enough to win against
+signed blocks.
+
+That covers two moments. At launch, no bond is registered yet. The genesis
+commits to a midstate block (`MIDSTATE_BLOCK_*`), pinning the midstate chain
+the launch was made against: it is the relay's root. A bond's proof must be
+taken above that anchor and buried under a day of relayed work, so the first
+registration comes some hours after the parameters exist. Until then
+producers mine unsigned blocks, and a producer's node (`--midstate-rpc`)
+relays midstate's headers in them; its bond registers in the first block
+whose relay holds the burial, and from then on every block is signed.
+
+And if every registered bond ever lapses, the chain does not stop. Before
+this rule it would have: only blocks move the relay, so with no bond to sign
+a block, a new bond whose proof is more than about a day past the relay's
+tip could never register. Unsigned blocks relay midstate's headers until a
+new bond can.
+
+Only MDS holders mine once a bond is registered, so the 30-day slow start
+doubles as the window to acquire MDS and register, and the launch script's
+default `--merge-share` is 0.25.
 
 ## Running a bonded producer
 

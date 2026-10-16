@@ -773,7 +773,8 @@ pub struct Batch {
     /// own bond in the first block it mines. At most one per block.
     #[serde(default)]
     pub registrations: Vec<BondRegistration>,
-    /// Bonded-mining authorisation, required from `bond::BONDED_MINING_FROM`.
+    /// Bonded-mining authorisation, required from `bond::BONDED_MINING_FROM`
+    /// whenever a registered bond could sign the block (`bond::any_can_sign`).
     #[serde(default)]
     pub miner: Option<MinerAuth>,
     /// Midstate headers this block relays (`core/relay.rs`).
