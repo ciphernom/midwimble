@@ -1,0 +1,47 @@
+# Publishes the website (docs/) and the browser wallet (web-wallet/, at
+# /wallet/) to GitHub Pages. The wallet's WebAssembly and libp2p bundle are
+# committed (web-wallet/build.sh makes them), so this only gathers files.
+#
+# One-time setup: repository Settings → Pages → Source: "GitHub Actions".
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/**
+      - web-wallet/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; one that has started runs to the end.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Gather the site
+        run: |
+          mkdir -p _site/wallet
+          cp -r docs/. _site/
+          cd web-wallet
+          cp -r index.html app.js worker.js keygen.js qr.js wallet.css logo.svg \
+                config.json light_client.bundle.js pkg ../_site/wallet/
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v5

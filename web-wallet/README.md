@@ -27,6 +27,7 @@ server of its own, no HTTPS gateway, no certificate authority.
 Serve this folder over HTTPS (or `localhost`), e.g. `python3 -m http.server`
 here, and open it. `pkg/` and `light_client.bundle.js` are built and
 committed, so nothing needs building to serve it.
+`.github/workflows/pages.yml` publishes it with the website, at `/wallet/`.
 
 It needs a node that serves browsers: one built with `--features webrtc`.
 Such a node keeps its WebRTC certificate in `<data-dir>/webrtc_cert.pem`, so
