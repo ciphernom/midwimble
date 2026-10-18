@@ -64,6 +64,29 @@ midwimble node --data-dir ~/midwimble-testnet --listen /ip4/0.0.0.0/tcp/9433 \
 
 The testnet's seed runs on the same host as midstate's bootstrap node.
 
+## Browser wallets
+
+`web-wallet/` is a wallet that runs in the browser and reaches nodes over
+WebRTC-direct. A node serves it when built with the `webrtc` feature:
+
+```sh
+cargo build --release --features webrtc
+midwimble node --data-dir ~/midwimble-testnet --listen /ip4/0.0.0.0/tcp/9433 ...
+```
+
+It listens for browsers on UDP at the TCP port plus two (9435 here: open it
+in the firewall), keeps its WebRTC certificate in
+`<data-dir>/webrtc_cert.pem` so that its address survives restarts, and logs
+that address at start:
+
+```text
+Browser wallets can connect to /ip4/…/udp/9435/webrtc-direct/certhash/uEi…/p2p/12D3Koo…
+```
+
+The public form is also under `webrtc_addrs` in `/state`. Add it to
+`web-wallet/config.json`'s `nodes` for the wallet to use by default; anyone
+can also paste it into the wallet's node setting.
+
 ## The explorer
 
 Every node serves a block explorer at its RPC address: open

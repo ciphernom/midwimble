@@ -1,0 +1,20 @@
+{
+  "name": "midwimble-web-wallet",
+  "version": "0.1.0",
+  "private": true,
+  "description": "midwimble's browser wallet: the libp2p light client bundle",
+  "license": "GPL-3.0-or-later",
+  "scripts": {
+    "bundle": "rollup -c"
+  },
+  "dependencies": {
+    "@libp2p/webrtc": "6.0.14",
+    "@multiformats/multiaddr": "13.0.1",
+    "libp2p": "3.1.6"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^29.0.2",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "rollup": "^4.60.0"
+  }
+}

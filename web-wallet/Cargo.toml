@@ -1,0 +1,51 @@
+[package]
+name = "midwimble-web-wallet"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "midwimble's browser wallet: the wallet core compiled to WebAssembly"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# For a local devnet of `--features fast-mining` nodes (coinbase maturity 3).
+fast-mining = ["midwimble/fast-mining"]
+
+[dependencies]
+midwimble = { path = "..", default-features = false }
+# Must equal the wasm-bindgen CLI that build.sh runs.
+wasm-bindgen = "=0.2.114"
+anyhow = "1"
+argon2 = "0.5"
+bincode = "=1.3.3"
+bip39 = "2"
+chacha20poly1305 = "0.10"
+hex = "0.4"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = "1"
+# rand 0.8 reaches the browser's crypto.getRandomValues through this.
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+# The CLI wallet (node feature) to check that wallet files move both ways,
+# and fast mining to build real chains in tests.
+midwimble = { path = "..", default-features = false, features = ["node", "fast-mining"] }
+tempfile = "3"
+
+# Tests build chains (proof of work, range proofs): optimise dependencies,
+# as the main crate does.
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -195,8 +195,8 @@ Midstate anchors serve as the horizon instead.
 
 ### Networking (midstate)
 
-- **Transports:** TCP and QUIC (WebRTC-direct behind a feature), with Noise and
-  Yamux.
+- **Transports:** TCP and QUIC (WebRTC-direct for browser wallets behind a
+  feature), with Noise and Yamux.
 - **Discovery and reachability:** Kademlia on a private protocol id, identify,
   relay, DCUtR hole punching, AutoNAT, peer exchange, and the IPFS-DHT
   rendezvous.
@@ -286,6 +286,12 @@ midwimble pool-mine --pool stratum+tls://host:3334 --tls-pin <sha256> --node 127
 midwimble anchor --midstate-rpc 127.0.0.1:8545 --depth 6
 midwimble anchor-verify --depth 6
 ```
+
+**Browser wallet.** `web-wallet/` is the wallet compiled to WebAssembly, with
+a page in the explorer's style: create, restore or open a `.mww` file, send,
+receive, history. It reaches nodes built with `--features webrtc` through the
+light protocol, and shares the CLI's phrases, addresses and wallet file
+format. See `web-wallet/README.md` and `docs/TESTNET.md`.
 
 **RPC.** The node serves these endpoints on loopback, with no authentication:
 

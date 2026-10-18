@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<!-- midwimble's browser wallet. Self-contained, like the explorer: no fonts,
+     scripts or images from anywhere else. Keys stay in this browser; it
+     reaches nodes over WebRTC (light_client.bundle.js). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>midwimble wallet</title>
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="wallet.css">
+</head>
+<body>
+<header>
+  <div class="bar-top">
+    <a class="brand" href="#/"><img src="logo.svg" alt=""><b>Midwimble</b><i>wallet</i></a>
+    <nav id="nav" hidden>
+      <a href="#/" data-route="">wallet</a>
+      <a href="#/send" data-route="send">send</a>
+      <a href="#/receive" data-route="receive">receive</a>
+      <a href="#/history" data-route="history">history</a>
+      <a href="#/settings" data-route="settings">settings</a>
+    </nav>
+    <a class="net" id="net" href="#/settings"><span class="dot"></span><span>starting…</span></a>
+  </div>
+</header>
+<main id="view"><div class="empty">loading…</div></main>
+<footer>
+  Keys stay in this browser. Blocks come from a midwimble node over WebRTC; it never sees your keys.
+  <a href="https://github.com/ciphernom/midwimble" rel="noopener noreferrer">source</a>
+</footer>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
