@@ -221,6 +221,31 @@ fn save_checkpoint(path: &std::path::Path, leaves: &[[u8; 32]]) {
     }
 }
 
+/// The WOTS public key of leaf `index` of the tree grown from `master_seed`:
+/// what [`keygen`] puts at that leaf. With [`root_from_leaves`] it lets a
+/// caller generate a tree in pieces, e.g. a browser splitting the work
+/// across web workers.
+pub fn leaf_public_key(master_seed: &[u8; 32], index: u64) -> [u8; 32] {
+    wots::keygen_seq(&derive_wots_seed(master_seed, index))
+}
+
+/// The master public key (root) over a full set of leaves, in leaf order:
+/// equal to `keygen(..).public_key()` when the leaves are that tree's.
+pub fn root_from_leaves(leaves: &[[u8; 32]]) -> Result<MasterPublicKey> {
+    let n = leaves.len();
+    if n < 2 || !n.is_power_of_two() || n > 1usize << MAX_HEIGHT {
+        bail!("an MSS tree has 2^h leaves with h in 1..={}", MAX_HEIGHT);
+    }
+    let mut level = leaves.to_vec();
+    while level.len() > 1 {
+        level = level
+            .chunks_exact(2)
+            .map(|pair| hash_concat(&pair[0], &pair[1]))
+            .collect();
+    }
+    Ok(level[0])
+}
+
 /// Generate a random MSS keypair with default height.
 pub fn keygen_random() -> Result<MssKeypair> {
     let seed: [u8; 32] = rand::random();
@@ -629,6 +654,20 @@ mod tests {
         assert_eq!(kp.height, 4);
         assert_eq!(kp.remaining(), 16);
         assert_ne!(kp.master_pk, [0u8; 32]);
+    }
+
+    #[test]
+    fn a_tree_built_from_its_leaves_matches_keygen() {
+        let kp = keygen(&test_seed(), 3).unwrap();
+        let leaves: Vec<[u8; 32]> = (0..8).map(|i| leaf_public_key(&test_seed(), i)).collect();
+        assert_eq!(&kp.tree[8..], &leaves[..]);
+        assert_eq!(root_from_leaves(&leaves).unwrap(), kp.public_key());
+        // Order matters, and only whole trees have a root.
+        let mut swapped = leaves.clone();
+        swapped.swap(0, 1);
+        assert_ne!(root_from_leaves(&swapped).unwrap(), kp.public_key());
+        assert!(root_from_leaves(&leaves[..6]).is_err());
+        assert!(root_from_leaves(&leaves[..1]).is_err());
     }
 
     #[test]

@@ -64,8 +64,14 @@ pub fn recovery_commitment(
 /// generations); wallets store the public key and regenerate the pair only
 /// if a recovery epoch ever happens.
 pub fn derive_recovery_keypair(seed: &[u8], height: u32) -> Result<MssKeypair> {
-    let mss_seed = hash_domain(b"midwimble.wallet.recovery.v1", &[seed]);
-    mss::keygen(&mss_seed, height)
+    mss::keygen(&recovery_master_seed(seed), height)
+}
+
+/// The MSS master seed of a wallet seed's recovery key. A secret: it signs
+/// recovery claims. Exposed so the key can be generated in pieces
+/// ([`mss::leaf_public_key`]); [`derive_recovery_keypair`] is the usual way.
+pub fn recovery_master_seed(seed: &[u8]) -> [u8; 32] {
+    hash_domain(b"midwimble.wallet.recovery.v1", &[seed])
 }
 
 /// The Pedersen generators recovery checks openings against. Always
@@ -320,5 +326,15 @@ mod tests {
         let sig = kp.sign(&[7; 32]).unwrap();
         assert!(mss::verify(&sig, &[7; 32], &kp.public_key()));
         assert!(!mss::verify(&sig, &[8; 32], &kp.public_key()));
+    }
+
+    #[test]
+    fn a_recovery_key_generated_in_pieces_is_the_same_key() {
+        let master = recovery_master_seed(b"seed");
+        let leaves: Vec<[u8; 32]> = (0..4).map(|i| mss::leaf_public_key(&master, i)).collect();
+        assert_eq!(
+            mss::root_from_leaves(&leaves).unwrap(),
+            derive_recovery_keypair(b"seed", 2).unwrap().public_key()
+        );
     }
 }
