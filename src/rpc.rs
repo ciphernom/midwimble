@@ -354,6 +354,7 @@ async fn state(AxState(node): AxState<NodeHandle>) -> Json<Value> {
         "peer_id": info.peer_id,
         "peers": info.peers,
         "listen_addrs": info.listen_addrs,
+        "webrtc_addrs": info.webrtc_addrs,
         "syncing": info.syncing,
         "mempool_count": info.mempool_count,
         "mempool_weight": info.mempool_weight,

@@ -55,7 +55,9 @@ use crate::finality::{
 use crate::mempool::{Mempool, ReorgCache};
 use crate::miner::{MinedBlock, Miner};
 use crate::network::amino::{self, AminoHandle};
-use crate::network::light_protocol::{LightNotification, LightRequest, LightResponse};
+use crate::network::light_protocol::{
+    LightNotification, LightRequest, LightResponse, LIGHT_BLOCKS_BYTE_LIMIT, MAX_LIGHT_BLOCKS,
+};
 use crate::network::protocol::BATCH_RESPONSE_SOFT_LIMIT;
 use crate::network::protocol::{
     ANCHORS_RESPONSE_SOFT_LIMIT, MAX_ANCHORS_PER_MESSAGE, SNAPSHOT_PART_BYTES,
@@ -192,6 +194,8 @@ pub struct NodeInfo {
     pub peer_id: String,
     pub peers: Vec<String>,
     pub listen_addrs: Vec<String>,
+    /// Addresses browser wallets dial (`Network::webrtc_addrs`).
+    pub webrtc_addrs: Vec<String>,
     /// Downloading a heavier chain's blocks: the chain is about to change,
     /// so templates are stale. (While a session only fetches and checks a
     /// peer's headers, the node keeps taking blocks and mining.)
@@ -549,11 +553,12 @@ impl Node {
     pub async fn new(config: NodeConfig) -> Result<(Node, NodeHandle)> {
         let storage = Storage::open(&config.data_dir)?;
         let keypair = load_or_create_identity(&config.data_dir)?;
-        let mut network = Network::new(
+        let mut network = Network::with_data_dir(
             keypair.clone(),
             config.listen.clone(),
             config.bootstrap.clone(),
             HashSet::new(),
+            Some(&config.data_dir),
         )
         .await?;
         if let Some(addr) = &config.public_address {
@@ -612,6 +617,7 @@ impl Node {
             peer_id: network.local_peer_id().to_string(),
             peers: Vec::new(),
             listen_addrs: Vec::new(),
+            webrtc_addrs: Vec::new(),
             syncing: false,
             mempool_count: 0,
             mempool_weight: 0,
@@ -784,6 +790,7 @@ impl Node {
             .iter()
             .map(|a| a.to_string())
             .collect();
+        info.webrtc_addrs = self.network.webrtc_addrs();
         info.syncing = self.chain_syncing();
         info.mempool_count = self.mempool.len();
         info.mempool_weight = self.mempool.total_weight();
@@ -980,6 +987,14 @@ impl Node {
                 let _ = respond.send(response);
             }
             NetworkEvent::PeerConnected(peer, addr) => {
+                // Browser wallets (WebRTC) speak only the light protocols.
+                // Asking one for its state fails as an unsupported protocol,
+                // which would get it banned on the spot (midstate skips them
+                // the same way).
+                if self.network.is_light_peer(&peer) {
+                    tracing::info!("Light client connected: {}", peer);
+                    return;
+                }
                 let routable = addr
                     .parse::<Multiaddr>()
                     .map_or(false, |a| crate::network::is_routable(&a));
@@ -996,7 +1011,9 @@ impl Node {
             }
             NetworkEvent::RequestFailed(peer) => self.peer_unavailable(peer),
             NetworkEvent::ProtocolMismatch(peer) => {
-                self.ban_peer(peer, "speaks none of our protocols")
+                if !self.network.is_light_peer(&peer) {
+                    self.ban_peer(peer, "speaks none of our protocols")
+                }
             }
             NetworkEvent::OutgoingConnectionFailed(addr) => {
                 self.known_addrs.remove(&addr);
@@ -3249,12 +3266,21 @@ impl Node {
                 "weight": self.state.weight().to_string(),
                 "tip": hex::encode(self.state.header_hash),
                 "target": hex::encode(self.state.target),
+                "timestamp": self.state.timestamp,
                 "state_root": hex::encode(self.state.state_root()),
                 "supply": self.state.supply,
                 "utxos": self.state.utxos.len(),
+                "syncing": self.chain_syncing(),
+                // Blocks below this have been pruned: a wallet that would
+                // scan them reads the unspent outputs (`get_utxos`) instead.
+                "pruned_below": self.storage.finality().map(|f| f.pruned_below).unwrap_or(0),
+                // Where else a browser can reach this node.
+                "webrtc_addrs": self.network.webrtc_addrs(),
             }),
             LightRequest::GetHeaders { .. }
             | LightRequest::GetBlock { .. }
+            | LightRequest::GetBlocks { .. }
+            | LightRequest::GetUtxos { .. }
             | LightRequest::GetFilters { .. } => {
                 return light_from_storage(&self.storage, self.state.height, request)
             }
@@ -3344,6 +3370,8 @@ fn request_reads_storage(request: &LightRequest) -> bool {
         request,
         LightRequest::GetHeaders { .. }
             | LightRequest::GetBlock { .. }
+            | LightRequest::GetBlocks { .. }
+            | LightRequest::GetUtxos { .. }
             | LightRequest::GetFilters { .. }
     )
 }
@@ -3369,6 +3397,40 @@ fn light_from_storage(
                 .load_batch(height)?
                 .ok_or_else(|| anyhow!("no block at {height}"))?;
             json!({ "height": height, "block_hex": hex::encode(bincode::serialize(&batch)?) })
+        }
+        LightRequest::GetBlocks {
+            start_height,
+            count,
+        } => {
+            let count = count
+                .min(MAX_LIGHT_BLOCKS)
+                .min(tip.saturating_sub(start_height));
+            let batches = storage.load_batches(start_height, count, LIGHT_BLOCKS_BYTE_LIMIT)?;
+            json!({
+                "start_height": start_height,
+                "count": batches.len(),
+                "blocks_hex": hex::encode(bincode::serialize(&batches)?),
+            })
+        }
+        LightRequest::GetUtxos { after, limit } => {
+            let after = after
+                .as_deref()
+                .map(crate::wallet::parse_point)
+                .transpose()?;
+            let limit = limit.unwrap_or(256).min(1000) as usize;
+            let page = storage.unspent_outputs(after, limit)?;
+            let outputs = page
+                .iter()
+                .map(|(o, e)| {
+                    Ok(json!({
+                        "output_hex": hex::encode(bincode::serialize(o)?),
+                        "height": e.height,
+                        "coinbase": e.coinbase,
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let next = page.last().map(|(o, _)| hex::encode(o.commitment));
+            json!({ "outputs": outputs, "next": next, "height": tip })
         }
         LightRequest::GetFilters {
             start_height,

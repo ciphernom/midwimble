@@ -39,6 +39,24 @@ pub enum LightRequest {
     /// Whole block as hex-encoded bincode, for view-key scanning.
     #[serde(rename = "get_block")]
     GetBlock { height: u64 },
+    /// Consecutive whole blocks from `start_height`, as one hex-encoded
+    /// bincode `Vec<Batch>`: what a wallet scanning a long stretch of chain
+    /// asks for instead of one `get_block` per height. The node may return
+    /// fewer than `count` (it caps the count and the response size), never
+    /// zero unless `start_height` is past its tip.
+    #[serde(rename = "get_blocks")]
+    GetBlocks { start_height: u64, count: u64 },
+    /// One page of the unspent outputs, as the RPC's `/utxos` gives it: for
+    /// a wallet restoring from a node that has pruned the blocks it would
+    /// otherwise scan (`docs/PRUNING.md`). `after` is the last commitment of
+    /// the page before; `limit` defaults to 256, at most 1000.
+    #[serde(rename = "get_utxos")]
+    GetUtxos {
+        #[serde(default)]
+        after: Option<String>,
+        #[serde(default)]
+        limit: Option<u64>,
+    },
     #[serde(rename = "get_filters")]
     GetFilters { start_height: u64, end_height: u64 },
     #[serde(rename = "get_mempool")]
@@ -58,10 +76,19 @@ impl LightRequest {
             self,
             LightRequest::GetFilters { .. }
                 | LightRequest::GetHeaders { .. }
+                | LightRequest::GetBlocks { .. }
+                | LightRequest::GetUtxos { .. }
                 | LightRequest::SubmitTransaction { .. }
         )
     }
 }
+
+/// Most blocks one `get_blocks` returns.
+pub const MAX_LIGHT_BLOCKS: u64 = 200;
+/// `get_blocks` stops adding blocks once their bincode reaches this, so the
+/// hex response stays well inside [`MAX_LIGHT_MSG_SIZE`] (which browser
+/// clients mirror).
+pub const LIGHT_BLOCKS_BYTE_LIMIT: usize = 900_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LightResponse {
@@ -164,5 +191,26 @@ mod tests {
         assert_eq!(json, r#"{"method":"get_block","params":{"height":5}}"#);
         let parsed: LightRequest = serde_json::from_str(r#"{"method":"get_state"}"#).unwrap();
         assert!(matches!(parsed, LightRequest::GetState));
+        let parsed: LightRequest = serde_json::from_str(
+            r#"{"method":"get_blocks","params":{"start_height":7,"count":64}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed,
+            LightRequest::GetBlocks {
+                start_height: 7,
+                count: 64
+            }
+        ));
+        assert!(parsed.is_expensive());
+        let parsed: LightRequest =
+            serde_json::from_str(r#"{"method":"get_utxos","params":{}}"#).unwrap();
+        assert!(matches!(
+            parsed,
+            LightRequest::GetUtxos {
+                after: None,
+                limit: None
+            }
+        ));
     }
 }

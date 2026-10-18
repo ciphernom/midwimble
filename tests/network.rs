@@ -786,3 +786,99 @@ async fn peers_that_lie_about_their_chain_neither_stall_the_node_nor_stay() {
     follower.stop().await;
     producer.stop().await;
 }
+
+/// What a browser wallet does (`web-wallet/`): dial the node over
+/// WebRTC-direct, then talk the light protocol. Browsers speak nothing else,
+/// and the node used to ban them on sight for it.
+#[cfg(feature = "webrtc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn browser_wallets_reach_a_node_over_webrtc() {
+    use futures::StreamExt;
+    use libp2p::core::muxing::StreamMuxerBox;
+    use libp2p::{PeerId, StreamProtocol, Transport};
+    use midwimble::network::light_protocol::{
+        read_response_raw, write_request_raw, LightRequest, LIGHT_PROTOCOL,
+    };
+
+    let keys = WalletKeys::random();
+    let node = TestNode::start(Some(keys.address()), vec![]).await;
+    wait_until("a few blocks", 60, || node.height() > 3).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (addr, peer) = loop {
+        let info = node.handle.info();
+        if let Some(a) = info.listen_addrs.iter().find(|a| a.contains("/certhash/")) {
+            break (format!("{a}/p2p/{}", info.peer_id), info.peer_id.parse::<PeerId>().unwrap());
+        }
+        assert!(Instant::now() < deadline, "no WebRTC listener");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    // The data dir keeps the certificate, so the address survives a restart.
+    assert!(node.dir.path().join("webrtc_cert.pem").exists());
+
+    let cert = libp2p_webrtc::tokio::Certificate::generate(&mut rand::rngs::OsRng).unwrap();
+    let mut browser = libp2p::SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_other_transport(|key| {
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                libp2p_webrtc::tokio::Transport::new(key.clone(), cert)
+                    .map(|(p, c), _| (p, StreamMuxerBox::new(c))),
+            )
+        })
+        .unwrap()
+        .with_behaviour(|_| libp2p_stream::Behaviour::new())
+        .unwrap()
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build();
+    let mut control = browser.behaviour().new_control();
+    // rust-libp2p's WebRTC transport dials from its listening socket.
+    browser
+        .listen_on("/ip4/127.0.0.1/udp/0/webrtc-direct".parse().unwrap())
+        .unwrap();
+    browser.dial(addr.parse::<libp2p::Multiaddr>().unwrap()).unwrap();
+    tokio::spawn(async move {
+        loop {
+            browser.select_next_some().await;
+        }
+    });
+
+    async fn ask(
+        control: &mut libp2p_stream::Control,
+        peer: PeerId,
+        protocol: StreamProtocol,
+        req: &LightRequest,
+    ) -> midwimble::network::light_protocol::LightResponse {
+        let mut s = control.open_stream(peer, protocol).await.unwrap();
+        write_request_raw(&mut s, req).await.unwrap();
+        read_response_raw(&mut s).await.unwrap()
+    }
+
+    // Asked twice, a second apart: a banned client would be gone by then.
+    for _ in 0..2 {
+        let r = tokio::time::timeout(
+            Duration::from_secs(20),
+            ask(&mut control, peer, LIGHT_PROTOCOL, &LightRequest::GetState),
+        )
+        .await
+        .expect("the node answers a light client");
+        assert!(r.ok, "{:?}", r.error);
+        assert!(r.data.unwrap()["height"].as_u64().unwrap() > 3);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    // Blocks come in bulk, as a wallet scanning the chain asks for them.
+    let r = ask(
+        &mut control,
+        peer,
+        LIGHT_PROTOCOL,
+        &LightRequest::GetBlocks {
+            start_height: 0,
+            count: 3,
+        },
+    )
+    .await;
+    let data = r.data.expect("blocks");
+    let blocks: Vec<midwimble::core::Batch> =
+        bincode::deserialize(&hex::decode(data["blocks_hex"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(blocks.len(), 3);
+    assert_eq!(blocks[0].extension.final_hash, midwimble::core::Batch::genesis().extension.final_hash);
+    node.stop().await;
+}

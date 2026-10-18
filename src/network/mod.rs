@@ -302,7 +302,10 @@ fn make_behaviour(key: &Keypair, relay_client: relay::client::Behaviour) -> Midw
 }
 
 #[cfg(not(feature = "webrtc"))]
-fn build_swarm(keypair: Keypair) -> Result<Swarm<MidwimbleBehaviour>> {
+fn build_swarm(
+    keypair: Keypair,
+    _data_dir: Option<&std::path::Path>,
+) -> Result<Swarm<MidwimbleBehaviour>> {
     Ok(libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -318,9 +321,13 @@ fn build_swarm(keypair: Keypair) -> Result<Swarm<MidwimbleBehaviour>> {
 }
 
 #[cfg(feature = "webrtc")]
-fn build_swarm(keypair: Keypair) -> Result<Swarm<MidwimbleBehaviour>> {
+fn build_swarm(
+    keypair: Keypair,
+    data_dir: Option<&std::path::Path>,
+) -> Result<Swarm<MidwimbleBehaviour>> {
     use libp2p::core::muxing::StreamMuxerBox;
     use libp2p::Transport;
+    let certificate = load_or_create_webrtc_cert(data_dir);
     Ok(libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -330,8 +337,6 @@ fn build_swarm(keypair: Keypair) -> Result<Swarm<MidwimbleBehaviour>> {
         )?
         .with_quic()
         .with_other_transport(|keypair| {
-            let certificate = libp2p_webrtc::tokio::Certificate::generate(&mut rand::rngs::OsRng)
-                .expect("WebRTC certificate generation");
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
                 libp2p_webrtc::tokio::Transport::new(keypair.clone(), certificate)
                     .map(|(peer_id, conn), _| (peer_id, StreamMuxerBox::new(conn))),
@@ -341,6 +346,59 @@ fn build_swarm(keypair: Keypair) -> Result<Swarm<MidwimbleBehaviour>> {
         .with_behaviour(|key, relay_client| make_behaviour(key, relay_client))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
         .build())
+}
+
+/// The node's WebRTC certificate, from `data_dir/webrtc_cert.pem` or made
+/// (and saved there) on first start. Browsers authenticate a WebRTC-direct
+/// node by this certificate's hash, which its address carries
+/// (`/certhash/…`): a certificate made afresh at every start would break
+/// every address a browser wallet has saved, and every published one, at
+/// every restart (midstate's `load_or_create_webrtc_cert`).
+#[cfg(feature = "webrtc")]
+fn load_or_create_webrtc_cert(
+    data_dir: Option<&std::path::Path>,
+) -> libp2p_webrtc::tokio::Certificate {
+    use libp2p_webrtc::tokio::Certificate;
+    let path = data_dir.map(|d| d.join("webrtc_cert.pem"));
+    if let Some(path) = &path {
+        if let Ok(pem) = std::fs::read_to_string(path) {
+            match Certificate::from_pem(&pem) {
+                Ok(cert) => return cert,
+                // Losing the address is bad; refusing to start is worse.
+                Err(e) => tracing::warn!(
+                    "WebRTC certificate {} is unusable ({e}); making a new one, \
+                     so this node's WebRTC address changes",
+                    path.display()
+                ),
+            }
+        }
+    }
+    let cert =
+        Certificate::generate(&mut rand::rngs::OsRng).expect("WebRTC certificate generation");
+    if let Some(path) = &path {
+        match write_private(path, cert.serialize_pem().as_bytes()) {
+            Ok(()) => tracing::info!("Saved a new WebRTC certificate to {}", path.display()),
+            Err(e) => tracing::warn!(
+                "Could not save the WebRTC certificate to {} ({e}): this node's \
+                 WebRTC address will change when it restarts",
+                path.display()
+            ),
+        }
+    }
+    cert
+}
+
+/// Writes a file only its owner can read, atomically.
+#[cfg(feature = "webrtc")]
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)
 }
 
 // ── Events ──────────────────────────────────────────────────────────────────
@@ -406,8 +464,28 @@ impl Network {
         bootstrap_peers: Vec<Multiaddr>,
         static_banned_peers: HashSet<PeerId>,
     ) -> Result<Self> {
+        Self::with_data_dir(
+            keypair,
+            listen_addr,
+            bootstrap_peers,
+            static_banned_peers,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::new`], keeping what must outlive a restart in `data_dir`:
+    /// with the `webrtc` feature, the certificate whose hash is part of the
+    /// address browser wallets dial.
+    pub async fn with_data_dir(
+        keypair: Keypair,
+        listen_addr: Multiaddr,
+        bootstrap_peers: Vec<Multiaddr>,
+        static_banned_peers: HashSet<PeerId>,
+        data_dir: Option<&std::path::Path>,
+    ) -> Result<Self> {
         tracing::info!("Local peer id: {}", keypair.public().to_peer_id());
-        let mut swarm = build_swarm(keypair)?;
+        let mut swarm = build_swarm(keypair, data_dir)?;
         let light_incoming = swarm
             .behaviour_mut()
             .light
@@ -742,6 +820,15 @@ impl Network {
         addrs
     }
 
+    /// The subset browser wallets dial: WebRTC-direct, with the certificate
+    /// hash and peer id they need (`/webrtc-direct/certhash/…/p2p/…`).
+    pub fn webrtc_addrs(&self) -> Vec<String> {
+        self.advertisable_addrs()
+            .into_iter()
+            .filter(|a| a.contains("/webrtc-direct") && a.contains("/certhash/"))
+            .collect()
+    }
+
     /// Server-dialable subset (no browser transports).
     pub fn dialable_addrs(&self) -> Vec<String> {
         self.advertisable_addrs()
@@ -887,7 +974,13 @@ impl Network {
             .await
             {
                 Ok(Ok(req)) => req,
-                _ => {
+                outcome => {
+                    match outcome {
+                        Ok(Err(e)) => {
+                            tracing::debug!("Unreadable light request from {}: {}", peer, e)
+                        }
+                        _ => tracing::debug!("Light request from {} timed out", peer),
+                    }
                     guard.close_stream(peer).await;
                     return;
                 }
@@ -1155,6 +1248,14 @@ impl Network {
             }
             SwarmEvent::NewListenAddr { address, .. } => {
                 tracing::info!("Listening on {}", address);
+                if address.to_string().contains("/webrtc-direct") {
+                    // What a browser wallet's node setting takes, verbatim.
+                    tracing::info!(
+                        "Browser wallets can connect to {}/p2p/{}",
+                        address,
+                        self.swarm.local_peer_id()
+                    );
+                }
                 self.listen_addrs.push(address);
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
