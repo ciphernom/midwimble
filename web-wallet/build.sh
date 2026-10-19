@@ -1,7 +1,8 @@
 #!/bin/sh
-# Builds the browser wallet in place: pkg/ (the wallet, as WebAssembly) and
-# light_client.bundle.js (libp2p). Both are committed, so this folder can be
-# served as it is; rebuild after changing src/, the core, or light_client.js.
+# Builds the browser wallet in place: pkg/ (the wallet, as WebAssembly),
+# light_client.bundle.js (libp2p) and qr_reader.bundle.js (jsQR). All are
+# committed, so this folder can be served as it is; rebuild after changing
+# src/, the core, light_client.js or qr_reader.js.
 #
 # Needs  rustup target add wasm32-unknown-unknown
 #        cargo install wasm-bindgen-cli --version 0.2.114 --locked

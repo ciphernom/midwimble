@@ -13,8 +13,10 @@ server of its own, no HTTPS gateway, no certificate authority.
   Argon2id, XChaCha20-Poly1305), so a `.mww` file moves between
   `midwimble wallet` and the browser in both directions.
 - **Receive** to one reusable address (QR included); **send** with the relay's
-  minimum fee; **history** with change folded into the payment that made it;
-  coins, with a warning for any whose recovery commitment a sender got wrong.
+  minimum fee, to an address typed, pasted, or scanned from its QR code with
+  the camera or from a photo; **history** with change folded into the payment
+  that made it; coins, with a warning for any whose recovery commitment a
+  sender got wrong.
 - **Follows the chain** by downloading whole blocks (`get_blocks`), notices
   reorganisations, reads the unspent-output set instead (`get_utxos`) when a
   node has pruned the blocks it would need, and rebroadcasts payments still
@@ -25,8 +27,8 @@ server of its own, no HTTPS gateway, no certificate authority.
 ## Use it
 
 Serve this folder over HTTPS (or `localhost`), e.g. `python3 -m http.server`
-here, and open it. `pkg/` and `light_client.bundle.js` are built and
-committed, so nothing needs building to serve it.
+here, and open it. `pkg/`, `light_client.bundle.js` and `qr_reader.bundle.js`
+are built and committed, so nothing needs building to serve it.
 `.github/workflows/pages.yml` publishes it with the website, at `/wallet/`.
 
 It needs a node that serves browsers: one built with `--features webrtc`.
@@ -54,7 +56,8 @@ FEATURES=fast-mining ./build.sh    # for a local devnet of fast-mining nodes
 ```
 
 `build.sh` compiles the wallet with WebAssembly SIMD (every current browser
-has it) and bundles the libp2p client with rollup (`npm ci`, `npm run bundle`).
+has it) and bundles the libp2p client and the QR reader (jsQR) with rollup
+(`npm ci`, `npm run bundle`).
 
 ## Test
 
@@ -73,6 +76,8 @@ cargo test        # real fast-mining chains, and wallet files to and from the CL
 | `app.js`, `index.html`, `wallet.css` | the page |
 | `light_client.js` | the WebRTC light client (bundled into `light_client.bundle.js`) |
 | `qr.js` | a QR encoder, so the page loads nothing from anywhere else |
+| `qr_scan.js` | reads QR codes for the send form, from the camera or a photo; loaded when someone scans |
+| `qr_reader.js` | decodes them on a worker with jsQR (bundled into `qr_reader.bundle.js`); browsers with a `BarcodeDetector` (Chrome on Android and macOS) use that instead |
 
 ## Notes
 
@@ -80,5 +85,10 @@ cargo test        # real fast-mining chains, and wallet files to and from the CL
   1,024 one-time keys, about a billion hashes. Helper workers share it; it
   takes a minute or two on a laptop, once.
 - One tab at a time: a second tab offers to take the wallet over.
+- Scanning asks for the camera only when "scan" is pressed, and turns it off
+  as soon as a code is read, the scanner closes, or the tab is hidden. Where
+  there is no camera, or it is refused, "Choose a photo" reads a photo or a
+  screenshot of the code instead. A scanned code may be an address or a
+  `midwimble:<address>?amount=<coins>` URI.
 - The recovery phrase restores everything that matters. The wallet file also
   keeps the scan position and the payment history.

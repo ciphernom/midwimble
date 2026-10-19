@@ -684,6 +684,223 @@ function walletView() {
     };
 }
 
+// ── scanning a payment's QR code ────────────────────────────────────────────
+
+/** A QR-code glyph for the scan button (DOM calls, so CSP needs no exceptions). */
+function scanIcon() {
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('d', 'M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5M8 12h8');
+    svg.appendChild(path);
+    return svg;
+}
+
+/** What a scanned code asks to pay: an address in either case (this
+ *  wallet's codes hold it in capitals), or a `midwimble:` URI with an
+ *  optional amount in coins. */
+function paymentCode(text) {
+    let address = String(text).trim();
+    let amount = null;
+    const uri = /^midwimble:([^?#]*)(?:\?([^#]*))?/i.exec(address);
+    if (uri) {
+        address = uri[1];
+        const a = new URLSearchParams(uri[2] || '').get('amount');
+        if (a && /^\d+(\.\d{1,8})?$/.test(a)) amount = a;
+    }
+    return { address: address.toLowerCase(), amount };
+}
+
+function cameraTrouble(e) {
+    switch (e && e.name) {
+        case 'NotAllowedError':
+        case 'SecurityError':
+            return 'Camera access is blocked. Allow it for this site in the browser’s settings, or choose a photo of the code.';
+        case 'NotFoundError':
+        case 'OverconstrainedError':
+            return 'No camera found. Choose a photo of the code instead.';
+        case 'NotReadableError':
+        case 'AbortError':
+            return 'The camera is in use by another app. Close that app, or choose a photo of the code.';
+        default:
+            return `The camera did not start (${errOf(e)}). Choose a photo of the code instead.`;
+    }
+}
+
+/** Reads a payment's QR code with the camera, or from a photo or screenshot.
+ *  Resolves with { address, amount } once a code holds a midwimble address,
+ *  or null if closed. The camera is off again by the time it resolves. */
+let scanning = false;
+async function scanPayment() {
+    if (scanning) return null; // a second tap while the first opens
+    scanning = true;
+    try {
+        return await scanner();
+    } finally {
+        scanning = false;
+    }
+}
+
+async function scanner() {
+    let qr;
+    try {
+        qr = await import('./qr_scan.js');
+    } catch (e) {
+        toast(`The QR reader did not load: ${errOf(e)}`, 'bad');
+        return null;
+    }
+    const canCamera = qr.cameraSupported();
+    const video = h('video', { playsinline: true, autoplay: true, muted: true });
+    video.muted = true;
+    video.playsInline = true;
+    const view = h('div', { class: 'scanner', hidden: !canCamera }, video);
+    const status = h('div', { 'aria-live': 'polite' });
+    const say = (text, cls = 'dim') => { status.className = cls; status.textContent = text; };
+    const file = h('input', { type: 'file', accept: 'image/*', hidden: true });
+    const flip = h('button', { class: 'btn', type: 'button', hidden: true }, 'Switch camera');
+    const camera = new qr.Camera(video);
+    let done = false;
+    let finish = null;
+    let rejected = null; // the last text that was not an address: said once
+    let active = false; // the camera is on, or on its way
+    let paused = false; // turned off because the tab was hidden
+    let wanted = null; // which camera to turn back on
+    let run = 0; // bumped to stop a watching loop, or a start in progress
+    camera.onended = () => {
+        if (done) return;
+        run++;
+        active = false;
+        view.hidden = true;
+        say('The camera stopped. Close this and scan again, or choose a photo of the code.', 'warn-text');
+    };
+
+    // A code's text: closes the scanner if it pays a midwimble address, or
+    // says why not while the camera keeps looking.
+    const consider = async (text) => {
+        if (text == null || done || text === rejected) return;
+        const code = paymentCode(text);
+        try {
+            await ask('check-address', { to: code.address });
+        } catch (_) {
+            if (done) return;
+            rejected = text;
+            say(`That QR code is not a midwimble address. It reads “${short(String(text), 16)}”.`, 'warn-text');
+            return;
+        }
+        if (done) return;
+        done = true;
+        view.classList.add('found');
+        setTimeout(() => finish(code), 200);
+    };
+
+    const watch = async (me) => {
+        while (!done && me === run && camera.live) {
+            let text = null;
+            try {
+                text = await camera.read();
+            } catch (e) {
+                if (me === run) say(`The QR reader failed (${errOf(e)}). Choose a photo of the code instead.`, 'bad-text');
+                return;
+            }
+            await consider(text);
+            await new Promise(r => setTimeout(r, 100));
+        }
+    };
+
+    const startCamera = async (deviceId) => {
+        const me = ++run;
+        if (!canCamera) {
+            say('This browser cannot use a camera here. Choose a photo of the code instead.');
+            return;
+        }
+        active = true;
+        say('Starting the camera…');
+        try {
+            await camera.start(deviceId);
+        } catch (e) {
+            if (done || me !== run) return;
+            active = false;
+            view.hidden = true;
+            say(cameraTrouble(e), 'warn-text');
+            return;
+        }
+        if (done) return;
+        if (me !== run) {
+            // Overtaken: by the tab hiding (turn it off), or by another start.
+            if (paused) camera.stop();
+            return;
+        }
+        wanted = camera.deviceId();
+        view.hidden = false;
+        rejected = null; // the status line no longer says why, so say it again
+        say('Hold the recipient’s QR code up to the camera.');
+        watch(me);
+        flip.hidden = (await qr.cameraList()).length < 2;
+    };
+
+    flip.addEventListener('click', async () => {
+        const cams = await qr.cameraList();
+        const at = cams.findIndex(c => c.deviceId === camera.deviceId());
+        if (cams.length > 1) startCamera(cams[(at + 1) % cams.length].deviceId);
+    });
+
+    file.addEventListener('change', async () => {
+        const f = file.files && file.files[0];
+        file.value = '';
+        if (!f || done) return;
+        say('Reading the picture…');
+        let text;
+        try {
+            text = await qr.readImageFile(f);
+        } catch (e) {
+            say(`That file could not be read as a picture (${errOf(e)}).`, 'bad-text');
+            return;
+        }
+        if (text == null) {
+            say('No QR code found in that picture. Try a sharper or closer one.', 'warn-text');
+            return;
+        }
+        rejected = null; // a picture always gets an answer
+        await consider(text);
+    });
+
+    // No camera runs in a hidden tab; coming back turns it on again.
+    const onVisibility = () => {
+        if (done) return;
+        if (document.hidden) {
+            if (!active) return;
+            paused = true;
+            run++;
+            camera.stop();
+        } else if (paused) {
+            paused = false;
+            startCamera(wanted);
+        }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+
+    const closed = overlay(close => {
+        finish = close;
+        const box = section('Scan a QR code', 'the recipient’s address', h('div', { class: 'pad stack' },
+            view, status, file,
+            h('div', { class: 'row' },
+                h('button', { class: 'btn', type: 'button', onclick: () => file.click() }, 'Choose a photo'),
+                flip,
+                h('button', { class: 'btn', type: 'button', onclick: () => close(null) }, 'Cancel'))));
+        box.classList.add('scan');
+        return box;
+    });
+    startCamera(null);
+    const result = await closed;
+    done = true;
+    run++;
+    document.removeEventListener('visibilitychange', onVisibility);
+    camera.close();
+    return result;
+}
+
 function sendView() {
     const to = h('textarea', { rows: 2, spellcheck: 'false', autocomplete: 'off', placeholder: 'mw1…' });
     const amt = h('input', { inputmode: 'decimal', autocomplete: 'off', placeholder: '0.00000000' });
@@ -713,6 +930,19 @@ function sendView() {
     amt.addEventListener('input', requote);
     const max = h('button', { class: 'btn small', type: 'button', onclick: () => { if (app.state) { amt.value = plain(app.state.max); requote(); } } }, 'max');
     const review = h('button', { class: 'btn primary', type: 'submit' }, 'Review payment');
+    const scan = h('button', { class: 'btn small', type: 'button', title: 'Scan the recipient’s QR code', onclick: async () => {
+        const got = await scanPayment();
+        if (!got) return;
+        to.value = got.address;
+        to.classList.remove('bad');
+        err.textContent = '';
+        if (got.amount) {
+            amt.value = got.amount;
+            requote();
+        }
+        toast(got.amount ? `Scanned the address and an amount of ${got.amount} coins.` : 'Scanned the address.');
+        (got.amount ? review : amt).focus();
+    } }, scanIcon(), 'scan');
     const form = h('form', { class: 'pad stack', onsubmit: async (e) => {
         e.preventDefault();
         err.textContent = '';
@@ -751,7 +981,7 @@ function sendView() {
             review.replaceChildren('Review payment');
         }
     } },
-    h('label', null, h('span', null, 'to'), to),
+    h('label', null, h('span', null, 'to'), h('div', { class: 'input-row top' }, to, scan)),
     h('label', null, h('span', null, 'amount (coins)'), h('div', { class: 'input-row' }, amt, max)),
     quoteLine, err,
     h('div', { class: 'row' }, review, available));

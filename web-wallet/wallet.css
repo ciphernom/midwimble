@@ -111,7 +111,11 @@ input.bad, textarea.bad { border-color: var(--red); }
 .btn.small { padding: 3px 10px; font-size: 11px; border-radius: 999px; }
 .btn:disabled { opacity: .45; cursor: default; box-shadow: none; }
 .input-row { display: flex; gap: 8px; }
-.input-row input { flex: 1; min-width: 0; }
+.input-row input, .input-row textarea { flex: 1; min-width: 0; }
+.input-row.top { align-items: flex-start; }
+.input-row.top .btn { min-height: 35px; } /* as tall as the max button beside an input */
+.btn svg { width: 14px; height: 14px; flex: none; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.btn.small svg { width: 12px; height: 12px; margin-left: -2px; }
 .err { color: var(--red); font-size: 12px; min-height: 1em; }
 .check { display: flex; gap: 10px; align-items: flex-start; color: #c5c1cc; }
 .check input { width: auto; margin-top: 4px; }
@@ -169,6 +173,20 @@ tbody tr:hover { background: rgba(167, 139, 250, .05); }
 .toast.ok { border-color: rgba(0, 255, 65, .4); }
 .overlay { position: fixed; inset: 0; background: rgba(4, 4, 6, .72); backdrop-filter: blur(3px); display: grid; place-items: center; z-index: 15; padding: 20px; }
 .overlay section { width: min(560px, 100%); box-shadow: 0 30px 80px rgba(0,0,0,.5); }
+.overlay section.scan { width: min(480px, 100%); }
+/* The camera: a square showing the centre of the frame, the part that is read. */
+.scanner {
+  position: relative; aspect-ratio: 1; margin: 0 auto; overflow: hidden;
+  width: min(100%, 420px, max(180px, calc(100vh - 290px)));
+  width: min(100%, 420px, max(180px, calc(100dvh - 290px)));
+  background: #000; border: 1px solid var(--line); border-radius: 12px;
+}
+.scanner video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.scanner::after {
+  content: ""; position: absolute; inset: 13%; border: 2px solid rgba(167, 139, 250, .9); border-radius: 14px;
+  box-shadow: 0 0 0 100vmax rgba(4, 4, 6, .38); transition: border-color .15s;
+}
+.scanner.found::after { border-color: var(--green); box-shadow: 0 0 0 100vmax rgba(4, 4, 6, .38), 0 0 24px rgba(0, 255, 65, .5); }
 dl { margin: 0; display: grid; grid-template-columns: minmax(120px, 170px) 1fr; }
 dt, dd { margin: 0; padding: 9px 20px; border-bottom: 1px solid var(--line); }
 dt { color: var(--muted); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; padding-top: 11px; }
