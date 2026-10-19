@@ -527,8 +527,14 @@ fn fees_after_the_last_coin_still_need_a_coinbase() {
     after.height = end + 1;
     after.supply = issued_before(after.height);
 
-    let template =
-        build_template(&after, &chain.timestamps, &[tx.clone()], &alice.address(), None).unwrap();
+    let template = build_template(
+        &after,
+        &chain.timestamps,
+        &[tx.clone()],
+        &alice.address(),
+        None,
+    )
+    .unwrap();
     let cb = template
         .batch
         .coinbase
@@ -851,7 +857,9 @@ fn a_forged_signature_is_rejected_even_with_valid_work() {
     let mut chain = TestChain::new();
     let payout = TestWallet::new().address();
     let bond = bonded_miner(&chain, b"honest", locked_long());
-    chain.apply(chain.make_bonded_block(&bond, &payout).unwrap()).unwrap();
+    chain
+        .apply(chain.make_bonded_block(&bond, &payout).unwrap())
+        .unwrap();
 
     // Someone who knows the bond id but not its mining key signs a block as
     // that bond and does the proof of work for it.
@@ -910,7 +918,9 @@ fn the_signature_binds_the_whole_block() {
     let mut chain = TestChain::new();
     let payout = TestWallet::new().address();
     let bond = bonded_miner(&chain, b"binder", locked_long());
-    chain.apply(chain.make_bonded_block(&bond, &payout).unwrap()).unwrap();
+    chain
+        .apply(chain.make_bonded_block(&bond, &payout).unwrap())
+        .unwrap();
     let signed = chain.bonded_template(&bond, &payout).unwrap().batch;
     let prev = chain.state.mw_midstate;
     check_miner_authorization(&chain.state.bonds, &prev, &signed).unwrap();

@@ -41,14 +41,14 @@ use crate::anchor::{load_records, load_records_from, AnchorRecord};
 use crate::core::auxpow::verify_pow;
 use crate::core::filter::CompactFilter;
 use crate::core::mw::{Context, StealthAddress, Transaction};
+use crate::core::relay::{MidstateHeaders, RelayFeed};
 use crate::core::snapshot::Snapshot;
 use crate::core::state::{apply_batch, apply_batch_skip_pow, choose_best_state};
-use crate::core::template::{select_transactions};
+use crate::core::template::select_transactions;
 use crate::core::types::{
     compute_header_hash, utxo_leaf, Batch, BatchHeader, State, DIFFICULTY_LOOKBACK, KERNEL_WEIGHT,
     MAX_BLOCK_WEIGHT, MEDIAN_TIME_PAST_WINDOW, OUTPUT_WEIGHT,
 };
-use crate::core::relay::{MidstateHeaders, RelayFeed};
 use crate::finality::{
     precheck, verify_evidence, CheckedLinks, FinalityConfig, FinalityTracker, RecordFault,
 };

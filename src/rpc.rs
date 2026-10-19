@@ -89,7 +89,10 @@ pub fn router_with(node: NodeHandle, options: &RpcOptions, index: SharedIndex) -
         .route("/mining/submit", post(mining_submit))
         .route("/explorer/blocks", get(crate::explorer::blocks))
         .route("/explorer/block/{id}", get(crate::explorer::block))
-        .route("/explorer/output/{commitment}", get(crate::explorer::output))
+        .route(
+            "/explorer/output/{commitment}",
+            get(crate::explorer::output),
+        )
         .route("/explorer/kernel/{excess}", get(crate::explorer::kernel))
         .route("/explorer/bonds", get(crate::explorer::bonds))
         .route("/explorer/bond/{id}", get(crate::explorer::bond))
@@ -524,9 +527,9 @@ static MERGE_JOBS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::VecDeque<([u8; 32], crate::core::template::BlockTemplate)>>,
 > = std::sync::OnceLock::new();
 
-fn merge_jobs(
-) -> &'static std::sync::Mutex<std::collections::VecDeque<([u8; 32], crate::core::template::BlockTemplate)>>
-{
+fn merge_jobs() -> &'static std::sync::Mutex<
+    std::collections::VecDeque<([u8; 32], crate::core::template::BlockTemplate)>,
+> {
     MERGE_JOBS.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
 }
 

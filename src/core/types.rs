@@ -18,12 +18,12 @@
 //! because there are no Commit transactions, so fork choice is plain
 //! cumulative proof-of-work.
 
-use super::bond::{BondEntry, BondRegistration, BondSet, MinerAuth};
-use super::relay::{Relay, RelayEntry, RelayHeaders};
 use super::auxpow::AuxPow;
+use super::bond::{BondEntry, BondRegistration, BondSet, MinerAuth};
 use super::mmr::{MerkleMountainRange, UtxoAccumulator};
 use super::mw::crypto::{self, Point32, Scalar32, IDENTITY};
 use super::mw::{Coinbase, Transaction};
+use super::relay::{Relay, RelayEntry, RelayHeaders};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
@@ -363,8 +363,7 @@ impl Emission {
     /// after every block below `height` has been applied. A chain state's
     /// `supply` field always equals this.
     pub fn issued_before(&self, height: u64) -> u64 {
-        self.scheduled_before(height)
-            .min(self.max_supply as u128) as u64
+        self.scheduled_before(height).min(self.max_supply as u128) as u64
     }
 
     /// What the block at `height` may mint.
@@ -421,7 +420,11 @@ pub fn parse_amount(s: &str) -> anyhow::Result<u64> {
     if whole.is_empty() && frac.is_empty() {
         anyhow::bail!("empty amount");
     }
-    if !whole.bytes().chain(frac.bytes()).all(|c| c.is_ascii_digit()) {
+    if !whole
+        .bytes()
+        .chain(frac.bytes())
+        .all(|c| c.is_ascii_digit())
+    {
         anyhow::bail!("'{s}' is not an amount in coins (digits and one '.')");
     }
     if frac.len() > 8 {
@@ -924,7 +927,11 @@ impl Batch {
     pub fn weight(&self) -> u64 {
         self.body.weight()
             + self.coinbase.as_ref().map_or(0, Coinbase::weight)
-            + self.registrations.iter().map(BondRegistration::weight).sum::<u64>()
+            + self
+                .registrations
+                .iter()
+                .map(BondRegistration::weight)
+                .sum::<u64>()
             + self.relay.as_ref().map_or(0, RelayHeaders::weight)
     }
 

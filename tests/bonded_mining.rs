@@ -69,7 +69,11 @@ async fn start_in(
     config.min_block_interval = Duration::from_millis(250);
     let (node, handle) = Node::new(config).await.unwrap();
     let task = tokio::spawn(node.run());
-    TestNode { handle, _dir: dir, _task: task }
+    TestNode {
+        handle,
+        _dir: dir,
+        _task: task,
+    }
 }
 
 impl TestNode {
@@ -109,11 +113,12 @@ async fn a_bonded_producer_mines_and_a_peer_validates_every_block() {
     // Test bonds must be within the registration horizon (one Midstate year),
     // while remaining eligible throughout the test. A fixed height of
     // 10_000_000 exceeds that horizon and prevents block template creation.
-    let bonded_until = est_midstate_height(current_timestamp())
-        + MIN_REMAINING_BOND_LOCK
-        + 10_000;
+    let bonded_until = est_midstate_height(current_timestamp()) + MIN_REMAINING_BOND_LOCK + 10_000;
     let (registration, headers) = devnet_registration(
-        mining_key, bonded_until, hash(b"integration salt"), &GENESIS_TARGET,
+        mining_key,
+        bonded_until,
+        hash(b"integration salt"),
+        &GENESIS_TARGET,
     );
     let bond = MinerBond {
         secret,
@@ -163,7 +168,10 @@ async fn a_bonded_producer_mines_and_a_peer_validates_every_block() {
     let id = hex::encode(bond.bond_id);
     let (bonds, miners) = tokio::task::spawn_blocking(move || {
         let client = midwimble::rpc::RpcClient::new(addr);
-        (client.get("/bonds").unwrap(), client.get("/miners/1/3").unwrap())
+        (
+            client.get("/bonds").unwrap(),
+            client.get("/miners/1/3").unwrap(),
+        )
     })
     .await
     .unwrap();

@@ -30,13 +30,13 @@
 //! transaction whose result is cross-checked against the caller's state.
 
 use crate::core::anchor::Checkpoint;
+use crate::core::bond::BondSet;
 use crate::core::mmr::{MerkleMountainRange, UtxoAccumulator};
 use crate::core::mw::crypto::{compress, decompress, scalar_from_bytes, Point32, Scalar32};
 use crate::core::mw::{Kernel, StoredGroup};
+use crate::core::relay::{Relay, RelayEntry};
 use crate::core::snapshot::{mmr_from_peaks, mmr_peak_values, Snapshot, SNAPSHOT_HEADERS};
 use crate::core::state::{calculate_target, calculate_work};
-use crate::core::bond::BondSet;
-use crate::core::relay::{Relay, RelayEntry};
 use crate::core::types::{block_reward, utxo_leaf, BlockEffects, UtxoEntry};
 use crate::core::{Batch, BatchHeader, State};
 use anyhow::{anyhow, bail, Context, Result};
@@ -972,7 +972,9 @@ impl Storage {
                 bail!("commit_chain: stored diffs disagree with the supplied state");
             }
             if capped != state.capped {
-                bail!("commit_chain: replayed fork-choice weight disagrees with the supplied state");
+                bail!(
+                    "commit_chain: replayed fork-choice weight disagrees with the supplied state"
+                );
             }
             if bonds.root() != state.bonds.root() || bond_table.len()? != state.bonds.len() as u64 {
                 bail!("commit_chain: stored bond diffs disagree with the supplied state");
@@ -1593,7 +1595,11 @@ mod tests {
         let mut loaded = storage.load_state().unwrap().unwrap();
         assert_eq!((loaded.depth, loaded.capped), (state.depth, state.capped));
         for &(height, capped) in &history {
-            assert_eq!(storage.state_at(&loaded, height).unwrap().capped, capped, "height {height}");
+            assert_eq!(
+                storage.state_at(&loaded, height).unwrap().capped,
+                capped,
+                "height {height}"
+            );
         }
         mine_signed(&storage, &mut loaded, &mut ts, &to, &b);
         mine_signed(&storage, &mut loaded, &mut ts, &to, &a);
@@ -1621,7 +1627,10 @@ mod tests {
         mine_signed_at(&storage, &mut state, &mut ts, &to, &bond, late);
         let cheap = calculate_work(&state.target);
         let cap = cheap + cheap / WORK_CAP_HEADROOM;
-        assert!(cap < full, "the cheap block ({cheap}) caps a full one ({full})");
+        assert!(
+            cap < full,
+            "the cheap block ({cheap}) caps a full one ({full})"
+        );
         mine_signed(&storage, &mut state, &mut ts, &to, &bond);
         assert_eq!(calculate_work(&state.target), full, "back on schedule");
 
@@ -1631,7 +1640,10 @@ mod tests {
             mine_signed(&storage, &mut state, &mut ts, &to, &bond);
             history.push((state.height, state.capped));
         }
-        assert_eq!(state.capped - before, (full - cap) * WORK_CAP_WINDOW as u128);
+        assert_eq!(
+            state.capped - before,
+            (full - cap) * WORK_CAP_WINDOW as u128
+        );
         let after = state.capped;
         mine_signed(&storage, &mut state, &mut ts, &to, &bond);
         assert_eq!(state.capped, after, "the cheap block has left the window");
@@ -1642,7 +1654,11 @@ mod tests {
         assert_eq!((loaded.depth, loaded.capped), (state.depth, state.capped));
         assert_eq!(loaded.work_floor, state.work_floor);
         for &(height, capped) in &history {
-            assert_eq!(storage.state_at(&loaded, height).unwrap().capped, capped, "height {height}");
+            assert_eq!(
+                storage.state_at(&loaded, height).unwrap().capped,
+                capped,
+                "height {height}"
+            );
         }
         let rewound = storage.state_at(&loaded, history[0].0).unwrap();
         assert_eq!(rewound.work_floor.front().map(|&(_, w)| w), Some(cheap));

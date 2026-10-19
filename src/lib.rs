@@ -10,6 +10,8 @@ pub mod core;
 #[cfg(feature = "node")]
 pub mod anchor;
 #[cfg(feature = "node")]
+pub mod explorer;
+#[cfg(feature = "node")]
 pub mod finality;
 #[cfg(feature = "node")]
 pub mod mempool;
@@ -25,8 +27,6 @@ pub mod node;
 pub mod pool;
 #[cfg(feature = "node")]
 pub mod rpc;
-#[cfg(feature = "node")]
-pub mod explorer;
 #[cfg(feature = "node")]
 pub mod storage;
 #[cfg(feature = "node")]

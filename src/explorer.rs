@@ -72,7 +72,11 @@ fn coinbase_outputs(b: &Batch) -> impl Iterator<Item = &Output> {
 }
 
 fn all_kernels(b: &Batch) -> impl Iterator<Item = &Kernel> {
-    b.body.body.kernels.iter().chain(b.coinbase.iter().map(|c| &c.kernel))
+    b.body
+        .body
+        .kernels
+        .iter()
+        .chain(b.coinbase.iter().map(|c| &c.kernel))
 }
 
 impl ExplorerIndex {
@@ -149,7 +153,9 @@ impl ExplorerIndex {
     fn sync(&mut self, node: &NodeHandle) -> anyhow::Result<()> {
         let storage = node.storage();
         while self.next > 0 {
-            let stored = storage.load_batch(self.next - 1)?.map(|b| b.extension.final_hash);
+            let stored = storage
+                .load_batch(self.next - 1)?
+                .map(|b| b.extension.final_hash);
             if stored.is_some() && stored == self.log.back().map(|l| l.hash) {
                 break;
             }
@@ -174,15 +180,24 @@ impl ExplorerIndex {
 }
 
 fn not_found(what: &str) -> ApiError {
-    (StatusCode::NOT_FOUND, Json(json!({ "error": format!("no such {what}") })))
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": format!("no such {what}") })),
+    )
 }
 
 fn bad(e: impl std::fmt::Display) -> ApiError {
-    (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() })))
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": e.to_string() })),
+    )
 }
 
 fn internal(e: impl std::fmt::Display) -> ApiError {
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": e.to_string() })),
+    )
 }
 
 fn hex32(s: &str) -> Result<[u8; 32], ApiError> {
@@ -205,7 +220,9 @@ where
     F: FnOnce(&ExplorerIndex, &NodeHandle) -> ApiResult + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
-        let mut idx = index.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut idx = index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         idx.sync(&node).map_err(internal)?;
         answer(&idx, &node)
     })
@@ -224,7 +241,11 @@ fn difficulty_bits(target: &[u8; 32]) -> f64 {
 }
 
 fn fees(b: &Batch) -> u64 {
-    b.body.body.kernels.iter().fold(0u64, |acc, k| acc.saturating_add(k.fee))
+    b.body
+        .body
+        .kernels
+        .iter()
+        .fold(0u64, |acc, k| acc.saturating_add(k.fee))
 }
 
 fn summary(height: u64, b: &Batch, prev_timestamp: Option<u64>) -> Value {
@@ -271,7 +292,11 @@ fn kernel_json(k: &Kernel) -> Value {
 
 /// The coinbase's 32 spare bytes as text, when a miner put text there.
 fn printable(extra: &[u8; 32]) -> Option<String> {
-    let text: String = extra.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+    let text: String = extra
+        .iter()
+        .take_while(|&&b| b != 0)
+        .map(|&b| b as char)
+        .collect();
     let clean = !text.is_empty() && text.chars().all(|c| c.is_ascii_graphic() || c == ' ');
     clean.then_some(text)
 }
@@ -316,7 +341,10 @@ pub async fn blocks(
 fn resolve_block(idx: &ExplorerIndex, id: &str, tip: u64) -> Result<u64, ApiError> {
     let height = match id.parse::<u64>() {
         Ok(h) => h,
-        Err(_) => *idx.hashes.get(&hex32(id)?).ok_or_else(|| not_found("block"))?,
+        Err(_) => *idx
+            .hashes
+            .get(&hex32(id)?)
+            .ok_or_else(|| not_found("block"))?,
     };
     if height >= tip {
         return Err(not_found("block"));
@@ -426,7 +454,10 @@ pub async fn output(
         let state = node.state();
         let spent = idx.spent.get(&key).copied().filter(|&s| s >= created);
         let spent_hash = match spent {
-            Some(s) => storage.load_batch(s).map_err(internal)?.map(|sb| hex::encode(sb.extension.final_hash)),
+            Some(s) => storage
+                .load_batch(s)
+                .map_err(internal)?
+                .map(|sb| hex::encode(sb.extension.final_hash)),
             None => None,
         };
         let mut v = output_json(o, idx, &state);
@@ -457,7 +488,9 @@ pub async fn kernel(
             .map_err(internal)?
             .ok_or_else(|| not_found("kernel"))?;
         let coinbase = b.coinbase.as_ref().is_some_and(|c| c.kernel.excess == key);
-        let k = all_kernels(&b).find(|k| k.excess == key).ok_or_else(|| not_found("kernel"))?;
+        let k = all_kernels(&b)
+            .find(|k| k.excess == key)
+            .ok_or_else(|| not_found("kernel"))?;
         let mut v = kernel_json(k);
         v["height"] = json!(height);
         v["hash"] = json!(hex::encode(b.extension.final_hash));
@@ -500,9 +533,15 @@ pub async fn bonds(
     with_index(node, index, move |idx, node| {
         let state = node.state();
         let now = unix_now();
-        let mut list: Vec<Value> = state.bonds.keys().map(|id| bond_json(id, idx, &state, now)).collect();
+        let mut list: Vec<Value> = state
+            .bonds
+            .keys()
+            .map(|id| bond_json(id, idx, &state, now))
+            .collect();
         list.sort_by_key(|b| std::cmp::Reverse(b["window_signed"].as_u64().unwrap_or(0)));
-        Ok(Json(json!({ "bonds": list, "window": window_json(&state, now) })))
+        Ok(Json(
+            json!({ "bonds": list, "window": window_json(&state, now) }),
+        ))
     })
     .await
 }
@@ -544,7 +583,11 @@ pub async fn search(
         let found = |kind: &str, id: String| Ok(Json(json!({ "kind": kind, "id": id })));
         if !q.is_empty() && q.len() <= 20 && q.bytes().all(|c| c.is_ascii_digit()) {
             let h: u64 = q.parse().map_err(bad)?;
-            return if h < node.state().height { found("block", h.to_string()) } else { Err(not_found("block")) };
+            return if h < node.state().height {
+                found("block", h.to_string())
+            } else {
+                Err(not_found("block"))
+            };
         }
         let key = hex32(&q).map_err(|_| not_found("height, hash, commitment, kernel or bond"))?;
         if let Some(h) = idx.hashes.get(&key) {
@@ -572,14 +615,26 @@ mod tests {
     use crate::core::mw::transaction::{Input, KernelFeatures, OutputGroup};
 
     /// A block whose kernel excess and hash are both `[tag; 32]`.
-    fn block(tag: u8, spends: &[[u8; 32]], creates: &[[u8; 32]], signer: Option<[u8; 32]>) -> Batch {
-        let sig = SchnorrSig { e: [0; 32], s: [0; 32] };
+    fn block(
+        tag: u8,
+        spends: &[[u8; 32]],
+        creates: &[[u8; 32]],
+        signer: Option<[u8; 32]>,
+    ) -> Batch {
+        let sig = SchnorrSig {
+            e: [0; 32],
+            s: [0; 32],
+        };
         let mut b = Batch::genesis().clone();
         b.extension.final_hash = [tag; 32];
         b.coinbase = None;
         b.body.body.inputs = spends
             .iter()
-            .map(|c| Input { commitment: *c, owner_key: [0; 32], signature: sig.clone() })
+            .map(|c| Input {
+                commitment: *c,
+                owner_key: [0; 32],
+                signature: sig.clone(),
+            })
             .collect();
         b.body.body.outputs = vec![OutputGroup {
             outputs: creates
@@ -601,9 +656,16 @@ mod tests {
             min_height: 0,
             excess: [tag; 32],
             owner_excess: [0; 32],
-            signature: KernelSig { c: [0; 32], s1: [0; 32], s2: [0; 32] },
+            signature: KernelSig {
+                c: [0; 32],
+                s1: [0; 32],
+                s2: [0; 32],
+            },
         }];
-        b.miner = signer.map(|bond_id| MinerAuth { bond_id, signature: sig });
+        b.miner = signer.map(|bond_id| MinerAuth {
+            bond_id,
+            signature: sig,
+        });
         b
     }
 
@@ -626,7 +688,11 @@ mod tests {
         assert!(!idx.kernels.contains_key(&[2; 32]));
         assert!(!idx.hashes.contains_key(&[2; 32]));
         assert!(idx.signed[&bond].is_empty());
-        assert_eq!(idx.created.get(&a), Some(&0), "earlier blocks are untouched");
+        assert_eq!(
+            idx.created.get(&a),
+            Some(&0),
+            "earlier blocks are untouched"
+        );
 
         // The replacement spends a into c instead.
         idx.add(1, &block(3, &[a], &[c], None));

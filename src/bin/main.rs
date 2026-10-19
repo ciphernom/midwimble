@@ -459,7 +459,8 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
     use midwimble::core::bond::*;
     use midwimble::core::state::calculate_work;
     use midwimble::core::types::GENESIS_TARGET;
-    let read = |p: &PathBuf| -> Result<BondFile> { Ok(serde_json::from_slice(&std::fs::read(p)?)?) };
+    let read =
+        |p: &PathBuf| -> Result<BondFile> { Ok(serde_json::from_slice(&std::fs::read(p)?)?) };
     let write = |p: &PathBuf, f: &BondFile| -> Result<()> {
         std::fs::write(p, serde_json::to_vec_pretty(f)?)?;
         #[cfg(unix)]
@@ -486,7 +487,10 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
         }
     };
     match cmd {
-        BondCmd::New { file, mining_pubkey } => {
+        BondCmd::New {
+            file,
+            mining_pubkey,
+        } => {
             if file.exists() {
                 anyhow::bail!("{} already exists", file.display());
             }
@@ -501,10 +505,17 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
                 out!("Co-bond file: it holds no secret. Next: `midwimble bond address`, lock the coin, \
                       `midwimble bond register`, then give {} to the pool.", file.display());
             } else {
-                out!("Keep {} safe: it can mine as the bond. Next: `midwimble bond address`.", file.display());
+                out!(
+                    "Keep {} safe: it can mine as the bond. Next: `midwimble bond address`.",
+                    file.display()
+                );
             }
         }
-        BondCmd::Address { file, owner_pk, until } => {
+        BondCmd::Address {
+            file,
+            owner_pk,
+            until,
+        } => {
             let f = read(&file)?;
             let script = BondScript {
                 mining_key: f.mining_key()?,
@@ -518,7 +529,15 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
                 MIN_MINING_BOND >> 30
             );
         }
-        BondCmd::Register { file, owner_pk, until, value, salt, midstate_rpc, midwimble_rpc } => {
+        BondCmd::Register {
+            file,
+            owner_pk,
+            until,
+            value,
+            salt,
+            midstate_rpc,
+            midwimble_rpc,
+        } => {
             let mut f = read(&file)?;
             let coin = BondCoin {
                 script: BondScript {
@@ -535,15 +554,26 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
             // 1. The proof, taken once, against midstate's tip.
             let proof = match &f.proof {
                 Some(p) if p.coin == coin => {
-                    out!("✓ proof already taken at midstate height {}", p.midstate_height);
+                    out!(
+                        "✓ proof already taken at midstate height {}",
+                        p.midstate_height
+                    );
                     p.clone()
                 }
                 _ => {
-                    let v = midstate.get(&format!("/utxo_proof/{}", hex::encode(coin.coin_id())))?;
+                    let v =
+                        midstate.get(&format!("/utxo_proof/{}", hex::encode(coin.coin_id())))?;
                     let p = bond_proof_from_json(coin, &v)?;
                     let bond = p.verify(&bytes32(&v["state_root"])?)?;
-                    out!("✓ four roots rebuild midstate's state root at height {}", p.midstate_height);
-                    out!("✓ SMT proof: the bond coin is unspent there ({} units, locked until {})", bond.value, bond.bonded_until);
+                    out!(
+                        "✓ four roots rebuild midstate's state root at height {}",
+                        p.midstate_height
+                    );
+                    out!(
+                        "✓ SMT proof: the bond coin is unspent there ({} units, locked until {})",
+                        bond.value,
+                        bond.bonded_until
+                    );
                     f.coin = Some(coin);
                     f.proof = Some(p.clone());
                     f.registration = None;
@@ -661,7 +691,10 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
                 }
                 out!("Buried, but with less than the 25% margin: if midwimble's difficulty rises, run this again.");
             }
-            out!("Ready: midwimble node --mining-bond {} --mine-to <address>", file.display());
+            out!(
+                "Ready: midwimble node --mining-bond {} --mine-to <address>",
+                file.display()
+            );
         }
     }
     Ok(())
@@ -689,15 +722,15 @@ fn utc(ts: u64) -> String {
 }
 
 fn print_params() {
+    use midwimble::core::bond::{BONDED_MINING_FROM, MIN_MINING_BOND, MIN_REMAINING_BOND_LOCK};
     use midwimble::core::state::calculate_work;
     use midwimble::core::types::{
         count_leading_zeros, network_anchor, ASERT_HALF_LIFE, BITCOIN_BLOCK_HASH,
-        BITCOIN_BLOCK_HEIGHT, BITCOIN_BLOCK_TIME, COINBASE_MATURITY, EMISSION,
-        GENESIS_TARGET, GENESIS_TIMESTAMP, HALVING_INTERVAL, LAUNCH_PARAMETERS_SET,
-        MAX_SUPPLY, MIDSTATE_BLOCK_HASH, MIDSTATE_BLOCK_HEIGHT, MIN_FEE_PER_WEIGHT, NETWORK_MAGIC,
+        BITCOIN_BLOCK_HEIGHT, BITCOIN_BLOCK_TIME, COINBASE_MATURITY, EMISSION, GENESIS_TARGET,
+        GENESIS_TIMESTAMP, HALVING_INTERVAL, LAUNCH_PARAMETERS_SET, MAX_SUPPLY,
+        MIDSTATE_BLOCK_HASH, MIDSTATE_BLOCK_HEIGHT, MIN_FEE_PER_WEIGHT, NETWORK_MAGIC,
         TARGET_BLOCK_TIME,
     };
-    use midwimble::core::bond::{BONDED_MINING_FROM, MIN_MINING_BOND, MIN_REMAINING_BOND_LOCK};
     let at = |height: u64| utc(GENESIS_TIMESTAMP + height * TARGET_BLOCK_TIME);
     let kind = match (LAUNCH_PARAMETERS_SET, cfg!(feature = "fast-mining")) {
         (_, true) => "FAST-MINING TEST BUILD (never run this on a real network)",
@@ -705,7 +738,10 @@ fn print_params() {
         (false, false) => "DEVNET: launch parameters are still placeholders",
     };
     out!("build                {kind}");
-    out!("network magic        {}", String::from_utf8_lossy(NETWORK_MAGIC));
+    out!(
+        "network magic        {}",
+        String::from_utf8_lossy(NETWORK_MAGIC)
+    );
     out!("network anchor       {}", hex::encode(network_anchor()));
     out!(
         "bitcoin anchor       height {BITCOIN_BLOCK_HEIGHT}, mined {}",
@@ -714,7 +750,10 @@ fn print_params() {
     out!("                     {BITCOIN_BLOCK_HASH}");
     out!("midstate anchor      height {MIDSTATE_BLOCK_HEIGHT}");
     out!("                     {MIDSTATE_BLOCK_HASH}");
-    out!("genesis time         {} ({GENESIS_TIMESTAMP})", utc(GENESIS_TIMESTAMP));
+    out!(
+        "genesis time         {} ({GENESIS_TIMESTAMP})",
+        utc(GENESIS_TIMESTAMP)
+    );
     let work = calculate_work(&GENESIS_TARGET);
     out!(
         "genesis target       {} ({} leading zero bits; 60 s blocks at ~{} attempts/s)",
@@ -747,7 +786,10 @@ fn print_params() {
         );
     }
     out!("");
-    out!("max supply           {} (8 decimal places, reached exactly)", format_amount(MAX_SUPPLY));
+    out!(
+        "max supply           {} (8 decimal places, reached exactly)",
+        format_amount(MAX_SUPPLY)
+    );
     if EMISSION.slow_start > 0 {
         out!(
             "slow start           blocks 1..={}, ending ~{}",
@@ -755,7 +797,10 @@ fn print_params() {
             at(EMISSION.slow_start)
         );
     }
-    out!("era-0 reward         {}", format_amount(EMISSION.initial_reward));
+    out!(
+        "era-0 reward         {}",
+        format_amount(EMISSION.initial_reward)
+    );
     out!(
         "halving interval     {HALVING_INTERVAL} blocks ({} s, Bitcoin's era length)",
         HALVING_INTERVAL * TARGET_BLOCK_TIME
@@ -794,7 +839,9 @@ fn run(cli: Cli) -> Result<()> {
             rpc,
             rpc_allow_hosts,
             explorer,
-            mine_to, mining_bond, co_bonds,
+            mine_to,
+            mining_bond,
+            co_bonds,
             midstate_rpc,
             threads,
             amino,
@@ -837,7 +884,8 @@ fn run(cli: Cli) -> Result<()> {
                 Ok(())
             };
             if let Some(path) = &mining_bond {
-                let file: midwimble::core::bond::BondFile = serde_json::from_slice(&std::fs::read(path)?)?;
+                let file: midwimble::core::bond::BondFile =
+                    serde_json::from_slice(&std::fs::read(path)?)?;
                 let mut bond = file.miner_bond()?;
                 check(path, bond.registration.as_ref(), bond.midstate.as_ref())?;
                 tracing::info!("Mining as bond {}", hex::encode(bond.bond_id));
@@ -845,7 +893,10 @@ fn run(cli: Cli) -> Result<()> {
                     let co: midwimble::core::bond::BondFile =
                         serde_json::from_slice(&std::fs::read(path)?)?;
                     if co.mining_key()? != bond.mining_key() {
-                        anyhow::bail!("{} names a different mining key than --mining-bond", path.display());
+                        anyhow::bail!(
+                            "{} names a different mining key than --mining-bond",
+                            path.display()
+                        );
                     }
                     let entry = co.co_bond_entry()?;
                     check(path, entry.registration.as_ref(), entry.midstate.as_ref())?;
@@ -854,11 +905,15 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 config.mining_bond = Some(bond);
             } else if !co_bonds.is_empty() {
-                anyhow::bail!("--co-bond needs --mining-bond: the co-bonds sign with its mining key");
+                anyhow::bail!(
+                    "--co-bond needs --mining-bond: the co-bonds sign with its mining key"
+                );
             } else if config.mine_to.is_some()
                 && midwimble::core::bond::BONDED_MINING_FROM != u64::MAX
             {
-                anyhow::bail!("mining requires a registered bond: pass --mining-bond (see `midwimble bond`)");
+                anyhow::bail!(
+                    "mining requires a registered bond: pass --mining-bond (see `midwimble bond`)"
+                );
             }
             if config.mining_bond.is_some() && midstate_rpc.is_none() {
                 tracing::warn!(

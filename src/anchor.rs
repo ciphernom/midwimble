@@ -548,8 +548,14 @@ mod tests {
         assert_eq!(heights(&records), vec![1, 2]);
         // Nothing new until the line is complete; then only the new records,
         // past a line that does not parse and those `keep` refuses.
-        assert!(load_records_from(&path, offset, 10, all).unwrap().0.is_empty());
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        assert!(load_records_from(&path, offset, 10, all)
+            .unwrap()
+            .0
+            .is_empty());
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(f, "{tail}").unwrap();
         writeln!(f, "not json").unwrap();
         for h in 4..=6 {

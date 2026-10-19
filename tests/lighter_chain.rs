@@ -54,9 +54,16 @@ fn bonds(seeds: &[&[u8]]) -> Vec<MinerBond> {
 fn mine(state: &mut State, ts: &mut Vec<u64>, bond: &MinerBond) -> Batch {
     let to = WalletKeys::random().address();
     let on_schedule = GENESIS_TIMESTAMP + 60 * state.height;
-    let (template, _) =
-        build_template_bonded(state, ts, &[], &[(to, 1)], [0; 32], Some(on_schedule), Some(bond))
-            .unwrap();
+    let (template, _) = build_template_bonded(
+        state,
+        ts,
+        &[],
+        &[(to, 1)],
+        [0; 32],
+        Some(on_schedule),
+        Some(bond),
+    )
+    .unwrap();
     let block = template.mine_blocking();
     apply_batch(state, &block, ts).unwrap();
     ts.push(block.timestamp);
@@ -72,7 +79,12 @@ fn stored(blocks: &[Batch], state: &State) -> tempfile::TempDir {
     apply_batch(&mut replay, Batch::genesis(), &[]).unwrap();
     let genesis_effects = std::slice::from_ref(&replay.effects);
     storage
-        .commit_chain(0, std::slice::from_ref(Batch::genesis()), genesis_effects, &replay)
+        .commit_chain(
+            0,
+            std::slice::from_ref(Batch::genesis()),
+            genesis_effects,
+            &replay,
+        )
         .unwrap();
     let (mut ts, mut effects) = (vec![Batch::genesis().timestamp], Vec::new());
     for block in blocks {
@@ -100,7 +112,10 @@ impl TestNode {
         config.min_block_interval = Duration::from_millis(250);
         let (node, handle) = Node::new(config).await.unwrap();
         let task = tokio::spawn(node.run());
-        Self { handle, _task: task }
+        Self {
+            handle,
+            _task: task,
+        }
     }
 
     async fn dial_addr(&self) -> String {

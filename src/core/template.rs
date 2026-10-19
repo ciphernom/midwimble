@@ -10,9 +10,11 @@ use super::bond::{
     authorization_message, check_miner_authorization, BondRegistration, MinerAuth, MinerBond,
     BONDED_MINING_FROM,
 };
-use super::relay::{MidstateHeaders, RelayFeed, RelayHeaders, RELAY_MAX_FUTURE, RELAY_WEIGHT_PER_HEADER};
 use super::extension::create_extension;
 use super::mw::{build_coinbase_with, PayoutReceipt, StealthAddress, Transaction};
+use super::relay::{
+    MidstateHeaders, RelayFeed, RelayHeaders, RELAY_MAX_FUTURE, RELAY_WEIGHT_PER_HEADER,
+};
 use super::state::{apply_body, current_timestamp, min_next_timestamp, validate_block_contents};
 use super::types::*;
 use anyhow::{anyhow, bail, Result};
@@ -241,11 +243,7 @@ pub fn split_by_weight<K: Copy>(total: u64, weights: &[(K, u64)]) -> Result<Vec<
     }
     // Sum of floors <= total; at most weights.len() - 1 units remain.
     let mut order: Vec<usize> = (0..weights.len()).collect();
-    order.sort_by(|&a, &b| {
-        remainders[b]
-            .cmp(&remainders[a])
-            .then_with(|| a.cmp(&b))
-    });
+    order.sort_by(|&a, &b| remainders[b].cmp(&remainders[a]).then_with(|| a.cmp(&b)));
     for index in order.into_iter().take((total - paid) as usize) {
         out[index].1 += 1;
     }
@@ -264,7 +262,15 @@ pub fn build_template_with(
     extra: [u8; 32],
     timestamp: Option<u64>,
 ) -> Result<(BlockTemplate, Vec<(StealthAddress, PayoutReceipt)>)> {
-    build_template_bonded(state, previous_timestamps, txs, payouts, extra, timestamp, None)
+    build_template_bonded(
+        state,
+        previous_timestamps,
+        txs,
+        payouts,
+        extra,
+        timestamp,
+        None,
+    )
 }
 
 /// [`build_template_with`], mined under `bond`: the block carries the bond's
@@ -395,9 +401,11 @@ pub fn build_template_relayed(
                     }
                 }
             }
-            None => not_ready = Some(anyhow!(
+            None => {
+                not_ready = Some(anyhow!(
                 "the mining bond is not registered on this chain and no registration is configured"
-            )),
+            ))
+            }
         }
     }
     // Co-bonds' registrations ride along too, one a block, once the

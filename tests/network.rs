@@ -807,7 +807,10 @@ async fn browser_wallets_reach_a_node_over_webrtc() {
     let (addr, peer) = loop {
         let info = node.handle.info();
         if let Some(a) = info.listen_addrs.iter().find(|a| a.contains("/certhash/")) {
-            break (format!("{a}/p2p/{}", info.peer_id), info.peer_id.parse::<PeerId>().unwrap());
+            break (
+                format!("{a}/p2p/{}", info.peer_id),
+                info.peer_id.parse::<PeerId>().unwrap(),
+            );
         }
         assert!(Instant::now() < deadline, "no WebRTC listener");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -834,7 +837,9 @@ async fn browser_wallets_reach_a_node_over_webrtc() {
     browser
         .listen_on("/ip4/127.0.0.1/udp/0/webrtc-direct".parse().unwrap())
         .unwrap();
-    browser.dial(addr.parse::<libp2p::Multiaddr>().unwrap()).unwrap();
+    browser
+        .dial(addr.parse::<libp2p::Multiaddr>().unwrap())
+        .unwrap();
     tokio::spawn(async move {
         loop {
             browser.select_next_some().await;
@@ -879,6 +884,9 @@ async fn browser_wallets_reach_a_node_over_webrtc() {
     let blocks: Vec<midwimble::core::Batch> =
         bincode::deserialize(&hex::decode(data["blocks_hex"].as_str().unwrap()).unwrap()).unwrap();
     assert_eq!(blocks.len(), 3);
-    assert_eq!(blocks[0].extension.final_hash, midwimble::core::Batch::genesis().extension.final_hash);
+    assert_eq!(
+        blocks[0].extension.final_hash,
+        midwimble::core::Batch::genesis().extension.final_hash
+    );
     node.stop().await;
 }

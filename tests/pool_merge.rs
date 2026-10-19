@@ -14,9 +14,9 @@ use midwimble::core::auxpow::bytes32;
 use midwimble::core::bond::{
     devnet_registration, est_midstate_height, MinerBond, MIN_REMAINING_BOND_LOCK,
 };
-use midwimble::core::state::current_timestamp;
 use midwimble::core::extension::create_extension;
 use midwimble::core::mw::WalletKeys;
+use midwimble::core::state::current_timestamp;
 use midwimble::core::types::{hash, GENESIS_TARGET};
 use midwimble::node::{Node, NodeConfig};
 use midwimble::rpc::RpcClient;
@@ -40,11 +40,12 @@ async fn a_pool_mines_midwimble_with_its_midstate_search() {
     let mining_key = RistrettoPoint::mul_base(&secret).compress().to_bytes();
     // Keep the test bond eligible without exceeding the one-year
     // registration horizon enforced by consensus.
-    let bonded_until = est_midstate_height(current_timestamp())
-        + MIN_REMAINING_BOND_LOCK
-        + 10_000;
+    let bonded_until = est_midstate_height(current_timestamp()) + MIN_REMAINING_BOND_LOCK + 10_000;
     let (registration, headers) = devnet_registration(
-        mining_key, bonded_until, hash(b"pool bond salt"), &GENESIS_TARGET,
+        mining_key,
+        bonded_until,
+        hash(b"pool bond salt"),
+        &GENESIS_TARGET,
     );
     let bond = MinerBond {
         secret,
@@ -202,7 +203,10 @@ async fn a_pool_mines_midwimble_with_its_midstate_search() {
     .await
     .unwrap();
     let (job, found, stale_refused, wrong_output_refused, not_last) = job_and_result;
-    assert!(stale_refused, "a mining hash the node never issued was accepted");
+    assert!(
+        stale_refused,
+        "a mining hash the node never issued was accepted"
+    );
     assert!(
         wrong_output_refused,
         "a commitment claimed in the wrong coinbase output was accepted"
@@ -211,7 +215,10 @@ async fn a_pool_mines_midwimble_with_its_midstate_search() {
     assert!(err.to_string().contains("last output"), "{err:#}");
 
     assert_eq!(found["accepted"], true, "{found}");
-    assert_eq!(found["merged_mined"], true, "the block carries its aux proof");
+    assert_eq!(
+        found["merged_mined"], true,
+        "the block carries its aux proof"
+    );
     assert_eq!(found["height"], job["height"]);
 
     // The node accepted it as its own tip, and it is a merge-mined block
@@ -220,7 +227,10 @@ async fn a_pool_mines_midwimble_with_its_midstate_search() {
     assert_eq!(state.height, job["height"].as_u64().unwrap() + 1);
     let block = handle.storage().load_batches(1, 1, usize::MAX).unwrap();
     let block = &block[0];
-    assert!(block.aux_pow.is_some(), "the block's work lives in midstate");
+    assert!(
+        block.aux_pow.is_some(),
+        "the block's work lives in midstate"
+    );
     assert_eq!(hex::encode(block.miner.as_ref().unwrap().bond_id), bond_id);
     assert_eq!(block.registrations.len(), 1, "block 1 registers the bond");
     assert_eq!(state.bonds.len(), 1);

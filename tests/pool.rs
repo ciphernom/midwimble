@@ -193,7 +193,10 @@ async fn pool_pays_auditing_miners() {
     for record in found {
         let height = record["height"].as_u64().unwrap();
         let block = handle.storage().load_batch(height).unwrap().unwrap();
-        assert_eq!(hex::encode(block.extension.final_hash), record["hash"].as_str().unwrap());
+        assert_eq!(
+            hex::encode(block.extension.final_hash),
+            record["hash"].as_str().unwrap()
+        );
         let commitment: [u8; 32] = hex::decode(record["commitment"].as_str().unwrap())
             .unwrap()
             .try_into()

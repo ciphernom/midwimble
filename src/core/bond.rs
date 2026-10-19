@@ -23,17 +23,17 @@
 //! whose header a heavier midstate branch replaces is revoked.
 
 use super::anchor::HeaderLink;
-use super::relay::{MidstateHeaders, Relay};
 use super::auxpow::midstate_coin_id;
 use super::mmr::{verify_utxo_proof, UtxoAccumulator, UtxoProof};
-use super::state::calculate_work;
 use super::mw::crypto::{schnorr_sign, schnorr_verify, SchnorrSig};
+use super::relay::{MidstateHeaders, Relay};
+use super::state::calculate_work;
 use super::types::{
     compute_header_hash, fold_unsigned, hash, hash_concat, hash_domain, Batch, BatchHeader,
     NETWORK_MAGIC,
 };
-use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 use anyhow::{anyhow, bail, Result};
+use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 use serde::{Deserialize, Serialize};
 
 /// Midstate opcodes the template uses (midstate `src/core/script.rs`).
@@ -312,7 +312,8 @@ impl Bond {
 
 fn eligible(value: u64, bonded_until: u64, block_timestamp: u64) -> bool {
     value >= MIN_MINING_BOND
-        && bonded_until >= est_midstate_height(block_timestamp).saturating_add(MIN_REMAINING_BOND_LOCK)
+        && bonded_until
+            >= est_midstate_height(block_timestamp).saturating_add(MIN_REMAINING_BOND_LOCK)
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────
@@ -693,7 +694,10 @@ pub fn check_miner_authorization(
         .as_ref()
         .ok_or_else(|| anyhow!("block is not authorised by a mining bond"))?;
     let bond = bonds.get(&auth.bond_id).ok_or_else(|| {
-        anyhow!("block is mined under an unregistered bond {}", hex::encode(auth.bond_id))
+        anyhow!(
+            "block is mined under an unregistered bond {}",
+            hex::encode(auth.bond_id)
+        )
     })?;
     if !bond.eligible_at(batch.timestamp) {
         bail!(
@@ -896,17 +900,25 @@ impl BondFile {
             let bytes: [u8; 32] = hex::decode(key)?
                 .try_into()
                 .map_err(|_| anyhow!("mining_pubkey must be 32 bytes"))?;
-            if curve25519_dalek::ristretto::CompressedRistretto(bytes).decompress().is_none() {
+            if curve25519_dalek::ristretto::CompressedRistretto(bytes)
+                .decompress()
+                .is_none()
+            {
                 bail!("mining_pubkey is not a valid mining key");
             }
             return Ok(bytes);
         }
-        Ok(RistrettoPoint::mul_base(&self.secret()?).compress().to_bytes())
+        Ok(RistrettoPoint::mul_base(&self.secret()?)
+            .compress()
+            .to_bytes())
     }
 
     /// A co-bond file: the bond will name `mining_key`, someone else's.
     pub fn co_bond(mining_key: [u8; 32]) -> Self {
-        Self { mining_pubkey: Some(hex::encode(mining_key)), ..Self::default() }
+        Self {
+            mining_pubkey: Some(hex::encode(mining_key)),
+            ..Self::default()
+        }
     }
 
     /// What a producer adds with `--co-bond`. Needs a finished registration.
@@ -939,7 +951,14 @@ impl BondFile {
             registration: Some(registration),
             midstate: self.midstate_headers.clone(),
         };
-        let registered_key = bond.registration.as_ref().unwrap().proof.coin.script.mining_key;
+        let registered_key = bond
+            .registration
+            .as_ref()
+            .unwrap()
+            .proof
+            .coin
+            .script
+            .mining_key;
         if bond.mining_key() != registered_key {
             bail!("this file's secret is not the registered bond's mining key");
         }
@@ -952,7 +971,8 @@ impl BondFile {
 pub fn header_link_from_json(h: &serde_json::Value) -> Result<(HeaderLink, [u8; 32])> {
     use super::auxpow::bytes32;
     let u64_of = |v: &serde_json::Value| {
-        v.as_u64().ok_or_else(|| anyhow!("midstate header field is not a u64"))
+        v.as_u64()
+            .ok_or_else(|| anyhow!("midstate header field is not a u64"))
     };
     let link = HeaderLink {
         post_tx_midstate: bytes32(&h["post_tx_midstate"])?,
@@ -1044,7 +1064,10 @@ pub const MAX_BOND_HORIZON: u64 = 365 * 24 * 60;
 /// registered bonds rather than recent signers keeps an attacker's private
 /// chain, where only the attacker signs, under the same cap.
 pub fn signer_cap(bonds: &BondSet, block_timestamp: u64) -> usize {
-    let eligible = bonds.values().filter(|e| e.eligible_at(block_timestamp)).count();
+    let eligible = bonds
+        .values()
+        .filter(|e| e.eligible_at(block_timestamp))
+        .count();
     CAP_WINDOW.div_ceil(eligible.clamp(1, CAP_K))
 }
 
@@ -1359,7 +1382,11 @@ mod cap_tests {
     #[test]
     fn cap_is_an_equal_share_never_below_one_kth() {
         let mut bonds = BondSet::default();
-        assert_eq!(signer_cap(&bonds, 0), CAP_WINDOW, "a lone producer is uncapped");
+        assert_eq!(
+            signer_cap(&bonds, 0),
+            CAP_WINDOW,
+            "a lone producer is uncapped"
+        );
         for i in 0..3 {
             bonds.insert(bond_id(i), eligible_bond());
         }
@@ -1368,13 +1395,29 @@ mod cap_tests {
             bonds.insert(bond_id(i), eligible_bond());
         }
         assert_eq!(signer_cap(&bonds, 0), CAP_WINDOW.div_ceil(CAP_K));
-        assert_eq!(CAP_WINDOW % CAP_K, 0, "K divides the window, so the cap is exact");
+        assert_eq!(
+            CAP_WINDOW % CAP_K,
+            0,
+            "K divides the window, so the cap is exact"
+        );
 
         // Expired and undersized bonds do not dilute the cap.
         let mut few = BondSet::default();
         few.insert([1; 32], eligible_bond());
-        few.insert([2; 32], BondEntry { bonded_until: 0, ..eligible_bond() });
-        few.insert([3; 32], BondEntry { value: MIN_MINING_BOND / 2, ..eligible_bond() });
+        few.insert(
+            [2; 32],
+            BondEntry {
+                bonded_until: 0,
+                ..eligible_bond()
+            },
+        );
+        few.insert(
+            [3; 32],
+            BondEntry {
+                value: MIN_MINING_BOND / 2,
+                ..eligible_bond()
+            },
+        );
         assert_eq!(signer_cap(&few, 0), CAP_WINDOW);
     }
 
@@ -1408,7 +1451,10 @@ mod cap_tests {
         for _ in 0..cap {
             assert_eq!(credit_work(&mut state, Some([1; 32]), work, 0), work);
         }
-        assert_eq!(credit_work(&mut state, Some([1; 32]), work, 0), work / OVER_CAP_WORK_DIVISOR);
+        assert_eq!(
+            credit_work(&mut state, Some([1; 32]), work, 0),
+            work / OVER_CAP_WORK_DIVISOR
+        );
 
         // Bond 2 fills the rest of the window.
         for _ in 0..CAP_WINDOW - cap - 1 {
@@ -1422,7 +1468,10 @@ mod cap_tests {
         credit_work(&mut state, None, work, 0);
         assert_eq!(state.signer_counts[&[1; 32]] as usize, cap - 1);
         assert_eq!(credit_work(&mut state, Some([1; 32]), work, 0), work);
-        assert!(!state.signer_counts.contains_key(&[0; 32]), "unsigned blocks count for nobody");
+        assert!(
+            !state.signer_counts.contains_key(&[0; 32]),
+            "unsigned blocks count for nobody"
+        );
 
         // Rebuilding from the same signers reproduces the window exactly.
         let signers: Vec<_> = state.recent_signers.iter().copied().collect();
@@ -1448,7 +1497,11 @@ mod cap_tests {
     fn a_low_block_caps_credit_for_exactly_one_window() {
         let mut floor = im::Vector::new();
         let work = 1u128 << 40;
-        assert_eq!(cap_work(&mut floor, 0, work), work, "an empty window caps nothing");
+        assert_eq!(
+            cap_work(&mut floor, 0, work),
+            work,
+            "an empty window caps nothing"
+        );
         for h in 1..10 {
             assert_eq!(cap_work(&mut floor, h, work), work);
         }
@@ -1459,7 +1512,11 @@ mod cap_tests {
         // ...caps every block after it while it is in the window, and no longer.
         let window = WORK_CAP_WINDOW as u64;
         for h in 12..12 + window {
-            assert_eq!(cap_work(&mut floor, h, work), work / 2 + work / 8, "height {h}");
+            assert_eq!(
+                cap_work(&mut floor, h, work),
+                work / 2 + work / 8,
+                "height {h}"
+            );
         }
         assert_eq!(cap_work(&mut floor, 12 + window, work), work);
     }
@@ -1488,7 +1545,10 @@ mod cap_tests {
         }
         // The window rebuilt from stored blocks (a restart) is the same window.
         let mut state = super::super::types::State::genesis();
-        rebuild_work_floor(&mut state, (n - WORK_CAP_WINDOW..n).map(|h| (h as u64, works[h])));
+        rebuild_work_floor(
+            &mut state,
+            (n - WORK_CAP_WINDOW..n).map(|h| (h as u64, works[h])),
+        );
         assert_eq!(state.work_floor, floor);
     }
 
@@ -1521,12 +1581,21 @@ mod cap_tests {
         let mut rich = shared.clone();
         extend(&mut rich, &few, CAP_WINDOW, 10 * d);
         let slots = (share * few.len()) as u128;
-        assert!(slots * 10 * d > CAP_WINDOW as u128 * d, "by block count alone it would win");
-        assert!(rich.weight() < honest_day.weight(), "ten times the hashrate buys no weight");
+        assert!(
+            slots * 10 * d > CAP_WINDOW as u128 * d,
+            "by block count alone it would win"
+        );
+        assert!(
+            rich.weight() < honest_day.weight(),
+            "ten times the hashrate buys no weight"
+        );
 
         let mut bonded = shared.clone();
         extend(&mut bonded, &many, CAP_WINDOW + 1, d);
-        assert!(bonded.weight() > honest_day.weight(), "more full-weight blocks still win");
+        assert!(
+            bonded.weight() > honest_day.weight(),
+            "more full-weight blocks still win"
+        );
     }
 
     /// The commitment depends on the set alone, however it was reached, and
@@ -1643,15 +1712,28 @@ mod cap_tests {
             midstate: None,
             co_bonds: vec![co([2; 32]), co([3; 32])],
         };
-        let mine = BondEntry { mining_key: producer.mining_key(), ..eligible_bond() };
+        let mine = BondEntry {
+            mining_key: producer.mining_key(),
+            ..eligible_bond()
+        };
         let mut bonds = BondSet::default();
         bonds.insert([1; 32], mine);
         bonds.insert([2; 32], mine);
         // Registered, but naming someone else's key: never this producer's to sign.
-        bonds.insert([3; 32], BondEntry { mining_key: [9; 32], ..eligible_bond() });
+        bonds.insert(
+            [3; 32],
+            BondEntry {
+                mining_key: [9; 32],
+                ..eligible_bond()
+            },
+        );
 
         let mut counts = im::HashMap::new();
-        assert_eq!(producer.choose_signer(&bonds, &counts, 0), [1; 32], "own bond on ties");
+        assert_eq!(
+            producer.choose_signer(&bonds, &counts, 0),
+            [1; 32],
+            "own bond on ties"
+        );
         counts.insert([1; 32], 5);
         counts.insert([2; 32], 2);
         assert_eq!(producer.choose_signer(&bonds, &counts, 0), [2; 32]);
@@ -1677,26 +1759,26 @@ mod tests {
     #[test]
     fn verifies_a_real_midstate_header() {
         let prev = [
-            0, 0, 0, 69, 80, 103, 194, 112, 22, 147, 243, 28, 0, 248, 178, 198, 115, 71, 111,
-            209, 96, 194, 254, 189, 159, 129, 242, 85, 223, 228, 248, 243,
+            0, 0, 0, 69, 80, 103, 194, 112, 22, 147, 243, 28, 0, 248, 178, 198, 115, 71, 111, 209,
+            96, 194, 254, 189, 159, 129, 242, 85, 223, 228, 248, 243,
         ];
         let mut target = [255u8; 32];
         target[..6].copy_from_slice(&[0, 0, 4, 193, 32, 127]);
         let link = HeaderLink {
             post_tx_midstate: [
-                77, 173, 143, 201, 58, 55, 42, 180, 120, 49, 199, 104, 109, 234, 237, 174, 168,
-                31, 199, 241, 102, 160, 92, 127, 150, 150, 136, 33, 175, 108, 75, 79,
+                77, 173, 143, 201, 58, 55, 42, 180, 120, 49, 199, 104, 109, 234, 237, 174, 168, 31,
+                199, 241, 102, 160, 92, 127, 150, 150, 136, 33, 175, 108, 75, 79,
             ],
             state_root: [
-                84, 171, 15, 189, 239, 148, 177, 127, 181, 83, 162, 142, 181, 144, 7, 138, 72,
-                17, 227, 169, 3, 9, 21, 136, 138, 20, 150, 166, 46, 120, 122, 200,
+                84, 171, 15, 189, 239, 148, 177, 127, 181, 83, 162, 142, 181, 144, 7, 138, 72, 17,
+                227, 169, 3, 9, 21, 136, 138, 20, 150, 166, 46, 120, 122, 200,
             ],
             timestamp: 1_789_993_393,
             target,
             nonce: 9_297_194_912_428,
             final_hash: [
-                0, 0, 0, 102, 168, 40, 225, 155, 113, 82, 165, 33, 248, 48, 166, 12, 34, 149,
-                135, 177, 254, 193, 74, 112, 88, 28, 39, 93, 45, 106, 77, 205,
+                0, 0, 0, 102, 168, 40, 225, 155, 113, 82, 165, 33, 248, 48, 166, 12, 34, 149, 135,
+                177, 254, 193, 74, 112, 88, 28, 39, 93, 45, 106, 77, 205,
             ],
         };
         use crate::core::relay::RelayHeaders;
@@ -1919,7 +2001,10 @@ mod tests {
         }
         .eligible_at(t));
         // The clock runs a week ahead of midstate's nominal schedule.
-        assert_eq!(est_midstate_height(MIDSTATE_GENESIS_TIMESTAMP), CLOCK_MARGIN);
+        assert_eq!(
+            est_midstate_height(MIDSTATE_GENESIS_TIMESTAMP),
+            CLOCK_MARGIN
+        );
     }
 
     /// Registrations against a relay of mined midstate headers, so these run
