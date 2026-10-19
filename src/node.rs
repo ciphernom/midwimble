@@ -57,6 +57,7 @@ use crate::miner::{MinedBlock, Miner};
 use crate::network::amino::{self, AminoHandle};
 use crate::network::light_protocol::{
     LightNotification, LightRequest, LightResponse, LIGHT_BLOCKS_BYTE_LIMIT, MAX_LIGHT_BLOCKS,
+    MAX_LIGHT_MEMPOOL_HASHES, MAX_LIGHT_MEMPOOL_TXS,
 };
 use crate::network::protocol::BATCH_RESPONSE_SOFT_LIMIT;
 use crate::network::protocol::{
@@ -1479,7 +1480,11 @@ impl Node {
         }
         self.mempool.revalidate(&self.state);
         for tx in restored {
-            let _ = self.mempool.add(tx, &self.state, true);
+            if self.mempool.add(tx.clone(), &self.state, true).is_ok() {
+                // Miners of the winning branch may never have seen it: it
+                // went from mempools into the block that just lost.
+                self.network.broadcast(Message::Transaction(tx));
+            }
         }
         self.cache_state();
         if let Some(last) = blocks.last() {
@@ -3285,7 +3290,47 @@ impl Node {
                 return light_from_storage(&self.storage, self.state.height, request)
             }
             LightRequest::GetMempool => {
-                json!({ "count": self.mempool.len(), "weight": self.mempool.total_weight() })
+                let hashes = self.mempool.hashes();
+                json!({
+                    "count": self.mempool.len(),
+                    "weight": self.mempool.total_weight(),
+                    "hashes": hashes
+                        .iter()
+                        .take(MAX_LIGHT_MEMPOOL_HASHES)
+                        .map(hex::encode)
+                        .collect::<Vec<_>>(),
+                    "truncated": hashes.len() > MAX_LIGHT_MEMPOOL_HASHES,
+                })
+            }
+            LightRequest::GetMempoolTxs { hashes } => {
+                if hashes.len() > MAX_LIGHT_MEMPOOL_TXS {
+                    bail!("at most {MAX_LIGHT_MEMPOOL_TXS} transactions per request");
+                }
+                let mut txs = Vec::new();
+                let mut sent = Vec::new();
+                let mut bytes = 0usize;
+                for h in &hashes {
+                    let hash: [u8; 32] = hex::decode(h)
+                        .ok()
+                        .and_then(|b| b.try_into().ok())
+                        .ok_or_else(|| anyhow!("not a transaction hash: {h}"))?;
+                    let Some(tx) = self.mempool.get(&hash) else {
+                        continue; // mined or dropped since the client looked
+                    };
+                    let size = bincode::serialized_size(tx)? as usize;
+                    if !txs.is_empty() && bytes + size > LIGHT_BLOCKS_BYTE_LIMIT {
+                        break;
+                    }
+                    bytes += size;
+                    txs.push(tx);
+                    sent.push(h.as_str());
+                }
+                json!({
+                    // The hashes of the transactions sent, in order: any
+                    // missing were mined or dropped, or did not fit.
+                    "hashes": sent,
+                    "txs_hex": hex::encode(bincode::serialize(&txs)?),
+                })
             }
             LightRequest::SubmitTransaction { .. } => {
                 return Err(anyhow!("submissions are handled asynchronously"));

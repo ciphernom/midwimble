@@ -72,6 +72,18 @@ impl Mempool {
         self.entries.values().map(|e| e.tx.clone()).collect()
     }
 
+    /// The hashes of every transaction in the pool, in hash order.
+    pub fn hashes(&self) -> Vec<[u8; 32]> {
+        let mut hashes: Vec<[u8; 32]> = self.entries.keys().copied().collect();
+        hashes.sort_unstable();
+        hashes
+    }
+
+    /// The pool's transaction with this hash.
+    pub fn get(&self, tx_hash: &[u8; 32]) -> Option<&Transaction> {
+        self.entries.get(tx_hash).map(|e| &e.tx)
+    }
+
     /// Everything the pool would do except insertion: relay policy, full
     /// stateless validation, stateful validation against `state`, and
     /// conflicts with pool contents.

@@ -59,8 +59,18 @@ pub enum LightRequest {
     },
     #[serde(rename = "get_filters")]
     GetFilters { start_height: u64, end_height: u64 },
+    /// The mempool's size, and the hashes of its transactions (at most
+    /// [`MAX_LIGHT_MEMPOOL_HASHES`]; `truncated` says there were more).
+    /// Transactions still in their Dandelion++ stem phase are not listed.
     #[serde(rename = "get_mempool")]
     GetMempool,
+    /// Transactions waiting in the mempool, by hash, as one hex-encoded
+    /// bincode `Vec<Transaction>`: a wallet scans their outputs with its
+    /// view key to see payments to it before a block confirms them. At most
+    /// [`MAX_LIGHT_MEMPOOL_TXS`] are asked for; any that left the mempool
+    /// are left out, and so are any past the response's size limit.
+    #[serde(rename = "get_mempool_txs")]
+    GetMempoolTxs { hashes: Vec<String> },
     /// Hex-encoded bincode `Transaction`, entered via Dandelion++.
     #[serde(rename = "submit_transaction")]
     SubmitTransaction { tx_hex: String },
@@ -85,6 +95,10 @@ impl LightRequest {
 
 /// Most blocks one `get_blocks` returns.
 pub const MAX_LIGHT_BLOCKS: u64 = 200;
+/// Most transaction hashes one `get_mempool` lists.
+pub const MAX_LIGHT_MEMPOOL_HASHES: usize = 4_096;
+/// Most transactions one `get_mempool_txs` may ask for.
+pub const MAX_LIGHT_MEMPOOL_TXS: usize = 64;
 /// `get_blocks` stops adding blocks once their bincode reaches this, so the
 /// hex response stays well inside [`MAX_LIGHT_MSG_SIZE`] (which browser
 /// clients mirror).
@@ -97,6 +111,11 @@ pub struct LightResponse {
     pub data: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The request's `id`, echoed: a client that numbers its requests can
+    /// tell an answer that reached the wrong stream (a WebRTC data channel's
+    /// id is reused quickly) from its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
 }
 
 impl LightResponse {
@@ -105,6 +124,7 @@ impl LightResponse {
             ok: true,
             data: Some(data),
             error: None,
+            id: None,
         }
     }
 
@@ -113,13 +133,30 @@ impl LightResponse {
             ok: false,
             data: None,
             error: Some(msg.into()),
+            id: None,
         }
     }
 }
 
 pub async fn read_request_raw<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<LightRequest> {
+    Ok(read_request_with_id(io).await?.1)
+}
+
+/// A request and the `id` its client gave it, if any: the answer echoes it.
+pub async fn read_request_with_id<T: AsyncRead + Unpin + Send>(
+    io: &mut T,
+) -> io::Result<(Option<u64>, LightRequest)> {
     let bytes = read_length_prefixed(io).await?;
-    serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    parse_request(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn parse_request(bytes: &[u8]) -> serde_json::Result<(Option<u64>, LightRequest)> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let id = value
+        .as_object_mut()
+        .and_then(|m| m.remove("id"))
+        .and_then(|v| v.as_u64());
+    Ok((id, serde_json::from_value(value)?))
 }
 
 pub async fn write_response_raw<T: AsyncWrite + Unpin + Send>(
@@ -212,5 +249,29 @@ mod tests {
                 limit: None
             }
         ));
+        let parsed: LightRequest =
+            serde_json::from_str(r#"{"method":"get_mempool_txs","params":{"hashes":["ab","cd"]}}"#)
+                .unwrap();
+        assert!(matches!(parsed, LightRequest::GetMempoolTxs { ref hashes } if hashes.len() == 2));
+        // Old clients' bare get_mempool still parses.
+        let parsed: LightRequest = serde_json::from_str(r#"{"method":"get_mempool"}"#).unwrap();
+        assert!(matches!(parsed, LightRequest::GetMempool));
+
+        // Numbered requests: the id comes back in the answer, and nodes that
+        // predate it parse the request anyway (they ignore the field).
+        let (id, parsed) = parse_request(br#"{"id":7,"method":"get_state"}"#).unwrap();
+        assert_eq!(id, Some(7));
+        assert!(matches!(parsed, LightRequest::GetState));
+        let old: LightRequest =
+            serde_json::from_str(r#"{"id":7,"method":"get_block","params":{"height":3}}"#).unwrap();
+        assert!(matches!(old, LightRequest::GetBlock { height: 3 }));
+        let (id, _) = parse_request(br#"{"method":"get_state"}"#).unwrap();
+        assert_eq!(id, None);
+        let mut answer = LightResponse::success(serde_json::json!({}));
+        answer.id = Some(7);
+        let json = serde_json::to_string(&answer).unwrap();
+        assert!(json.contains(r#""id":7"#), "{json}");
+        let unnumbered = serde_json::to_string(&LightResponse::error("x")).unwrap();
+        assert!(!unnumbered.contains("id"), "{unnumbered}");
     }
 }

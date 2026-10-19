@@ -965,11 +965,11 @@ impl Network {
         let guard = self.light_guard.clone();
         let light_count = self.light_peers.len();
         tokio::spawn(async move {
-            use light_protocol::{read_request_raw, write_response_raw};
+            use light_protocol::{read_request_with_id, write_response_raw};
             let mut stream = stream;
-            let request = match tokio::time::timeout(
+            let (id, request) = match tokio::time::timeout(
                 Duration::from_secs(LIGHT_READ_TIMEOUT_SECS),
-                read_request_raw(&mut stream),
+                read_request_with_id(&mut stream),
             )
             .await
             {
@@ -986,11 +986,9 @@ impl Network {
                 }
             };
             if request.is_expensive() && !guard.check_expensive(peer).await {
-                let _ = write_response_raw(
-                    &mut stream,
-                    LightResponse::error("rate limit: too many expensive requests"),
-                )
-                .await;
+                let mut refusal = LightResponse::error("rate limit: too many expensive requests");
+                refusal.id = id;
+                let _ = write_response_raw(&mut stream, refusal).await;
                 guard.close_stream(peer).await;
                 return;
             }
@@ -1010,6 +1008,7 @@ impl Network {
                 Ok(Err(_)) => LightResponse::error("internal error"),
                 Err(_) => LightResponse::error("server timeout"),
             };
+            resp.id = id;
             if is_get_state {
                 if let Some(serde_json::Value::Object(ref mut map)) = resp.data {
                     map.insert("light_connections".into(), serde_json::json!(light_count));
