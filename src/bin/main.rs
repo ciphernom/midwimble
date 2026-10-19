@@ -6,7 +6,7 @@ use midwimble::core::mw::StealthAddress;
 use midwimble::core::types::{block_reward, format_amount, parse_amount};
 use midwimble::node::{Node, NodeConfig};
 use midwimble::rpc::{self, RpcClient};
-use midwimble::wallet::Wallet;
+use midwimble::wallet::{SyncReport, Wallet, REORG_WINDOW};
 use std::path::PathBuf;
 
 /// `println!` that exits quietly when stdout is closed (e.g. piped into
@@ -295,7 +295,9 @@ enum WalletCmd {
     ViewKey,
     /// Print the recovery phrase: anyone who sees it can spend every coin.
     Phrase,
-    /// Scan new blocks from the node.
+    /// Scan new blocks from the node and say what changed: payments
+    /// received and confirmed, reorganisations, and payments to this wallet
+    /// still waiting in the node's mempool.
     Sync,
     /// Scan, then print the balance.
     Balance,
@@ -311,6 +313,21 @@ enum WalletCmd {
         /// Fee in coins (defaults to the relay minimum for the inputs used).
         #[arg(long)]
         fee: Option<String>,
+    },
+    /// Release the coins of a payment that will never confirm, and stop
+    /// broadcasting it. If it confirms after all, syncing records it.
+    Cancel {
+        /// The payment's transaction hash (or its first characters), as
+        /// `send` and `sync` print it.
+        #[arg(long)]
+        tx: String,
+    },
+    /// Scan the chain again, from the birth height or `--from`. On a network
+    /// that was relaunched, this forgets the old chain's coins and payments
+    /// and starts over on the node's.
+    Rescan {
+        #[arg(long)]
+        from: Option<u64>,
     },
 }
 
@@ -819,8 +836,149 @@ fn print_params() {
     out!("(dates assume the hashrate stays near its launch calibration; ASERT keeps them within a day or two)");
 }
 
-fn sync_wallet(wallet: &mut Wallet, client: &RpcClient) -> Result<u64> {
-    wallet.sync_from_node(client)
+/// Says what a wallet sync changed. `wallet sync` prints all of it; other
+/// commands print only what needs attention, on stderr, before their own
+/// output.
+fn report_sync(w: &Wallet, r: &SyncReport, everything: bool) {
+    let say = |line: String, attention: bool| {
+        if everything {
+            out!("{line}");
+        } else if attention {
+            eprintln!("{line}");
+        }
+    };
+    let short = |hash: &str| hash.get(..16).unwrap_or(hash).to_string();
+    let total = |v: &[u64]| format_amount(v.iter().sum());
+    if everything {
+        say(
+            format!(
+                "Scanned {} block(s); now at height {}",
+                r.blocks,
+                w.scanned_height()
+            ),
+            false,
+        );
+    }
+    if r.behind {
+        if r.node_syncing {
+            say(format!("The node is still syncing (at block {}; this wallet has scanned to {}): try again once it has caught up.", r.tip, w.scanned_height()), true);
+        } else {
+            say(format!("The node's chain is shorter than what this wallet has scanned (block {} against {}). If the network was relaunched, or this wallet was used on another network, `wallet rescan` starts it over on the node's chain.", r.tip, w.scanned_height()), true);
+        }
+        return;
+    }
+    if r.node_syncing {
+        say(
+            "(The node is downloading a heavier chain: what was just scanned may still change.)"
+                .into(),
+            false,
+        );
+    }
+    if let Some(to) = r.rolled_back_to {
+        if r.rescanned {
+            say(format!("The chain reorganised further back than this wallet keeps track of ({REORG_WINDOW} blocks): it rescanned from block {to}."), true);
+        } else {
+            say(format!("The chain reorganised: this wallet went back to block {to} and follows the new chain."), true);
+        }
+    }
+    if r.restored > 0 {
+        say(format!("The node has pruned old blocks: read its unspent outputs instead, and found {} coin(s).", r.restored), false);
+    }
+    let paid: Vec<(u64, u64)> = r
+        .received
+        .iter()
+        .filter(|(_, cb, _)| !cb)
+        .map(|(v, _, h)| (*v, *h))
+        .collect();
+    let mined: Vec<(u64, u64)> = r
+        .received
+        .iter()
+        .filter(|(_, cb, _)| *cb)
+        .map(|(v, _, h)| (*v, *h))
+        .collect();
+    if paid.len() > 5 {
+        say(
+            format!(
+                "Received {} payments, {} in all",
+                paid.len(),
+                total(&paid.iter().map(|p| p.0).collect::<Vec<_>>())
+            ),
+            false,
+        );
+    } else {
+        for (v, h) in &paid {
+            say(
+                format!("Received {} in block {h}", format_amount(*v)),
+                false,
+            );
+        }
+    }
+    if mined.len() > 5 {
+        say(
+            format!(
+                "Mined {} blocks, {} in all",
+                mined.len(),
+                total(&mined.iter().map(|p| p.0).collect::<Vec<_>>())
+            ),
+            false,
+        );
+    } else {
+        for (v, h) in &mined {
+            say(format!("Mined block {h}: {}", format_amount(*v)), false);
+        }
+    }
+    if !r.lost.is_empty() {
+        let lost: Vec<u64> = r.lost.iter().map(|(v, _)| *v).collect();
+        say(format!("{} this wallet had is gone: the blocks that paid it are no longer on the node's chain.", total(&lost)), true);
+    }
+    if r.confirmed.len() > 5 {
+        say(format!("{} payments confirmed", r.confirmed.len()), false);
+    } else {
+        for (hash, h) in &r.confirmed {
+            say(format!("Payment {hash} confirmed in block {h}"), false);
+        }
+    }
+    for hash in &r.failed {
+        say(format!("Payment {hash} failed: a block spent its coins in another transaction (from another copy of this wallet?)."), true);
+    }
+    for hash in &r.orphaned {
+        say(format!("Payment {hash} can no longer confirm: the blocks that paid this wallet the coins it spends are not on the node's chain."), true);
+    }
+    for hash in &r.unconfirmed {
+        say(format!("Payment {hash} is waiting for a block again: the reorganisation took it out of its block. Its coins stay reserved for it, and syncing broadcasts it again."), true);
+    }
+    for hash in &r.rebroadcast {
+        say(
+            format!("Broadcast payment {hash} again: the node had lost it."),
+            false,
+        );
+    }
+    for (hash, why) in &r.refused {
+        say(format!("The node refused payment {hash} when it was broadcast again: {why}. If it can never confirm, `wallet cancel --tx {}` releases its coins.", short(hash)), true);
+    }
+    for p in w.payments().iter().filter(|p| p.is_pending()) {
+        say(
+            format!(
+                "Waiting for a block: payment {} of {}",
+                p.tx_hash,
+                format_amount(p.amount)
+            ),
+            false,
+        );
+    }
+    for i in w.incoming() {
+        say(
+            format!(
+                "Incoming {} in transaction {}: waiting for a block",
+                format_amount(i.value),
+                i.tx_hash
+            ),
+            false,
+        );
+    }
+    if !r.mempool && w.scanned_height() >= r.tip {
+        say("(This node cannot show its mempool to wallets: upgrade it to see payments to this wallet before they confirm.)".into(), true);
+    }
 }
 
 fn main() {
@@ -1262,26 +1420,30 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 WalletCmd::Sync => {
                     let mut w = Wallet::open(&path, &password()?)?;
-                    let n = sync_wallet(&mut w, &client)?;
-                    out!(
-                        "Scanned {} block(s); now at height {}",
-                        n,
-                        w.scanned_height()
-                    );
+                    let r = w.sync(&client)?;
+                    report_sync(&w, &r, true);
                 }
                 WalletCmd::Balance => {
                     let mut w = Wallet::open(&path, &password()?)?;
-                    sync_wallet(&mut w, &client)?;
-                    let b = w.balance(client.height()?);
+                    let r = w.sync(&client)?;
+                    report_sync(&w, &r, false);
+                    let b = w.balance(r.tip);
                     out!(
-                        "spendable: {}\nimmature:  {}\npending:   {}",
+                        "spendable: {}\nimmature:  {}\npending:   {}\nincoming:  {}",
                         format_amount(b.spendable),
                         format_amount(b.immature),
-                        format_amount(b.pending)
+                        format_amount(b.pending),
+                        format_amount(b.incoming)
                     );
+                    if b.pending > 0 {
+                        out!("(pending: this wallet's coins in its own payments waiting for a block, change included)");
+                    }
+                    if b.incoming > 0 {
+                        out!("(incoming: payments to this wallet waiting for a block; spendable once one confirms them)");
+                    }
                     out!(
                         "(one block reward is currently {})",
-                        format_amount(block_reward(client.height()?))
+                        format_amount(block_reward(r.tip))
                     );
                 }
                 WalletCmd::Coins => {
@@ -1301,21 +1463,49 @@ fn run(cli: Cli) -> Result<()> {
                 WalletCmd::Send { to, amount, fee } => {
                     let amount = parse_amount(&amount)?;
                     let fee = fee.as_deref().map(parse_amount).transpose()?;
-                    let mut w = Wallet::open(&path, &password()?)?;
-                    sync_wallet(&mut w, &client)?;
                     let to = StealthAddress::decode(&to)?;
-                    let tip = client.height()?;
-                    let tx = w.build_send(&to, amount, fee, tip)?;
-                    match client.submit(&tx) {
-                        Ok(hash) => {
-                            w.save()?;
-                            out!("Submitted transaction {hash}");
-                        }
-                        Err(e) => {
-                            w.cancel_pending(&hex::encode(tx.hash()));
-                            return Err(e);
-                        }
+                    let mut w = Wallet::open(&path, &password()?)?;
+                    let r = w.sync(&client)?;
+                    report_sync(&w, &r, false);
+                    let tx = w.build_send(&to, amount, fee, r.tip)?;
+                    // Refused, it never left: the file keeps no record of it.
+                    let hash = client.submit(&tx)?;
+                    w.save()?;
+                    out!("Submitted transaction {hash}");
+                }
+                WalletCmd::Cancel { tx } => {
+                    let mut w = Wallet::open(&path, &password()?)?;
+                    let tx = tx.trim().to_ascii_lowercase();
+                    let matches: Vec<String> = w
+                        .payments()
+                        .iter()
+                        .map(|p| p.tx_hash.clone())
+                        .chain(w.coins().iter().filter_map(|c| c.pending_tx.clone()))
+                        .filter(|h| !tx.is_empty() && h.starts_with(&tx))
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    let hash = match matches.as_slice() {
+                        [one] => one.clone(),
+                        [] => bail!("no payment of this wallet has a hash starting {tx}"),
+                        _ => bail!(
+                            "{} payments have hashes starting {tx}: give more of it",
+                            matches.len()
+                        ),
+                    };
+                    if !w.cancel_pending(&hash) {
+                        bail!("payment {hash} is not waiting for a block (it confirmed, failed or was released already)");
                     }
+                    w.save()?;
+                    out!("Released the coins of payment {hash}. If it confirms after all, syncing records it.");
+                }
+                WalletCmd::Rescan { from } => {
+                    let mut w = Wallet::open(&path, &password()?)?;
+                    if w.rescan(&client, from)? {
+                        out!("This wallet was on another chain: it forgot that chain's coins and payments.");
+                    }
+                    let r = w.sync(&client)?;
+                    report_sync(&w, &r, true);
                 }
             }
             Ok(())

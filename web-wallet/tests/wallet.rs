@@ -386,6 +386,36 @@ fn wallet_files_move_between_cli_and_browser() {
         .history(chain.tip())
         .iter()
         .any(|e| e.kind == "sent" && e.detailed));
+
+    // The CLI keeps the browser's payments when it saves the file, and the
+    // browser sees the CLI's.
+    assert_eq!(back.payments().len(), 1);
+    let mut back = back;
+    let to = WalletKeys::random().address();
+    let tx = back.build_send(&to, 1_500, None, chain.tip()).unwrap();
+    back.save().unwrap();
+    let file = std::fs::read(&back_path).unwrap();
+    let key = wallet::derive_file_key("hunter2", &wallet::file_salt(&file).unwrap()).unwrap();
+    let mut web = WalletCore::open(&file, &key).unwrap();
+    let sent: Vec<_> = web
+        .history(chain.tip())
+        .into_iter()
+        .filter(|e| e.kind == "sent")
+        .collect();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(sent.iter().all(|e| e.detailed));
+    assert_eq!(
+        web.pending_txs().len(),
+        1,
+        "the CLI's payment waits for a block"
+    );
+    chain.mine(&WalletKeys::random().address(), &[tx]);
+    chain.sync(&mut web);
+    assert!(web
+        .history(chain.tip())
+        .iter()
+        .filter(|e| e.kind == "sent")
+        .all(|e| e.status == "confirmed"));
 }
 
 /// The chain's unspent outputs as `get_utxos` lists them.

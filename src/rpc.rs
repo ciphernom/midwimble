@@ -22,6 +22,7 @@
 //! | GET | `/headers/{start}/{count}` | hex-encoded headers |
 //! | GET | `/utxo/{commitment}` | whether an output is unspent |
 //! | GET | `/mempool` | pool size and transaction hashes |
+//! | POST | `/mempool/txs` | `{"hashes": [hex]}` → those transactions, hex-encoded |
 //! | POST | `/tx` | `{"tx_hex": ...}` submit via Dandelion++ |
 //! | POST | `/mining` | `{"address": "mw1..." \| null}` |
 //! | POST | `/peers` | `{"addr": multiaddr}` dial |
@@ -79,6 +80,7 @@ pub fn router_with(node: NodeHandle, options: &RpcOptions, index: SharedIndex) -
         .route("/utxo/{commitment}", get(utxo))
         .route("/utxos", get(unspent_outputs))
         .route("/mempool", get(mempool))
+        .route("/mempool/txs", post(mempool_txs))
         .route("/tx", post(submit_tx))
         .route("/mining", post(mining))
         .route("/peers", post(dial))
@@ -448,6 +450,45 @@ async fn mempool(AxState(node): AxState<NodeHandle>) -> ApiResult {
     let txs = node.mempool().await.map_err(bad)?;
     let hashes: Vec<String> = txs.iter().map(|t| hex::encode(t.hash())).collect();
     Ok(Json(json!({ "count": txs.len(), "transactions": hashes })))
+}
+
+/// Most transactions one `/mempool/txs` request may ask for.
+pub const MAX_RPC_MEMPOOL_TXS: usize = 256;
+
+#[derive(Deserialize)]
+struct MempoolTxsBody {
+    hashes: Vec<String>,
+}
+
+/// Transactions waiting in the mempool, by hash (`/mempool` lists them), as
+/// hex-encoded bincode: a wallet scans their outputs to see payments to it
+/// before a block confirms them. Any that left the pool are left out.
+async fn mempool_txs(
+    AxState(node): AxState<NodeHandle>,
+    Json(body): Json<MempoolTxsBody>,
+) -> ApiResult {
+    if body.hashes.len() > MAX_RPC_MEMPOOL_TXS {
+        return Err(bad(format!(
+            "at most {MAX_RPC_MEMPOOL_TXS} transactions per request"
+        )));
+    }
+    let hashes = body
+        .hashes
+        .iter()
+        .map(|h| hex32_of(h))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let txs = node.mempool_txs(hashes).await.map_err(bad)?;
+    let transactions: Vec<Value> = txs
+        .iter()
+        .map(|tx| {
+            Ok(json!({
+                "hash": hex::encode(tx.hash()),
+                "tx_hex": hex::encode(bincode::serialize(tx)?),
+            }))
+        })
+        .collect::<Result<_>>()
+        .map_err(bad)?;
+    Ok(Json(json!({ "transactions": transactions })))
 }
 
 #[derive(Deserialize)]
@@ -927,6 +968,50 @@ impl RpcClient {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok((outputs, v["next"].as_str().map(str::to_string)))
+    }
+
+    /// The ids of blocks `start..start + count` the node has (fewer past its
+    /// tip): what the next block links to (`prev_header_hash`).
+    pub fn block_ids(&self, start: u64, count: u64) -> Result<Vec<(u64, [u8; 32])>> {
+        let v = self.get(&format!("/headers/{start}/{count}"))?;
+        let bytes = hex::decode(
+            v["headers_hex"]
+                .as_str()
+                .ok_or_else(|| anyhow!("bad /headers response"))?,
+        )?;
+        let headers: Vec<crate::core::BatchHeader> = bincode::deserialize(&bytes)?;
+        Ok(headers
+            .iter()
+            .map(|h| (h.height, h.extension.final_hash))
+            .collect())
+    }
+
+    /// The hashes of the transactions waiting in the node's mempool.
+    pub fn mempool_hashes(&self) -> Result<Vec<String>> {
+        let v = self.get("/mempool")?;
+        Ok(v["transactions"]
+            .as_array()
+            .ok_or_else(|| anyhow!("bad /mempool response"))?
+            .iter()
+            .filter_map(|h| h.as_str().map(str::to_string))
+            .collect())
+    }
+
+    /// The mempool's transactions with these hashes, those still there. A
+    /// node from before `/mempool/txs` fails this with a 404.
+    pub fn mempool_txs(&self, hashes: &[String]) -> Result<Vec<Transaction>> {
+        let mut txs = Vec::new();
+        for chunk in hashes.chunks(MAX_RPC_MEMPOOL_TXS) {
+            let v = self.post("/mempool/txs", &json!({ "hashes": chunk }))?;
+            for t in v["transactions"]
+                .as_array()
+                .ok_or_else(|| anyhow!("bad /mempool/txs response"))?
+            {
+                let bytes = hex::decode(t["tx_hex"].as_str().unwrap_or_default())?;
+                txs.push(bincode::deserialize(&bytes)?);
+            }
+        }
+        Ok(txs)
     }
 
     pub fn blocks(&self, start: u64, count: u64) -> Result<Vec<crate::core::Batch>> {

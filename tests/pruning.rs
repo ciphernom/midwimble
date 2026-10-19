@@ -282,7 +282,7 @@ async fn wallets_restore_from_a_pruned_node() {
     let (found, balance, spendable) = tokio::task::spawn_blocking(move || {
         let client = RpcClient::new(rpc);
         let mut w = midwimble::wallet::Wallet::open(&path2, "pw").unwrap();
-        let found = w.sync_from_node(&client).unwrap();
+        let found = w.sync(&client).unwrap().restored;
         let tip = client.height().unwrap();
         let b = w.balance(tip);
         (found, b.spendable + b.immature, b.spendable)

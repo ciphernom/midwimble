@@ -8,9 +8,9 @@
 //! (Argon2id, XChaCha20-Poly1305, the same JSON), so a wallet moves between
 //! the browser and `midwimble wallet` as a file.
 //!
-//! The JSON has two fields the CLI does not know, `birth_height` and `sent`
-//! (this wallet's own payments, for its history). The CLI ignores them when
-//! it opens a file and drops them when it saves one.
+//! Both wallets keep `birth_height` and `sent` (its own payments, for its
+//! history and for broadcasting them again). The CLI also records block 0
+//! (`genesis`); this wallet drops that and checks its configured network.
 
 use anyhow::{anyhow, bail, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -93,10 +93,10 @@ struct WalletData {
     /// (height, block hash) of recently scanned blocks, for reorg detection.
     recent: Vec<(u64, [u8; 32])>,
     coins: Vec<WalletCoin>,
-    /// Where a rescan starts. Web wallet only.
+    /// Where a rescan starts.
     #[serde(default)]
     birth_height: u64,
-    /// Web wallet only.
+    /// This wallet's own payments.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     sent: Vec<Sent>,
 }

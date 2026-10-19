@@ -266,8 +266,11 @@ midwimble wallet --wallet w.mww create            # prints a v1 address + 24 wor
 midwimble wallet --wallet w.mww phrase            # prints the 24 words again
 midwimble node --data-dir ./node --mine-to <address> [--backend gpu] [--prune]
 midwimble node --data-dir ./node --checkpoint <checkpoint id>   # checkpoint verification
-midwimble wallet --wallet w.mww balance
+midwimble wallet --wallet w.mww balance           # incoming: payments to it still waiting for a block
+midwimble wallet --wallet w.mww sync              # what changed: payments received and confirmed, reorgs
 midwimble wallet --wallet w.mww send --to <address> --amount 0.25   # amounts in coins
+midwimble wallet --wallet w.mww cancel --tx <hash>                  # release a payment that will never confirm
+midwimble wallet --wallet w.mww rescan [--from <height>]            # scan again; starts over on a relaunched network
 midwimble bond new --file bond.json              # mining requires a bond: docs/BONDED_POW.md
 midwimble node --mining-bond bond.json --mine-to <address>
 python3 scripts/rehearse.py --midstate-rpc 127.0.0.1:8545   # full rehearsal: docs/REHEARSAL.md
@@ -301,6 +304,7 @@ format. See `web-wallet/README.md` and `docs/TESTNET.md`.
 - `GET /headers/{start}/{count}`
 - `GET /utxo/{commitment}`
 - `GET /mempool`
+- `POST /mempool/txs` (those transactions, for wallets to see payments before a block confirms them)
 - `POST /tx`
 - `POST /mining`
 - `POST /mining/template` (weighted payouts, `extra`, receipts)
@@ -383,8 +387,9 @@ verify. The vendored copy keys the file by a seed fingerprint.
 - **Pool:** a coinbase pays at most 31 miners, so miners with less than 1/31
   of a block are paid by sampling: exactly their share on average, but in
   fewer, larger payouts. The WebRTC browser pool from midstate is not ported.
-- **Wallet:** no outgoing history, and the password prompt echoes (use
-  `MIDWIMBLE_PASSWORD`).
+- **Wallet:** the CLI records its payments (and keeps the browser wallet's)
+  but has no history command (the browser wallet shows them), and the
+  password prompt echoes (use `MIDWIMBLE_PASSWORD`).
 
 ## Licence
 

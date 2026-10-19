@@ -215,6 +215,9 @@ pub enum Command {
     /// A solved block from a miner (template RPC, pool or merged miner).
     SubmitBlock(Batch, oneshot::Sender<Result<()>>),
     Mempool(oneshot::Sender<Vec<Transaction>>),
+    /// The pool's transactions with these hashes (any that left it are
+    /// left out).
+    MempoolTxs(Vec<[u8; 32]>, oneshot::Sender<Vec<Transaction>>),
     SetMining(Option<StealthAddress>),
     Dial(Multiaddr),
     SubmitAnchor(AnchorRecord, oneshot::Sender<Result<()>>),
@@ -279,6 +282,17 @@ impl NodeHandle {
         let (tx, rx) = oneshot::channel();
         self.commands
             .send(Command::Mempool(tx))
+            .map_err(|_| anyhow!("node stopped"))?;
+        rx.await.map_err(|_| anyhow!("node stopped"))
+    }
+
+    /// The mempool's transactions with these hashes, for wallets looking
+    /// for payments before a block confirms them. Any that left the pool
+    /// (mined or dropped) are left out.
+    pub async fn mempool_txs(&self, hashes: Vec<[u8; 32]>) -> Result<Vec<Transaction>> {
+        let (tx, rx) = oneshot::channel();
+        self.commands
+            .send(Command::MempoolTxs(hashes, tx))
             .map_err(|_| anyhow!("node stopped"))?;
         rx.await.map_err(|_| anyhow!("node stopped"))
     }
@@ -919,6 +933,13 @@ impl Node {
             Command::SubmitBlock(batch, reply) => self.submit_block(batch, reply),
             Command::Mempool(reply) => {
                 let _ = reply.send(self.mempool.transactions());
+            }
+            Command::MempoolTxs(hashes, reply) => {
+                let txs = hashes
+                    .iter()
+                    .filter_map(|h| self.mempool.get(h).cloned())
+                    .collect();
+                let _ = reply.send(txs);
             }
             Command::SetMining(to) => {
                 self.config.mine_to = to;
