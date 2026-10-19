@@ -21,6 +21,13 @@ server of its own, no HTTPS gateway, no certificate authority.
   reorganisations, reads the unspent-output set instead (`get_utxos`) when a
   node has pruned the blocks it would need, and rebroadcasts payments still
   waiting for a block.
+- **Shows payments to it before they confirm.** Every five seconds it asks the
+  node which transactions wait in its mempool (`get_mempool`), downloads the
+  new ones (`get_mempool_txs`) and scans their outputs with the view key, as
+  it scans blocks. A payment found there shows as pending ("incoming") and is
+  not spendable until a block confirms it; one that leaves the mempool
+  unconfirmed disappears again. Its own payments, change included, are not
+  income.
 - Keys never leave the page's wallet worker. The node learns which coins are
   the wallet's only from the payments sent through it.
 
@@ -85,6 +92,17 @@ cargo test        # real fast-mining chains, and wallet files to and from the CL
   1,024 one-time keys, about a billion hashes. Helper workers share it; it
   takes a minute or two on a laptop, once.
 - One tab at a time: a second tab offers to take the wallet over.
+- Reorganisations: the wallet keeps the hashes of the last 200 blocks it
+  scanned, and checks each new block against the one before it. When the
+  node's chain no longer holds what it scanned, it steps back ten blocks at a
+  time until the hashes match, then scans the new chain. Coins from the lost
+  blocks go, and coins they spent come back; a payment of its own that a
+  lost block confirmed waits for a block again, with its coins still
+  reserved, and is broadcast again until a block takes it (the node puts it
+  back in its mempool and relays it, too). A reorganisation deeper than 200
+  blocks (nodes accept up to 1,000, never below a finalized checkpoint) makes
+  it rescan from its birth height. While its node is syncing or behind it,
+  it waits rather than roll back.
 - Scanning asks for the camera only when "scan" is pressed, and turns it off
   as soon as a code is read, the scanner closes, or the tab is hidden. Where
   there is no camera, or it is refused, "Choose a photo" reads a photo or a

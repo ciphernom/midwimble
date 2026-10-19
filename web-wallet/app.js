@@ -352,12 +352,13 @@ function historyRows(entries, withActions) {
         let detail;
         if (e.kind === 'sent' && e.to) detail = h('span', { title: e.to }, 'to ', short(e.to, 12));
         else if (e.kind === 'sent') detail = h('span', { class: 'dim' }, 'made elsewhere or before a restore (fee included)');
+        else if (e.status === 'pending') detail = h('span', { class: 'dim', title: e.tx_hash || '' }, 'waiting for a block');
         else if (e.commitment) detail = h('span', { class: 'dim', title: e.commitment }, 'coin ', short(e.commitment, 8));
         else detail = h('span', { class: 'dim' }, 'net of change');
         const block = e.height != null ? num(e.height) : h('span', { class: 'dim' }, e.created_at ? ago(e.created_at) : '—');
         const row = [block, kindTag, value, e.fee != null ? coins(e.fee) : h('span', { class: 'dim' }, '—'), status, detail];
         if (withActions) {
-            row.push(e.status === 'pending' && e.tx_hash
+            row.push(e.kind === 'sent' && e.status === 'pending' && e.tx_hash
                 ? h('button', { class: 'btn small', type: 'button', onclick: () => release(e.tx_hash) }, 'release')
                 : '');
         }
@@ -633,6 +634,7 @@ function balanceSection() {
         const s = app.state;
         if (!s) return;
         const b = s.balance;
+        const incoming = b.incoming || 0;
         const span = Math.max(1, s.tip - s.birth);
         const done = s.tip ? Math.min(1, Math.max(0, (s.scanned - s.birth) / span)) : 0;
         const mature = app.constants ? app.constants.coinbase_maturity : 100;
@@ -644,8 +646,9 @@ function balanceSection() {
             h('div', { class: 'balance' },
                 h('div', { class: 'cell' }, h('div', { class: 'k' }, 'spendable'), h('div', { class: 'big' }, amount(b.spendable)), meter(done)),
                 cell('immature', amount(b.immature), false),
-                cell('pending', amount(b.pending), false)),
-            h('div', { class: 'note top' }, `Mined coins mature ${mature} blocks after their block; pending coins are in payments waiting for a block.`),
+                h('div', { class: 'cell' }, h('div', { class: 'k' }, 'pending'), h('div', { class: 'v' }, amount(b.pending + incoming)),
+                    incoming ? h('div', { class: 'incoming' }, '+', coins(incoming), ' incoming') : null)),
+            h('div', { class: 'note top' }, `Mined coins mature ${mature} blocks after their block. Pending is payments to or from this wallet that are waiting for a block; coins paid to it are spendable once one confirms them.`),
             ...notes);
     };
     return { el: box, update: draw };

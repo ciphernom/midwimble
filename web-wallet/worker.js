@@ -14,6 +14,11 @@ const BLOCKS_PER_REQUEST = 100;
 const UTXO_PAGE = 500;
 /** Seconds before a payment still waiting for a block is broadcast again. */
 const REBROADCAST_SECS = 120;
+/** Seconds between looks at the node's mempool for payments to this wallet
+ *  (a list of hashes; only new transactions are downloaded). */
+const MEMPOOL_SECS = 5;
+/** Transactions asked for per get_mempool_txs (the node's limit). */
+const MEMPOOL_TXS_PER_REQUEST = 64;
 const SAVE_EVERY_MS = 8_000;
 
 let wasmModule = null;
@@ -35,6 +40,10 @@ let syncError = null;
 let dirty = false;
 let lastSave = 0;
 const lastBroadcast = new Map();
+/** Mempool transactions already scanned (by hash), on this node. */
+const mempool = { supported: true, scanned: new Set(), running: false };
+/** Set when a rollback changed what the wallet shows: 'changed' or 'deep'. */
+let reorged = null;
 
 const post = (msg, transfer) => self.postMessage(msg, transfer || []);
 const toast = (text, kind = 'info') => post({ type: 'toast', text, kind });
@@ -226,8 +235,15 @@ function postState(force) {
     if (!wallet) return;
     const now = Date.now();
     if (!force && now - lastPost < 350) return;
+    let state;
+    try {
+        state = snapshot();
+    } catch (e) {
+        console.error('wallet state', e); // the next post carries it
+        return;
+    }
     lastPost = now;
-    post({ type: 'state', state: snapshot() });
+    post({ type: 'state', state });
 }
 
 // ── following the chain ─────────────────────────────────────────────────────
@@ -246,6 +262,7 @@ function requestSync() {
 
 async function refreshState() {
     const st = await rpc('get_state');
+    if (!Number.isSafeInteger(st.height) || st.height < 0) throw new Error('The node answered get_state without a height.');
     chain.tip = st.height;
     chain.timestamp = st.timestamp || chain.timestamp;
     chain.prunedBelow = st.pruned_below || 0;
@@ -261,6 +278,22 @@ async function checkNetwork() {
     if (!chain.networkOk) {
         syncError = `This node is on another network (genesis ${String(ids[0]).slice(0, 12)}…, expected ${genesis.slice(0, 12)}…). Pick another node in settings.`;
     }
+}
+
+/** A block this wallet scanned is no longer the node's: forget the last ten
+ *  blocks, and the caller looks again from there. Past the oldest block hash
+ *  it keeps (200 blocks), it cannot tell where the chains part, so it
+ *  rescans from its birth height instead. */
+function rollBack() {
+    const birth = wallet.birth_height();
+    let to = Math.max(birth, wallet.scanned_height() - 1 - 10);
+    let deep = false;
+    if (to > birth && !wallet.recorded_hash(to - 1)) {
+        to = birth;
+        deep = true;
+    }
+    if (wallet.rollback_to(to) || deep) reorged = deep ? 'deep' : (reorged || 'changed');
+    changed();
 }
 
 /** Rolls back while the last block scanned is no longer the node's. */
@@ -279,8 +312,7 @@ async function checkLastBlock() {
             throw e;
         }
         if (id === recorded) return;
-        wallet.rollback_to(Math.max(0, h - 1 - 10));
-        changed();
+        rollBack();
     }
 }
 
@@ -337,8 +369,7 @@ async function scanBlocks() {
             }
         }
         if (r.reorg) {
-            wallet.rollback_to(Math.max(0, wallet.scanned_height() - 10));
-            changed();
+            rollBack();
             continue;
         }
         changed();
@@ -384,12 +415,61 @@ async function runSync() {
         if (wallet.scanned_height() < chain.prunedBelow) await scanUnspent();
         await scanBlocks();
         await rebroadcast();
+        await scanMempool();
     } catch (e) {
         syncError = errText(e);
     } finally {
         scan.active = false;
+        if (reorged) {
+            toast(reorged === 'deep'
+                ? `The chain reorganised further back than this wallet keeps track of; it rescanned from block ${wallet ? wallet.birth_height() : 0}.`
+                : 'The chain reorganised; this wallet now follows the new chain, and payments its old blocks held are waiting for a block again.');
+            reorged = null;
+        }
         postState(true);
     }
+}
+
+/** Looks in the node's mempool for payments to this wallet, so that they
+ *  show (as pending, not spendable) before a block confirms them. Only new
+ *  transactions are downloaded; the wallet scans their outputs with its
+ *  view key, as it scans blocks, so the node learns nothing from it. */
+async function scanMempool() {
+    if (!wallet || !chain.connected || !mempool.supported || mempool.running) return;
+    if (chain.networkOk !== true || chain.nodeSyncing || chain.behind) return;
+    if (wallet.scanned_height() < chain.tip) return; // catch up first: unscanned coins would look like income
+    mempool.running = true;
+    try {
+        const d = await rpc('get_mempool');
+        if (!Array.isArray(d.hashes)) {
+            if (typeof d.count === 'number') mempool.supported = false; // a node from before this
+            return;
+        }
+        const live = new Set(d.hashes);
+        for (const h of mempool.scanned) if (!live.has(h)) mempool.scanned.delete(h);
+        const wanted = d.hashes.filter(h => !mempool.scanned.has(h)).slice(0, MEMPOOL_TXS_PER_REQUEST);
+        let txsHex = '';
+        if (wanted.length) {
+            const r = await rpc('get_mempool_txs', { hashes: wanted });
+            txsHex = r.txs_hex || '';
+            for (const h of (Array.isArray(r.hashes) ? r.hashes : wanted)) mempool.scanned.add(h);
+        }
+        if (!wallet) return;
+        const incoming = () => JSON.parse(wallet.balance(chain.tip)).incoming;
+        const before = incoming();
+        const fresh = JSON.parse(wallet.scan_mempool(txsHex, JSON.stringify(d.hashes), Math.floor(Date.now() / 1000)));
+        for (const p of fresh) toast(`Incoming ${mw.format_amount(p.value)}; waiting for a block.`, 'ok');
+        postState(incoming() !== before);
+    } catch (e) {
+        if (e.unanswered) mempool.supported = false;
+    } finally {
+        mempool.running = false;
+    }
+}
+
+function forgetMempool() {
+    mempool.supported = true;
+    mempool.scanned.clear();
 }
 
 /** Waits (a while) for the wallet to have scanned up to `height`. */
@@ -405,6 +485,8 @@ async function scannedTo(height, ms) {
 
 // Poll in case a push notification is lost.
 setInterval(() => { if (wallet && chain.connected) requestSync(); }, 30_000);
+// New payments arrive without a block; nothing announces them.
+setInterval(() => { if (wallet && chain.connected) scanMempool(); }, MEMPOOL_SECS * 1000);
 
 // ── unlocking ───────────────────────────────────────────────────────────────
 
@@ -425,6 +507,7 @@ async function becomeUnlocked(w, key, salt) {
     fileKey = key;
     fileSalt = salt;
     syncError = null;
+    forgetMempool(); // a new wallet object knows no incoming payments yet
     await save();
     post({ type: 'unlocked' });
     postState(true);
@@ -466,6 +549,7 @@ const handlers = {
         if (chain.connected && !was) {
             chain.networkOk = null;
             supportsGetBlocks = true;
+            forgetMempool();
             requestSync();
         }
         if (!chain.connected) {

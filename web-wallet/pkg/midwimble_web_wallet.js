@@ -36,8 +36,8 @@ export class Wallet {
         }
     }
     /**
-     * JSON {spendable, immature, pending}; `tip_height` is the height of
-     * the next block.
+     * JSON {spendable, immature, pending, incoming}; `tip_height` is the
+     * height of the next block.
      * @param {number} tip_height
      * @returns {string}
      */
@@ -394,7 +394,10 @@ export class Wallet {
         }
     }
     /**
+     * Forgets blocks from `height` on (a reorganisation). Returns whether
+     * anything the wallet shows changed.
      * @param {number} height
+     * @returns {boolean}
      */
     rollback_to(height) {
         try {
@@ -402,9 +405,11 @@ export class Wallet {
             wasm.wallet_rollback_to(retptr, this.__wbg_ptr, height);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
             var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
-            if (r1) {
-                throw takeObject(r0);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
             }
+            return r0 !== 0;
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
         }
@@ -476,6 +481,45 @@ export class Wallet {
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
             wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
+     * Scans mempool transactions (one hex bincode `Vec<Transaction>`, as
+     * `get_mempool_txs` sends them; empty for none) for payments to this
+     * wallet. `live_json` lists every hash `get_mempool` returned: payments
+     * no longer among them are forgotten. Returns JSON [{tx_hash, value}]
+     * of the payments seen for the first time.
+     * @param {string} txs_hex
+     * @param {string} live_json
+     * @param {number} now
+     * @returns {string}
+     */
+    scan_mempool(txs_hex, live_json, now) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(txs_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(live_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.wallet_scan_mempool(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, now);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr3 = r0;
+            var len3 = r1;
+            if (r3) {
+                ptr3 = 0; len3 = 0;
+                throw takeObject(r2);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
         }
     }
     /**

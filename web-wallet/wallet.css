@@ -70,6 +70,7 @@ h2 .aside { color: var(--muted); letter-spacing: .06em; text-transform: none; fo
 .k { color: var(--muted); font: 600 11px var(--mono); letter-spacing: .14em; text-transform: uppercase; }
 .cell .v { font-size: 18px; margin-top: 2px; word-break: break-all; letter-spacing: -.02em; }
 .cell .v.small { font-size: 13px; letter-spacing: 0; }
+.cell .incoming { color: var(--green); font-size: 12px; margin-top: 2px; }
 .big { font: 600 34px/1.15 var(--sans); letter-spacing: -.02em; margin-top: 4px; font-variant-numeric: tabular-nums; }
 .big small { font: 500 14px var(--mono); color: var(--muted); letter-spacing: 0; }
 .meter { height: 4px; background: rgba(167, 139, 250, .12); border-radius: 999px; overflow: hidden; margin-top: 8px; }

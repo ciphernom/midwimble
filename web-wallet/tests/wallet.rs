@@ -5,13 +5,15 @@ use midwimble::core::state::apply_batch;
 use midwimble::core::template::build_template;
 use midwimble::core::types::{block_reward, COINBASE_MATURITY};
 use midwimble::core::{Batch, State};
-use midwimble_web_wallet::wallet::{self, WalletCore, REORG};
+use midwimble_web_wallet::wallet::{self, BuiltSend, IncomingView, WalletCore, REORG};
+use std::collections::HashSet;
 
 const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
     abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
     abandon abandon abandon abandon abandon art";
 
 /// A chain built block by block, as a node would hold it.
+#[derive(Clone)]
 struct Chain {
     state: State,
     ts: Vec<u64>,
@@ -61,6 +63,18 @@ impl Chain {
                 .unwrap();
         }
     }
+}
+
+const OTHER: &str = "legal winner thank year wave sausage worth useful legal winner thank year \
+    wave sausage worth useful legal winner thank year wave sausage worth title";
+
+fn tx_of(sent: &BuiltSend) -> Transaction {
+    bincode::deserialize(&hex::decode(&sent.tx_hex).unwrap()).unwrap()
+}
+
+/// What `get_mempool` lists for a mempool holding `txs`.
+fn live(txs: &[&Transaction]) -> HashSet<String> {
+    txs.iter().map(|t| hex::encode(t.hash())).collect()
 }
 
 fn web_wallet(phrase: &str, height: u32, birth: u64) -> WalletCore {
@@ -460,4 +474,215 @@ fn the_default_address_is_the_clis() {
     let key = wallet::recovery_root(&wallet::recovery_leaves(&master, 0, 1 << height)).unwrap();
     let w = WalletCore::new(PHRASE, key, height, 0).unwrap();
     assert_eq!(w.address().encode(), CLI_ADDRESS);
+}
+
+#[test]
+fn payments_waiting_in_the_mempool_show_as_incoming() {
+    let mut chain = Chain::new();
+    let mut me = web_wallet(PHRASE, 1, 0);
+    let mut alice = web_wallet(OTHER, 1, 0);
+    chain.mine(&alice.address(), &[]);
+    chain.mine_to_stranger(COINBASE_MATURITY as usize);
+    chain.sync(&mut me);
+    chain.sync(&mut alice);
+
+    // Alice pays me; her transaction waits in the mempool.
+    let paid = alice
+        .build_send(&me.address().encode(), 5_000, None, chain.tip(), 0)
+        .unwrap();
+    let tx = tx_of(&paid);
+    let pool = live(&[&tx]);
+    let seen = me.scan_mempool(&[tx.clone()], &pool, 100);
+    assert_eq!(
+        seen,
+        vec![IncomingView {
+            tx_hash: paid.tx_hash.clone(),
+            value: 5_000
+        }]
+    );
+    let b = me.balance(chain.tip());
+    assert_eq!(
+        (b.spendable, b.incoming),
+        (0, 5_000),
+        "incoming is not spendable"
+    );
+    let first = &me.history(chain.tip())[0];
+    assert_eq!(
+        (first.kind, first.status, first.height, first.value),
+        ("received", "pending", None, 5_000)
+    );
+    assert_eq!(first.created_at, Some(100));
+    // Each payment is reported once.
+    assert!(me.scan_mempool(&[tx.clone()], &pool, 110).is_empty());
+    assert_eq!(me.balance(chain.tip()).incoming, 5_000);
+    // Alice's own payment, change and all, is not income to her; a stranger
+    // sees nothing at all.
+    assert!(alice.scan_mempool(&[tx.clone()], &pool, 100).is_empty());
+    assert_eq!(alice.balance(chain.tip()).incoming, 0);
+    let mut stranger = web_wallet(&wallet::generate_mnemonic(), 1, 0);
+    assert!(stranger.scan_mempool(&[tx.clone()], &pool, 100).is_empty());
+
+    // A block confirms it: the coin replaces the incoming payment.
+    chain.mine(&WalletKeys::random().address(), &[tx.clone()]);
+    chain.sync(&mut me);
+    let b = me.balance(chain.tip());
+    assert_eq!((b.spendable, b.incoming), (5_000, 0));
+    let history = me.history(chain.tip());
+    assert_eq!(history.len(), 1, "{history:?}");
+    assert_eq!(history[0].status, "confirmed");
+
+    // A payment that leaves the mempool unconfirmed is forgotten.
+    chain.sync(&mut alice);
+    let again = alice
+        .build_send(&me.address().encode(), 3_000, None, chain.tip(), 0)
+        .unwrap();
+    let dropped = tx_of(&again);
+    assert_eq!(
+        me.scan_mempool(&[dropped.clone()], &live(&[&dropped]), 200)
+            .len(),
+        1
+    );
+    assert!(me.scan_mempool(&[], &HashSet::new(), 210).is_empty());
+    assert_eq!(me.balance(chain.tip()).incoming, 0);
+    assert!(me
+        .history(chain.tip())
+        .iter()
+        .all(|e| e.status != "pending"));
+
+    // Another copy of my wallet paying someone: its change is not income.
+    let mut copy = web_wallet(PHRASE, 1, 0);
+    chain.sync(&mut copy);
+    let out = copy
+        .build_send(
+            &WalletKeys::random().address().encode(),
+            200,
+            None,
+            chain.tip(),
+            0,
+        )
+        .unwrap();
+    let out = tx_of(&out);
+    assert!(me
+        .scan_mempool(&[out.clone()], &live(&[&out]), 300)
+        .is_empty());
+}
+
+#[test]
+fn a_reorg_puts_a_payment_back_in_waiting() {
+    let mut chain = Chain::new();
+    let mut w = web_wallet(PHRASE, 1, 0);
+    let me = w.address();
+    chain.mine(&me, &[]);
+    chain.mine_to_stranger(COINBASE_MATURITY as usize);
+    chain.sync(&mut w);
+    let funds = w.balance(chain.tip()).spendable;
+
+    // The payment confirms on one branch...
+    let fork = chain.clone();
+    let paid = w
+        .build_send(
+            &WalletKeys::random().address().encode(),
+            1_000,
+            None,
+            chain.tip(),
+            0,
+        )
+        .unwrap();
+    let height = chain.tip();
+    chain.mine(&WalletKeys::random().address(), &[tx_of(&paid)]);
+    chain.sync(&mut w);
+    assert!(w.pending_txs().is_empty());
+    let b = w.balance(chain.tip());
+    assert_eq!((b.spendable, b.pending), (funds - 1_000 - paid.fee, 0));
+
+    // ...and a longer branch without it wins.
+    let mut other = fork;
+    other.mine_to_stranger(2);
+    let err = w
+        .scan_block(height + 1, &other.blocks[height as usize + 1])
+        .unwrap_err()
+        .to_string();
+    assert!(err.starts_with(REORG), "{err}");
+    assert!(
+        w.rollback_to(height),
+        "the rollback changes what the wallet shows"
+    );
+    other.sync(&mut w);
+
+    // The payment waits again: its coin stays reserved, not spendable, and
+    // it is up for broadcasting again.
+    let b = w.balance(other.tip());
+    assert_eq!((b.spendable, b.pending), (0, funds));
+    let pending = w.pending_txs();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].tx_hash, paid.tx_hash);
+    let e = w
+        .history(other.tip())
+        .into_iter()
+        .find(|e| e.tx_hash.as_deref() == Some(&paid.tx_hash))
+        .unwrap();
+    assert_eq!(e.status, "pending");
+    assert!(w.quote(1, other.tip()).is_err(), "nothing else to spend");
+
+    // Mined again on the winning branch, it confirms again.
+    let tx: Transaction = bincode::deserialize(&hex::decode(&pending[0].tx_hex).unwrap()).unwrap();
+    other.mine(&WalletKeys::random().address(), &[tx]);
+    other.sync(&mut w);
+    let b = w.balance(other.tip());
+    assert_eq!((b.spendable, b.pending), (funds - 1_000 - paid.fee, 0));
+    assert!(w.pending_txs().is_empty());
+
+    // A rollback that undoes nothing of this wallet's says so.
+    let mut quiet = web_wallet(&wallet::generate_mnemonic(), 1, 0);
+    other.sync(&mut quiet);
+    assert!(!quiet.rollback_to(other.tip() - 1));
+}
+
+#[test]
+fn coins_found_again_after_a_deep_rollback_stay_reserved() {
+    let mut chain = Chain::new();
+    let mut w = web_wallet(PHRASE, 1, 0);
+    let me = w.address();
+    chain.mine(&me, &[]);
+    chain.mine_to_stranger(COINBASE_MATURITY as usize);
+    chain.sync(&mut w);
+    let funds = w.balance(chain.tip()).spendable;
+    let fork = chain.clone();
+    let paid = w
+        .build_send(
+            &WalletKeys::random().address().encode(),
+            1_000,
+            None,
+            chain.tip(),
+            0,
+        )
+        .unwrap();
+    let height = chain.tip();
+    chain.mine(&WalletKeys::random().address(), &[tx_of(&paid)]);
+    chain.sync(&mut w);
+
+    // The worker steps back past the block that made the coin it spent.
+    let mut other = fork;
+    other.mine_to_stranger(2);
+    assert!(w
+        .scan_block(height + 1, &other.blocks[height as usize + 1])
+        .is_err());
+    assert!(w.rollback_to(1));
+    assert_eq!(
+        w.balance(other.tip()),
+        wallet::Balance::default(),
+        "the coin is forgotten"
+    );
+    let mut received = Vec::new();
+    while w.scanned_height() < other.blocks.len() as u64 {
+        let h = w.scanned_height();
+        received.extend(w.scan_block(h, &other.blocks[h as usize]).unwrap().received);
+    }
+    // Found again, it is not news, and it is reserved for the payment that
+    // spends it, which waits for a block again.
+    assert!(received.is_empty(), "{received:?}");
+    let b = w.balance(other.tip());
+    assert_eq!((b.spendable, b.immature, b.pending), (0, 0, funds));
+    assert_eq!(w.pending_txs().len(), 1);
+    assert!(w.quote(1, other.tip()).is_err());
 }

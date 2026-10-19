@@ -113,7 +113,11 @@ impl Drop for WalletData {
 pub struct Balance {
     pub spendable: u64,
     pub immature: u64,
+    /// This wallet's coins in its own payments still waiting for a block.
     pub pending: u64,
+    /// Payments to this wallet still waiting for a block (not spendable
+    /// until one confirms them).
+    pub incoming: u64,
 }
 
 /// What one block changed.
@@ -301,6 +305,14 @@ pub fn blocks_from_hex(hex_str: &str) -> Result<Vec<Batch>> {
     bincode::deserialize(&bytes).map_err(|e| anyhow!("not a list of blocks: {e}"))
 }
 
+/// Mempool transactions as `get_mempool_txs` sends them: one bincode
+/// `Vec<Transaction>`.
+pub fn txs_from_hex(hex_str: &str) -> Result<Vec<Transaction>> {
+    let bytes =
+        hex::decode(hex_str.trim()).map_err(|e| anyhow!("transactions are not hex: {e}"))?;
+    bincode::deserialize(&bytes).map_err(|e| anyhow!("not a list of transactions: {e}"))
+}
+
 /// The outputs of `get_utxos` pages: JSON `[{output_hex, height, coinbase}]`.
 pub fn unspent_from_json(json: &str) -> Result<Vec<(Output, u64, bool)>> {
     #[derive(Deserialize)]
@@ -338,6 +350,30 @@ pub struct WalletCore {
     data: WalletData,
     keys: WalletKeys,
     view: ViewKey,
+    /// Payments to this wallet still waiting in a node's mempool. Not
+    /// stored: the mempool is asked again after a reload.
+    incoming: Vec<Incoming>,
+    /// Coins a rollback forgot: found again on the new chain, they are not
+    /// news.
+    forgotten: HashSet<Point32>,
+}
+
+/// A transaction in a mempool that pays this wallet.
+#[derive(Clone, Debug)]
+struct Incoming {
+    tx_hash: String,
+    /// (commitment, value) of each output it pays this wallet.
+    outputs: Vec<(Point32, u64)>,
+    /// Unix seconds when this wallet first saw it.
+    seen_at: u64,
+}
+
+/// A payment seen in the mempool: [`WalletCore::scan_mempool`] reports each
+/// one once.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct IncomingView {
+    pub tx_hash: String,
+    pub value: u64,
 }
 
 impl WalletCore {
@@ -367,7 +403,13 @@ impl WalletCore {
         let keys = WalletKeys::from_seed(&seed, data.recovery_key);
         seed.zeroize();
         let view = keys.view_only();
-        Ok(Self { data, keys, view })
+        Ok(Self {
+            data,
+            keys,
+            view,
+            incoming: Vec::new(),
+            forgotten: HashSet::new(),
+        })
     }
 
     /// Opens a wallet file (the CLI's or [`Self::seal`]'s) with the key
@@ -440,24 +482,48 @@ impl WalletCore {
             .map(|(_, x)| *x)
     }
 
-    /// Forgets everything learned from blocks at or above `height`.
-    pub fn rollback_to(&mut self, height: u64) {
+    /// Forgets everything learned from blocks at or above `height`. A
+    /// payment those blocks settled is waiting for a block again: its coins
+    /// are reserved for it once more, and it is broadcast again (the node
+    /// usually puts it back in its mempool itself). Returns whether anything
+    /// the wallet shows changed.
+    pub fn rollback_to(&mut self, height: u64) -> bool {
+        let before = self.data.coins.len();
+        for c in self.data.coins.iter().filter(|c| c.height >= height) {
+            self.forgotten.insert(c.output.commitment);
+        }
         self.data.coins.retain(|c| c.height < height);
+        let mut changed = self.data.coins.len() != before;
         for c in &mut self.data.coins {
             if c.spent_height.map_or(false, |h| h >= height) {
                 c.spent_height = None;
+                changed = true;
             }
         }
         for s in &mut self.data.sent {
+            let mut unsettled = false;
             if s.height.map_or(false, |h| h >= height) {
                 s.height = None;
+                unsettled = true;
             }
             if s.failed_at.map_or(false, |h| h >= height) {
                 s.failed_at = None;
+                unsettled = true;
+            }
+            if unsettled {
+                changed = true;
+                if !s.cancelled {
+                    for c in &mut self.data.coins {
+                        if c.spent_height.is_none() && s.inputs.contains(&c.output.commitment) {
+                            c.pending_tx = Some(s.tx_hash.clone());
+                        }
+                    }
+                }
             }
         }
         self.data.recent.retain(|(h, _)| *h < height);
         self.data.scanned_height = self.data.scanned_height.min(height);
+        changed
     }
 
     /// Starts over from `height` (the birth height for a full rescan).
@@ -499,13 +565,13 @@ impl WalletCore {
             if s.height.is_some() || s.failed_at.is_some() {
                 continue;
             }
+            // The transaction is kept until the block is deep (below): a
+            // reorganisation can undo it, and then it is broadcast again.
             if kernels.contains(&s.kernel) {
                 s.height = Some(height);
-                s.tx_hex = None;
                 report.confirmed.push(s.tx_hash.clone());
             } else if s.inputs.iter().any(|c| spent.contains(c)) {
                 s.failed_at = Some(height);
-                s.tx_hex = None;
                 report.failed.push(s.tx_hash.clone());
             }
         }
@@ -537,7 +603,8 @@ impl WalletCore {
                 continue;
             }
             known.insert(output.commitment);
-            if !change.contains(&output.commitment) {
+            let again = self.forgotten.remove(&output.commitment);
+            if !change.contains(&output.commitment) && !again {
                 report
                     .received
                     .push((hex::encode(output.commitment), value, coinbase));
@@ -548,8 +615,22 @@ impl WalletCore {
                 height,
                 coinbase,
                 spent_height: None,
-                pending_tx: None,
+                pending_tx: self.reserved_for(&output.commitment),
             });
+        }
+
+        // Payments in the mempool that this block confirmed are coins now.
+        self.incoming
+            .retain(|i| !i.outputs.iter().any(|(c, _)| known.contains(c)));
+        // Past the reorg window a payment's block is settled for this
+        // wallet: its transaction is no longer needed.
+        for s in &mut self.data.sent {
+            if s.height
+                .or(s.failed_at)
+                .map_or(false, |h| height >= h + REORG_WINDOW as u64)
+            {
+                s.tx_hex = None;
+            }
         }
 
         self.data.recent.push((height, batch.extension.final_hash));
@@ -558,6 +639,68 @@ impl WalletCore {
         }
         self.data.scanned_height = height + 1;
         Ok(report)
+    }
+
+    /// Scans transactions waiting in a node's mempool for payments to this
+    /// wallet, with the view key, as blocks are scanned. `live` holds the
+    /// hash of every transaction the mempool lists now: a payment whose
+    /// transaction is gone is forgotten (a block took it, and scanning that
+    /// block finds its coins, or the node dropped it). This wallet's own
+    /// payments, and anything spending its coins (another copy of it, whose
+    /// change is not income), are left out. Returns the payments seen for
+    /// the first time.
+    pub fn scan_mempool(
+        &mut self,
+        txs: &[Transaction],
+        live: &HashSet<String>,
+        now: u64,
+    ) -> Vec<IncomingView> {
+        self.incoming.retain(|i| live.contains(&i.tx_hash));
+        let known: HashSet<Point32> = self
+            .data
+            .coins
+            .iter()
+            .map(|c| c.output.commitment)
+            .collect();
+        let own: HashSet<[u8; 32]> = self.data.sent.iter().map(|s| s.kernel).collect();
+        let mut fresh = Vec::new();
+        for tx in txs {
+            let tx_hash = hex::encode(tx.hash());
+            if !live.contains(&tx_hash) || self.incoming.iter().any(|i| i.tx_hash == tx_hash) {
+                continue;
+            }
+            if tx.kernel_ids().iter().any(|k| own.contains(k))
+                || tx.input_commitments().any(|c| known.contains(c))
+            {
+                continue;
+            }
+            let mut outputs = Vec::new();
+            for output in tx.outputs() {
+                if known.contains(&output.commitment) {
+                    continue;
+                }
+                let Some((value, _)) = self.view.scan(output) else {
+                    continue;
+                };
+                if scan_output(&self.keys, output).is_none() {
+                    continue;
+                }
+                outputs.push((output.commitment, value));
+            }
+            if outputs.is_empty() {
+                continue;
+            }
+            fresh.push(IncomingView {
+                tx_hash: tx_hash.clone(),
+                value: outputs.iter().map(|(_, v)| v).sum(),
+            });
+            self.incoming.push(Incoming {
+                tx_hash,
+                outputs,
+                seen_at: now,
+            });
+        }
+        fresh
     }
 
     /// Rebuilds the wallet from the chain's unspent outputs
@@ -599,7 +742,7 @@ impl WalletCore {
                 height: *height,
                 coinbase: *coinbase,
                 spent_height: None,
-                pending_tx: None,
+                pending_tx: self.reserved_for(&output.commitment),
             });
         }
         for coin in &mut self.data.coins {
@@ -626,6 +769,21 @@ impl WalletCore {
         report
     }
 
+    /// The payment still waiting for a block that spends this coin, if any:
+    /// a coin found again after a rollback stays reserved for it.
+    fn reserved_for(&self, commitment: &Point32) -> Option<String> {
+        self.data
+            .sent
+            .iter()
+            .find(|s| {
+                s.height.is_none()
+                    && s.failed_at.is_none()
+                    && !s.cancelled
+                    && s.inputs.contains(commitment)
+            })
+            .map(|s| s.tx_hash.clone())
+    }
+
     /// The change outputs of this wallet's own payments: coming back, they
     /// are not income.
     fn change_outputs(&self) -> HashSet<Point32> {
@@ -648,6 +806,12 @@ impl WalletCore {
                 b.spendable += c.value;
             }
         }
+        b.incoming = self
+            .incoming
+            .iter()
+            .flat_map(|i| i.outputs.iter())
+            .map(|(_, v)| v)
+            .sum();
         b
     }
 
@@ -941,6 +1105,20 @@ impl WalletCore {
                 commitment: None,
                 created_at: None,
                 detailed: false,
+            });
+        }
+        for i in &self.incoming {
+            entries.push(HistoryEntry {
+                kind: "received",
+                status: "pending",
+                height: None,
+                value: i.outputs.iter().map(|(_, v)| v).sum(),
+                fee: None,
+                to: None,
+                tx_hash: Some(i.tx_hash.clone()),
+                commitment: i.outputs.first().map(|(c, _)| hex::encode(c)),
+                created_at: Some(i.seen_at),
+                detailed: true,
             });
         }
         for s in &self.data.sent {

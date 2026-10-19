@@ -250,9 +250,10 @@ impl Wallet {
             .map(hex::encode))
     }
 
-    pub fn rollback_to(&mut self, height: f64) -> Result<(), JsError> {
-        self.0.rollback_to(whole(height, "a height")?);
-        Ok(())
+    /// Forgets blocks from `height` on (a reorganisation). Returns whether
+    /// anything the wallet shows changed.
+    pub fn rollback_to(&mut self, height: f64) -> Result<bool, JsError> {
+        Ok(self.0.rollback_to(whole(height, "a height")?))
     }
 
     pub fn rescan_from(&mut self, height: f64) -> Result<(), JsError> {
@@ -320,8 +321,32 @@ impl Wallet {
         Ok(json(&report))
     }
 
-    /// JSON {spendable, immature, pending}; `tip_height` is the height of
-    /// the next block.
+    /// Scans mempool transactions (one hex bincode `Vec<Transaction>`, as
+    /// `get_mempool_txs` sends them; empty for none) for payments to this
+    /// wallet. `live_json` lists every hash `get_mempool` returned: payments
+    /// no longer among them are forgotten. Returns JSON [{tx_hash, value}]
+    /// of the payments seen for the first time.
+    pub fn scan_mempool(
+        &mut self,
+        txs_hex: &str,
+        live_json: &str,
+        now: f64,
+    ) -> Result<String, JsError> {
+        let txs = if txs_hex.trim().is_empty() {
+            Vec::new()
+        } else {
+            wallet::txs_from_hex(txs_hex).map_err(err)?
+        };
+        let live: std::collections::HashSet<String> = serde_json::from_str(live_json)
+            .map_err(|e| JsError::new(&format!("not a list of transaction hashes: {e}")))?;
+        let fresh = self
+            .0
+            .scan_mempool(&txs, &live, whole(now.floor(), "the time")?);
+        Ok(json(&fresh))
+    }
+
+    /// JSON {spendable, immature, pending, incoming}; `tip_height` is the
+    /// height of the next block.
     pub fn balance(&self, tip_height: f64) -> Result<String, JsError> {
         Ok(json(&self.0.balance(whole(tip_height, "a height")?)))
     }

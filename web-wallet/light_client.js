@@ -35,6 +35,24 @@ const MAX_IN_FLIGHT = 4;
  * frame over 8 KiB: a payment spending many coins is written in pieces.
  */
 const WRITE_CHUNK = 8000;
+/**
+ * A field every successful answer to a method carries. An answer without it
+ * belongs to another request: WebRTC reuses a closed data channel's id
+ * quickly, and the late answer to an abandoned request can land on the next
+ * stream. Nodes echo each request's number, which settles it; for nodes
+ * from before that, this check catches answers to a different method. Either
+ * way the request is sent again rather than the answer handed on.
+ */
+const ANSWER_FIELD = {
+    get_state: 'height',
+    get_headers: 'headers_hex',
+    get_block: 'block_hex',
+    get_blocks: 'blocks_hex',
+    get_utxos: 'outputs',
+    get_mempool: 'count',
+    get_mempool_txs: 'txs_hex',
+    get_utxo_proof: 'proof',
+};
 
 function shuffle(list) {
     const a = list.slice();
@@ -63,6 +81,7 @@ export class LightClient {
         this.closed = false;
         this.inFlight = 0;
         this.queue = [];
+        this.seq = 0;            // numbers requests; the node echoes the number
         this.onStatus = () => {};
         this.onPush = () => {};
         this._retry = null;
@@ -198,6 +217,12 @@ export class LightClient {
                 e.nodeError = true;
                 throw e;
             }
+            const field = ANSWER_FIELD[method];
+            if (field && !(resp.data && typeof resp.data === 'object' && field in resp.data)) {
+                console.warn(`${method}: got an answer to another request; asking again`);
+                last = new Error(`${method}: the node's answer did not match the request`);
+                continue;
+            }
             return resp.data;
         }
         throw last;
@@ -222,8 +247,9 @@ export class LightClient {
         const conns = this.node.getConnections(this.peer);
         if (!conns.length) throw new Error('not connected to a node');
         const stream = await conns[0].newStream([LIGHT_PROTOCOL], { signal: AbortSignal.timeout(DIAL_TIMEOUT_MS) });
+        const id = ++this.seq;
         try {
-            const body = new TextEncoder().encode(JSON.stringify(req));
+            const body = new TextEncoder().encode(JSON.stringify({ id, ...req }));
             const msg = new Uint8Array(4 + body.length);
             new DataView(msg.buffer).setUint32(0, body.length, true);
             msg.set(body, 4);
@@ -280,7 +306,14 @@ export class LightClient {
                 });
             }
             stream.close().catch(() => {});
-            return JSON.parse(new TextDecoder().decode(await response));
+            const answer = JSON.parse(new TextDecoder().decode(await response));
+            // An answer numbered for another request reached this stream (see
+            // ANSWER_FIELD); nodes from before numbering send none.
+            if (answer && answer.id !== undefined && answer.id !== id) {
+                console.warn(`${req.method}: got the answer to another request; asking again`);
+                throw new Error(`${req.method}: the answer was for another request`);
+            }
+            return answer;
         } finally {
             // Frees the stream slot now rather than after the FIN handshake.
             try { stream.abort(new Error('done')); } catch (_) {}
