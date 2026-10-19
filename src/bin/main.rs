@@ -293,6 +293,8 @@ enum WalletCmd {
     /// Print a view key: it sees every payment to this wallet but cannot
     /// spend any. `pool-mine` needs one to check its payouts.
     ViewKey,
+    /// Print the recovery phrase: anyone who sees it can spend every coin.
+    Phrase,
     /// Scan new blocks from the node.
     Sync,
     /// Scan, then print the balance.
@@ -1197,6 +1199,11 @@ fn run(cli: Cli) -> Result<()> {
                     let view = Wallet::open(&path, &password()?)?.view_key();
                     eprintln!("Anyone with this key can see every payment to this wallet (never spend it).");
                     out!("{}", view.encode());
+                }
+                WalletCmd::Phrase => {
+                    let w = Wallet::open(&path, &password()?)?;
+                    eprintln!("Anyone with these words can spend this wallet's coins: write them down and keep them offline.");
+                    out!("{}", w.mnemonic());
                 }
                 WalletCmd::Sync => {
                     let mut w = Wallet::open(&path, &password()?)?;

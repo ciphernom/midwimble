@@ -263,6 +263,7 @@ on real GPU hardware.
 ```sh
 export MIDWIMBLE_PASSWORD=...
 midwimble wallet --wallet w.mww create            # prints a v1 address + 24 words (recovery key: ~seconds to a minute)
+midwimble wallet --wallet w.mww phrase            # prints the 24 words again
 midwimble node --data-dir ./node --mine-to <address> [--backend gpu] [--prune]
 midwimble node --data-dir ./node --checkpoint <checkpoint id>   # checkpoint verification
 midwimble wallet --wallet w.mww balance
