@@ -1,5 +1,7 @@
 {
   "network": "MIDWIMBLE_TESTNET_V3",
   "genesis": "7c45a2ef9d2f76134fe35f6016ef7df0dfef8d4f29dd5d02d4ae8144a10139b5",
-  "nodes": []
+  "nodes": [
+    "/ip4/134.199.148.215/udp/9435/webrtc-direct/certhash/uEiDIf7zrVJMvWcmjSBcR_4qV8vPllHc_h1IKm8ulT3w5kg/p2p/12D3KooWCvjd2SBokjWMH712NXNFWHKr7kJAeBsUQ447LHk7wrzu"
+  ]
 }
