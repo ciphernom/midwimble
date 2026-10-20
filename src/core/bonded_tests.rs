@@ -22,7 +22,18 @@ use anyhow::Result;
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 use primitive_types::U256;
 
-/// A chain past genesis whose blocks are stamped from an hour ago: the
+/// Where the test chain's blocks are stamped from (the first a minute
+/// later): the genesis schedule, so that ASERT keeps every target near the
+/// genesis target and each block carries real work. A chain stamped days
+/// behind its schedule falls to the easiest target, and a block's work of
+/// one is its own sliver, so no test could tell a capped or unsigned block
+/// from a full one. If the genesis lies ahead (a launch build, made before
+/// mining opens), an hour ago instead: blocks from the future are refused.
+fn chain_start() -> u64 {
+    GENESIS_TIMESTAMP.min(current_timestamp() - 3_600)
+}
+
+/// A chain past genesis whose blocks are stamped from [`chain_start`]: the
 /// timestamps given with each block decide its earliest stamp, so these
 /// work whatever the build's genesis time is.
 struct Chain {
@@ -40,7 +51,7 @@ impl Chain {
         );
         Self {
             state,
-            ts: vec![current_timestamp() - 3_600],
+            ts: vec![chain_start()],
         }
     }
 
@@ -117,8 +128,10 @@ fn producer(seed: u8) -> (MinerBond, [u8; 32]) {
     )
 }
 
+/// A lock comfortably inside `MAX_BOND_HORIZON` and well past the minimum
+/// remaining lock, for blocks stamped from [`chain_start`].
 fn locked_long() -> u64 {
-    est_midstate_height(current_timestamp()) + MAX_BOND_HORIZON / 2
+    est_midstate_height(chain_start()) + MAX_BOND_HORIZON / 2
 }
 
 /// Puts a bond straight into the chain's bond set, as if registered earlier.
@@ -221,6 +234,10 @@ fn while_no_bond_can_sign_blocks_are_unsigned_and_count_for_a_sliver() {
     for _ in 0..3 {
         let parent = chain.state.weight();
         let creditable = chain.creditable();
+        assert!(
+            sliver(creditable) < creditable,
+            "the test chain's blocks carry real work (see chain_start)"
+        );
         let t = chain.template(None).unwrap();
         assert!(t.batch.miner.is_none());
         assert_eq!(t.batch.chain_weight, parent + sliver(creditable));
