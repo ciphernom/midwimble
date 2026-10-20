@@ -376,9 +376,9 @@ pub fn build_template_relayed(
     // bond could sign it (checked below).
     let mut registrations: Vec<BondRegistration> = Vec::new();
     let mut not_ready: Option<anyhow::Error> = None;
-    // The producer's own bond can no longer sign at all: its lock has run
-    // down. It is not waiting for anything, so it does not hold up its
-    // co-bonds.
+    // The producer's own bond can no longer sign at all: smaller than the
+    // network now asks (its early phase over), or its lock run down. It is
+    // not waiting for anything, so it does not hold up its co-bonds.
     let mut retired = false;
     if let Some(b) = bond.filter(|b| !state_after_relay.bonds.contains_key(&b.bond_id)) {
         match &b.registration {
@@ -467,8 +467,9 @@ pub fn build_template_relayed(
         return Err(not_ready.unwrap_or_else(|| match bond {
             Some(_) if retired => anyhow!(
                 "this producer's mining bond is not eligible at this block's time and never will \
-                 be again (its lock ends too soon); none of its co-bonds can sign, and other \
-                 registered bonds can: lock and register a new bond"
+                 be again (smaller than the network now requires, or its lock ends too soon); \
+                 none of its co-bonds can sign, and other registered bonds can: lock and \
+                 register a new bond"
             ),
             Some(_) => anyhow!(
                 "none of this producer's bonds can sign at this time, and other registered bonds can"

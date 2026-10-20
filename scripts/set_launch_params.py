@@ -10,6 +10,10 @@ See docs/LAUNCH.md for the whole procedure. Typical use:
         --genesis-time 2026-11-02T16:00:00Z \\
         --midstate-rpc 127.0.0.1:8545 --merge-share 0.5
 
+A network can open with an early phase (--early-bonds-until): blocks stamped
+before it take a smaller bond with a shorter lock, so it can run as a testnet
+anyone can mine and become mainnet in place when the phase ends.
+
 Nothing here is consensus code: it only writes constants that consensus reads,
 and refuses values that would make an obviously broken or unfair launch.
 """
@@ -103,6 +107,49 @@ def attempts_per_second(t: int) -> int:
     return (MAX_TARGET // max(t, 1)) // BLOCK_TIME
 
 
+def bond_note(units: int) -> str:
+    return (f"2^{units.bit_length() - 1} units"
+            + (f" ({units >> 30} gMDS)" if units >= (1 << 30) else ""))
+
+
+def bond_block(p: dict) -> str:
+    """The bond constants: the full rules and, if there is one, the early phase's."""
+    if not p["early_until"]:
+        return f"""/// Smallest bond that grants mining eligibility, in midstate base units.
+/// {bond_note(p['min_bond'])}
+pub const LAUNCH_MIN_MINING_BOND: u64 = {p['min_bond']:_};
+
+/// Midstate blocks a bond must still be locked for to be eligible: the
+/// unbonding delay, {p['lock_days']} day(s).
+pub const LAUNCH_MIN_REMAINING_BOND_LOCK: u64 = {p['lock_blocks']:_};
+
+/// End of an early phase with a smaller bond and a shorter lock: none here,
+/// so every block takes the bond above.
+pub const LAUNCH_EARLY_BONDS_UNTIL: u64 = 0;
+
+/// Without an early phase, the same as the bond and lock above.
+pub const LAUNCH_EARLY_MIN_MINING_BOND: u64 = {p['min_bond']:_};
+pub const LAUNCH_EARLY_MIN_REMAINING_BOND_LOCK: u64 = {p['lock_blocks']:_};"""
+    return f"""/// Smallest bond that grants mining eligibility once the early phase is
+/// over, in midstate base units. {bond_note(p['min_bond'])}
+pub const LAUNCH_MIN_MINING_BOND: u64 = {p['min_bond']:_};
+
+/// Midstate blocks a bond must still be locked for to be eligible once the
+/// early phase is over: the unbonding delay, {p['lock_days']} day(s).
+pub const LAUNCH_MIN_REMAINING_BOND_LOCK: u64 = {p['lock_blocks']:_};
+
+/// End of the early phase ({utc(p['early_until'])}). Blocks stamped before it
+/// accept the early bond below, so the network can open as a testnet and
+/// become mainnet without a restart. Zero: no early phase.
+pub const LAUNCH_EARLY_BONDS_UNTIL: u64 = {p['early_until']:_};
+
+/// Smallest bond during the early phase. {bond_note(p['early_min_bond'])}
+pub const LAUNCH_EARLY_MIN_MINING_BOND: u64 = {p['early_min_bond']:_};
+
+/// The unbonding delay during the early phase, {p['early_lock_days']} day(s).
+pub const LAUNCH_EARLY_MIN_REMAINING_BOND_LOCK: u64 = {p['early_lock_blocks']:_};"""
+
+
 def render(p: dict) -> str:
     target_note = p["target_note"]
     return f"""{BEGIN}
@@ -136,13 +183,7 @@ const LAUNCH_GENESIS_TIMESTAMP: u64 = {p['genesis_time']:_}; // {utc(p['genesis_
 const LAUNCH_GENESIS_TARGET: [u8; 32] =
     hex32("{p['target']:064x}");
 
-/// Smallest bond that grants mining eligibility, in midstate base units.
-/// {p['bond_note']}
-pub const LAUNCH_MIN_MINING_BOND: u64 = {p['min_bond']:_};
-
-/// Midstate blocks a bond must still be locked for to be eligible: the
-/// unbonding delay, {p['lock_days']} day(s).
-pub const LAUNCH_MIN_REMAINING_BOND_LOCK: u64 = {p['lock_blocks']:_};
+{bond_block(p)}
 
 /// Set by `scripts/set_launch_params.py`: these are real launch parameters.
 pub const LAUNCH_PARAMETERS_SET: bool = true;
@@ -175,6 +216,17 @@ def main() -> None:
                          "(default 2^37 = 128 gMDS)")
     ap.add_argument("--bond-lock-days", type=int, default=30,
                     help="how long a bond must still be locked to mine (default 30)")
+    ap.add_argument("--early-bonds-until",
+                    help="end of an early phase (UTC with a trailing Z, or Unix seconds): blocks "
+                         "stamped before it take --early-min-bond locked --early-bond-lock-days, so "
+                         "the network can open as a testnet and become mainnet in place. Default: "
+                         "no early phase")
+    ap.add_argument("--early-min-bond", type=int, default=1 << 24,
+                    help="smallest mining bond during the early phase, in midstate base units; a "
+                         "power of two (default 2^24)")
+    ap.add_argument("--early-bond-lock-days", type=int, default=2,
+                    help="how long a bond must still be locked to mine during the early phase "
+                         "(default 2)")
     ap.add_argument("--testnet", action="store_true",
                     help="testnet defaults: MIDWIMBLE_TESTNET_V1, a 2^24-unit bond and a "
                          "two-day lock, so testers risk nothing")
@@ -220,6 +272,28 @@ def main() -> None:
         warn("more than six hours between the anchor block and genesis: that is a window in which "
              "anyone holding the release can pre-mine blocks for the first minutes of the chain")
 
+    if a.early_bonds_until:
+        early_until = parse_time(a.early_bonds_until)
+        if early_until <= genesis:
+            die("--early-bonds-until must be after the genesis time: an early phase that ends "
+                "before the chain begins does nothing")
+        early_bond, early_days = a.early_min_bond, a.early_bond_lock_days
+        if early_bond & (early_bond - 1) or early_bond < (1 << 20):
+            die("--early-min-bond must be a power of two and at least 2^20 units")
+        if early_days < 1:
+            die("--early-bond-lock-days must be at least 1")
+        if early_bond > a.min_bond or early_days > a.bond_lock_days:
+            die("the early phase may ask less than the full rules, never more: --early-min-bond "
+                "and --early-bond-lock-days must not exceed --min-bond and --bond-lock-days "
+                "(otherwise a bond that stopped counting could start again, which the bond set "
+                "cannot follow)")
+        if early_until - genesis > 60 * 86400:
+            warn(f"the early phase lasts {(early_until - genesis) // 86400} days: for all that "
+                 "time mining is as cheap to enter as a testnet's")
+    else:
+        # No early phase: its constants repeat the full rules.
+        early_until, early_bond, early_days = 0, a.min_bond, a.bond_lock_days
+
     if not 0.0 < a.merge_share <= 1.0:
         die("--merge-share must be in (0, 1]")
     if a.genesis_target:
@@ -257,13 +331,12 @@ def main() -> None:
     if ms_hash == "0" * 64:
         die("the midstate anchor hash is all zeros")
 
-    bond_note = (f"2^{a.min_bond.bit_length() - 1} units"
-                 + (f" ({a.min_bond >> 30} gMDS)" if a.min_bond >= (1 << 30) else ""))
     params = dict(magic=magic, btc_hash=btc_hash, btc_height=a.bitcoin_height, btc_time=btc_time,
                   genesis_time=genesis, target=target, target_note=note,
                   ms_hash=ms_hash, ms_height=ms_height, min_bond=a.min_bond,
                   lock_days=a.bond_lock_days, lock_blocks=a.bond_lock_days * 1440,
-                  bond_note=bond_note)
+                  early_until=early_until, early_min_bond=early_bond,
+                  early_lock_days=early_days, early_lock_blocks=early_days * 1440)
     block = render(params)
 
     src = a.types_rs.read_text()
@@ -284,7 +357,10 @@ def main() -> None:
     print(f"network magic      {magic}")
     print(f"bitcoin anchor     {a.bitcoin_height}  {btc_hash}  ({utc(btc_time)})")
     print(f"midstate anchor    {ms_height}  {ms_hash}")
-    print(f"mining bond        {bond_note}, locked {a.bond_lock_days} more day(s) to mine")
+    print(f"mining bond        {bond_note(a.min_bond)}, locked {a.bond_lock_days} more day(s) to mine")
+    if early_until:
+        print(f"early phase        until {utc(early_until)}: {bond_note(early_bond)}, locked "
+              f"{early_days} more day(s)")
     print(f"mining opens       {utc(genesis)}")
     print(f"slow start ends    ~{utc(genesis + SLOW_START_BLOCKS * BLOCK_TIME)}")
     print(f"genesis target     {leading_zero_bits(target)} leading zero bits, "

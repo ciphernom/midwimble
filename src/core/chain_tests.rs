@@ -624,7 +624,7 @@ fn heavier_fork_wins() {
 
 use super::bond::{
     authorization_message, check_miner_authorization, devnet_registrations, est_midstate_height,
-    MinerBond, MIN_REMAINING_BOND_LOCK,
+    min_remaining_bond_lock, MinerBond,
 };
 use super::relay::{RelayFeed, RelayHeaders};
 use super::state::apply_registrations;
@@ -738,7 +738,7 @@ fn expired_bonds_leave_the_bond_set() {
             (b"lasting", locked_long()),
             (
                 b"brief",
-                est_midstate_height(t0 + 300) + MIN_REMAINING_BOND_LOCK,
+                est_midstate_height(t0 + 300) + min_remaining_bond_lock(t0 + 300),
             ),
         ],
     );
@@ -889,7 +889,7 @@ fn unregistered_and_short_locked_bonds_cannot_mine() {
             (b"unregistered", locked_long()),
             (
                 b"short lock",
-                est_midstate_height(now()) + MIN_REMAINING_BOND_LOCK - 1_000,
+                est_midstate_height(now()) + min_remaining_bond_lock(now()) - 1_000,
             ),
             (b"lasting", locked_long()),
         ],

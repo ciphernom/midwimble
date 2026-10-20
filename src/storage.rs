@@ -1487,7 +1487,7 @@ mod tests {
     /// the set, and no undo record carries a copy of the whole set.
     #[test]
     fn bond_diffs_persist_and_rewind() {
-        use crate::core::bond::{est_midstate_height, MIN_REMAINING_BOND_LOCK};
+        use crate::core::bond::{est_midstate_height, min_remaining_bond_lock};
         let dir = tempfile::tempdir().unwrap();
         let (storage, mut state, mut ts) = fresh(dir.path());
         let to = WalletKeys::random().address();
@@ -1500,7 +1500,7 @@ mod tests {
                 ),
                 (
                     b"brief",
-                    est_midstate_height(t0 + 300) + MIN_REMAINING_BOND_LOCK,
+                    est_midstate_height(t0 + 300) + min_remaining_bond_lock(t0 + 300),
                 ),
             ],
             &state.target,

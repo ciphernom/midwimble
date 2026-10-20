@@ -20,6 +20,9 @@ obviously broken or unfair launch.
 | `LAUNCH_GENESIS_TARGET` | Midstate's live target ÷ expected merged-mining share | The reference hashrate ASERT adjusts around. |
 | `LAUNCH_MIN_MINING_BOND` | 2^37 units (128 gMDS) | What a miner must lock on midstate. A testnet sets it to 2^24 (`--testnet`). |
 | `LAUNCH_MIN_REMAINING_BOND_LOCK` | 43,200 blocks (30 days) | The unbonding delay; two days on a testnet. |
+| `LAUNCH_EARLY_BONDS_UNTIL` | 0, or when an early phase ends (`--early-bonds-until`) | Lets a network open as a testnet and become mainnet in place: blocks stamped before it take the two below instead. |
+| `LAUNCH_EARLY_MIN_MINING_BOND` | 2^24 units during an early phase (`--early-min-bond`) | At most the full bond: a bond's eligibility must only ever run down with time. |
+| `LAUNCH_EARLY_MIN_REMAINING_BOND_LOCK` | 2,880 blocks (2 days) during an early phase (`--early-bond-lock-days`) | At most the full lock, for the same reason. |
 | `LAUNCH_PARAMETERS_SET` | `true` | Until it is, the node warns that it is a devnet build. |
 
 ## The sequence

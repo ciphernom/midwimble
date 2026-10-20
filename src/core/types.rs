@@ -145,6 +145,14 @@ pub const LAUNCH_MIN_MINING_BOND: u64 = 16_777_216;
 /// unbonding delay, 2 day(s).
 pub const LAUNCH_MIN_REMAINING_BOND_LOCK: u64 = 2_880;
 
+/// End of an early phase with a smaller bond and a shorter lock: none here,
+/// so every block takes the bond above.
+pub const LAUNCH_EARLY_BONDS_UNTIL: u64 = 0;
+
+/// Without an early phase, the same as the bond and lock above.
+pub const LAUNCH_EARLY_MIN_MINING_BOND: u64 = 16_777_216;
+pub const LAUNCH_EARLY_MIN_REMAINING_BOND_LOCK: u64 = 2_880;
+
 /// Set by `scripts/set_launch_params.py`: these are real launch parameters.
 pub const LAUNCH_PARAMETERS_SET: bool = true;
 
@@ -152,10 +160,16 @@ pub const LAUNCH_PARAMETERS_SET: bool = true;
 
 /// A bond is one midstate coin, and midstate coin values are powers of two.
 const _: () = assert!(LAUNCH_MIN_MINING_BOND.count_ones() == 1);
+const _: () = assert!(LAUNCH_EARLY_MIN_MINING_BOND.count_ones() == 1);
 /// Small enough to be free is not a bond at all, even on a testnet.
-const _: () = assert!(LAUNCH_MIN_MINING_BOND >= 1 << 20);
+const _: () = assert!(LAUNCH_EARLY_MIN_MINING_BOND >= 1 << 20);
 /// The unbonding delay has to outlast a reorg of either chain.
-const _: () = assert!(LAUNCH_MIN_REMAINING_BOND_LOCK >= 24 * 60);
+const _: () = assert!(LAUNCH_EARLY_MIN_REMAINING_BOND_LOCK >= 24 * 60);
+/// The early phase may ask less than the network asks after it, never more:
+/// then a bond's eligibility only ever runs down as time passes, which is
+/// what lets the bond set forget a bond for good (`BondSet::prune_expired`).
+const _: () = assert!(LAUNCH_EARLY_MIN_MINING_BOND <= LAUNCH_MIN_MINING_BOND);
+const _: () = assert!(LAUNCH_EARLY_MIN_REMAINING_BOND_LOCK <= LAUNCH_MIN_REMAINING_BOND_LOCK);
 
 /// Genesis cannot predate the Bitcoin block it commits to.
 const _: () = assert!(LAUNCH_GENESIS_TIMESTAMP >= BITCOIN_BLOCK_TIME);

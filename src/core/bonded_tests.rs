@@ -299,7 +299,7 @@ fn when_the_last_bond_lapses_the_chain_carries_on() {
     let mut chain = Chain::new();
     // Eligible for blocks stamped up to about two minutes from the start.
     let start = chain.next_stamp();
-    let until = est_midstate_height(start + 120) + MIN_REMAINING_BOND_LOCK;
+    let until = est_midstate_height(start + 120) + min_remaining_bond_lock(start + 120);
     let bond = with_bond(&mut chain, 9, until);
     let signed = chain.template(Some(&bond)).unwrap();
     assert!(signed.batch.miner.is_some());
@@ -320,6 +320,61 @@ fn when_the_last_bond_lapses_the_chain_carries_on() {
         chain.state.bonds.is_empty(),
         "the lapsed bond has left the set"
     );
+}
+
+/// The end of the early phase, seen by block producers. A producer whose
+/// bond meets only the early minimum signs up to the last block stamped
+/// before `EARLY_BONDS_UNTIL`. From the first one stamped after, it cannot
+/// sign: while no other bond can, it mines unsigned, and once a full bond
+/// is registered it cannot mine at all. A full bond signs throughout.
+/// (Templates only: the switch may still lie ahead of the clock, and blocks
+/// from the future are refused.)
+#[test]
+fn early_bonds_stop_signing_when_the_early_phase_ends() {
+    if EARLY_BONDS_UNTIL == 0 || EARLY_MIN_MINING_BOND >= MIN_MINING_BOND {
+        return;
+    }
+    let switch = EARLY_BONDS_UNTIL;
+    let mut chain = Chain::new();
+    let (early, early_key) = producer(21);
+    chain.state.bonds.insert(
+        early.bond_id,
+        BondEntry {
+            mining_key: early_key,
+            value: EARLY_MIN_MINING_BOND,
+            bonded_until: est_midstate_height(switch) + MAX_BOND_HORIZON / 2,
+            proven_height: 0,
+            proven_hash: [0; 32],
+        },
+    );
+    // Eleven blocks a minute apart, the last stamped `last`: the next
+    // template is stamped a minute after it.
+    let ending_at = |last: u64| -> Vec<u64> { (0..11).rev().map(|i| last - i * 60).collect() };
+
+    // The last early block: signed by the early bond.
+    chain.ts = ending_at(switch - 120);
+    let t = chain.template(Some(&early)).unwrap();
+    assert_eq!(t.batch.timestamp, switch - 60);
+    assert_eq!(t.batch.miner.as_ref().unwrap().bond_id, early.bond_id);
+
+    // The first block after it: the early bond cannot sign, and with no
+    // other bond able to, its producer mines unsigned blocks.
+    chain.ts = ending_at(switch - 60);
+    let t = chain.template(Some(&early)).unwrap();
+    assert_eq!(t.batch.timestamp, switch);
+    assert!(t.batch.miner.is_none(), "an early bond cannot sign after the switch");
+
+    // Next to a full bond, the early producer cannot mine at all, and the
+    // full one signs.
+    let full = with_bond(&mut chain, 22, est_midstate_height(switch) + MAX_BOND_HORIZON / 2);
+    let err = chain.template(Some(&early)).unwrap_err().to_string();
+    assert!(err.contains("other registered bonds can"), "{err}");
+    let t = chain.template(Some(&full)).unwrap();
+    assert_eq!(t.batch.miner.as_ref().unwrap().bond_id, full.bond_id);
+    // Before the switch the full bond signs just the same.
+    chain.ts = ending_at(switch - 120);
+    let t = chain.template(Some(&full)).unwrap();
+    assert_eq!(t.batch.miner.as_ref().unwrap().bond_id, full.bond_id);
 }
 
 /// A registration for a bond coin naming `mining_key`, locked until

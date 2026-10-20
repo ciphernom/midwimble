@@ -287,10 +287,16 @@ async fn bonds(AxState(node): AxState<NodeHandle>) -> Json<Value> {
         })
         .collect();
     list.sort_by(|a, b| a["bond_id"].as_str().cmp(&b["bond_id"].as_str()));
-    let from = crate::core::bond::BONDED_MINING_FROM;
+    use crate::core::bond::{
+        min_mining_bond, min_remaining_bond_lock, BONDED_MINING_FROM, EARLY_BONDS_UNTIL,
+    };
+    let from = BONDED_MINING_FROM;
     Json(json!({
         "bonds": list,
         "bonded_mining_from": if from == u64::MAX { Value::Null } else { json!(from) },
+        "min_bond_now": min_mining_bond(now),
+        "min_remaining_lock_now": min_remaining_bond_lock(now),
+        "early_bonds_until": if EARLY_BONDS_UNTIL == 0 { Value::Null } else { json!(EARLY_BONDS_UNTIL) },
     }))
 }
 

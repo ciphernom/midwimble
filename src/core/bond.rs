@@ -21,6 +21,11 @@
 //! The header a bond is proven against must be on the midstate relay's chain
 //! (`core/relay.rs`): consensus's own view of midstate, fed by blocks. A bond
 //! whose header a heavier midstate branch replaces is revoked.
+//!
+//! A network may open with an early phase ([`EARLY_BONDS_UNTIL`]): blocks
+//! stamped before it accept a smaller bond with a shorter lock, so it can
+//! start as a testnet anyone can mine and become mainnet in place. From then
+//! on only bonds meeting the full minimums count.
 
 use super::anchor::HeaderLink;
 use super::auxpow::midstate_coin_id;
@@ -46,17 +51,117 @@ const OP_CHECKTIMEVERIFY: u8 = 0x33;
 const MIDSTATE_V2_ACTIVATION_HEIGHT: u64 = 100_000;
 const MIDSTATE_V4_ACTIVATION_HEIGHT: u64 = 163_675;
 
-/// Smallest bond that grants eligibility, in midstate base units: 2^37
-/// (128 gMDS) on mainnet. A launch parameter, so a testnet can set it low
-/// enough that testers risk nothing (`types::LAUNCH_MIN_MINING_BOND`).
+/// Smallest bond that grants eligibility once the early phase is over, in
+/// midstate base units: 2^37 (128 gMDS) on mainnet. A launch parameter, so a
+/// testnet can set it low enough that testers risk nothing
+/// (`types::LAUNCH_MIN_MINING_BOND`). What a block needs is
+/// [`min_mining_bond`] at its timestamp.
 pub const MIN_MINING_BOND: u64 = super::types::LAUNCH_MIN_MINING_BOND;
 
 /// How many midstate blocks a bond must stay locked beyond the height it is
-/// judged at (30 days on mainnet). This *is* the unbonding delay: a bond
-/// stops counting this long before its owner can spend it, so neither chain
-/// has to track an unbonding state. Also a launch parameter, so a testnet's
-/// bonds free up in a day or two.
+/// judged at (30 days on mainnet), once the early phase is over. This *is*
+/// the unbonding delay: a bond stops counting this long before its owner can
+/// spend it, so neither chain has to track an unbonding state. Also a launch
+/// parameter, so a testnet's bonds free up in a day or two. What a block
+/// needs is [`min_remaining_bond_lock`] at its timestamp.
 pub const MIN_REMAINING_BOND_LOCK: u64 = super::types::LAUNCH_MIN_REMAINING_BOND_LOCK;
+
+/// End of the network's early phase, as a block timestamp; zero if it had
+/// none. Blocks stamped before it take [`EARLY_MIN_MINING_BOND`] locked for
+/// [`EARLY_MIN_REMAINING_BOND_LOCK`] instead, so a network can open as a
+/// testnet, cheap for anyone to mine, and become mainnet without a restart:
+/// from this moment the bonds that cannot meet the full minimums stop
+/// counting, and leave the bond set with the first block that cannot be
+/// stamped before it (`types::LAUNCH_EARLY_BONDS_UNTIL`).
+pub const EARLY_BONDS_UNTIL: u64 = super::types::LAUNCH_EARLY_BONDS_UNTIL;
+
+/// Smallest bond during the early phase (`types::LAUNCH_EARLY_MIN_MINING_BOND`).
+pub const EARLY_MIN_MINING_BOND: u64 = super::types::LAUNCH_EARLY_MIN_MINING_BOND;
+
+/// The unbonding delay during the early phase
+/// (`types::LAUNCH_EARLY_MIN_REMAINING_BOND_LOCK`).
+pub const EARLY_MIN_REMAINING_BOND_LOCK: u64 =
+    super::types::LAUNCH_EARLY_MIN_REMAINING_BOND_LOCK;
+
+/// The minimums a bond must meet to authorise a block: the full ones and,
+/// for blocks stamped before `early_until`, an early phase's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BondRules {
+    pub min_bond: u64,
+    pub min_lock: u64,
+    /// End of the early phase, as a block timestamp; zero for none.
+    pub early_until: u64,
+    pub early_min_bond: u64,
+    pub early_min_lock: u64,
+}
+
+/// This network's rules, from its launch parameters.
+pub const BOND_RULES: BondRules = BondRules {
+    min_bond: MIN_MINING_BOND,
+    min_lock: MIN_REMAINING_BOND_LOCK,
+    early_until: EARLY_BONDS_UNTIL,
+    early_min_bond: EARLY_MIN_MINING_BOND,
+    early_min_lock: EARLY_MIN_REMAINING_BOND_LOCK,
+};
+
+impl BondRules {
+    pub fn in_early_phase(&self, block_timestamp: u64) -> bool {
+        block_timestamp < self.early_until
+    }
+
+    pub fn min_bond_at(&self, block_timestamp: u64) -> u64 {
+        if self.in_early_phase(block_timestamp) {
+            self.early_min_bond
+        } else {
+            self.min_bond
+        }
+    }
+
+    pub fn min_lock_at(&self, block_timestamp: u64) -> u64 {
+        if self.in_early_phase(block_timestamp) {
+            self.early_min_lock
+        } else {
+            self.min_lock
+        }
+    }
+
+    /// Whether a bond of `value` locked until midstate height `bonded_until`
+    /// may authorise a block stamped `block_timestamp`: see
+    /// [`Bond::eligible_at`].
+    pub fn eligible(&self, value: u64, bonded_until: u64, block_timestamp: u64) -> bool {
+        value >= self.min_bond_at(block_timestamp)
+            && bonded_until
+                >= est_midstate_height(block_timestamp)
+                    .saturating_add(self.min_lock_at(block_timestamp))
+    }
+
+    /// Whether the early phase asks less than the full rules, never more.
+    /// Then a bond's eligibility only ever runs down as time passes, which
+    /// is what lets the bond set forget a bond for good
+    /// ([`BondSet::prune_expired`]). `types.rs` refuses to build a network
+    /// whose rules break it.
+    pub const fn early_phase_asks_less(&self) -> bool {
+        self.early_min_bond <= self.min_bond && self.early_min_lock <= self.min_lock
+    }
+}
+
+const _: () = assert!(BOND_RULES.early_phase_asks_less());
+
+/// Whether a block stamped `block_timestamp` falls in the early phase.
+pub fn in_early_phase(block_timestamp: u64) -> bool {
+    BOND_RULES.in_early_phase(block_timestamp)
+}
+
+/// Smallest bond that can authorise a block stamped `block_timestamp`.
+pub fn min_mining_bond(block_timestamp: u64) -> u64 {
+    BOND_RULES.min_bond_at(block_timestamp)
+}
+
+/// Midstate blocks a bond must still be locked for to authorise a block
+/// stamped `block_timestamp`.
+pub fn min_remaining_bond_lock(block_timestamp: u64) -> u64 {
+    BOND_RULES.min_lock_at(block_timestamp)
+}
 
 /// The locking script of a mining bond:
 ///
@@ -299,21 +404,24 @@ pub fn est_midstate_height(timestamp: u64) -> u64 {
 }
 
 impl Bond {
-    /// Version-1 eligibility for a block with this timestamp: large enough,
-    /// and still locked for at least `MIN_REMAINING_BOND_LOCK` beyond the
-    /// estimated midstate height. Nothing can spend a bond before its lock
-    /// height, so the proof it was registered with keeps holding until then.
-    /// The value is a gate, never a weight: a bigger bond buys no more mining
-    /// power.
+    /// Version-1 eligibility for a block with this timestamp: at least
+    /// [`min_mining_bond`], and still locked for at least
+    /// [`min_remaining_bond_lock`] beyond the estimated midstate height (the
+    /// early phase's minimums before [`EARLY_BONDS_UNTIL`], the full ones
+    /// from it). Nothing can spend a bond before its lock height, so the
+    /// proof it was registered with keeps holding until then. The value is a
+    /// gate, never a weight: a bigger bond buys no more mining power.
+    ///
+    /// Once false, never true again at a later timestamp: the estimated
+    /// height only rises, and the early minimums are at most the full ones
+    /// (checked at compile time, [`BondRules::early_phase_asks_less`]).
     pub fn eligible_at(&self, block_timestamp: u64) -> bool {
         eligible(self.value, self.bonded_until, block_timestamp)
     }
 }
 
 fn eligible(value: u64, bonded_until: u64, block_timestamp: u64) -> bool {
-    value >= MIN_MINING_BOND
-        && bonded_until
-            >= est_midstate_height(block_timestamp).saturating_add(MIN_REMAINING_BOND_LOCK)
+    BOND_RULES.eligible(value, bonded_until, block_timestamp)
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────
@@ -564,8 +672,11 @@ impl BondSet {
     /// smallest timestamp the next block may carry, and returns them in id
     /// order. Timestamps must exceed the median of the last eleven, and that
     /// median never falls, so no later block on this chain could be
-    /// authorised by them either: removing them changes nothing but the size
-    /// of the set.
+    /// authorised by them either (eligibility only runs down with time, the
+    /// end of the early phase included: see [`Bond::eligible_at`]): removing
+    /// them changes nothing but the size of the set. Early-phase bonds below
+    /// the full minimums leave at the first block that cannot be stamped
+    /// before [`EARLY_BONDS_UNTIL`].
     pub fn prune_expired(&mut self, earliest_timestamp: u64) -> Vec<([u8; 32], BondEntry)> {
         let mut expired: Vec<([u8; 32], BondEntry)> = self
             .entries
@@ -1240,16 +1351,17 @@ pub fn rebuild_work_floor(
 }
 
 /// The cheap, stateful checks on a block's registrations, run before any
-/// header's proof of work: not already registered, at least the minimum bond,
-/// eligible at the block's time (a bond that could never sign is not worth
-/// the space, and one already pruned could otherwise come back), and locked
-/// no further out than `MAX_BOND_HORIZON`.
+/// header's proof of work: not already registered, at least the minimum bond
+/// at the block's time, eligible at the block's time (a bond that could
+/// never sign is not worth the space, and one already pruned could otherwise
+/// come back), and locked no further out than `MAX_BOND_HORIZON`.
 pub fn precheck_registrations(
     bonds: &BondSet,
     registrations: &[BondRegistration],
     block_timestamp: u64,
 ) -> Result<()> {
     let horizon = est_midstate_height(block_timestamp).saturating_add(MAX_BOND_HORIZON);
+    let min_bond = min_mining_bond(block_timestamp);
     for registration in registrations {
         let id = registration.bond_id();
         if bonds.contains_key(&id) {
@@ -1259,12 +1371,17 @@ pub fn precheck_registrations(
             registration.proof.coin.value,
             registration.proof.coin.script.bonded_until,
         );
-        if value < MIN_MINING_BOND {
+        if value < min_bond {
             bail!(
-                "bond {} locks {} units; a mining bond is at least {}",
+                "bond {} locks {} units; a mining bond is at least {}{}",
                 hex::encode(id),
                 value,
-                MIN_MINING_BOND
+                min_bond,
+                if EARLY_BONDS_UNTIL > 0 && !in_early_phase(block_timestamp) {
+                    " now that the early phase is over"
+                } else {
+                    ""
+                }
             );
         }
         if bonded_until > horizon {
@@ -1349,7 +1466,7 @@ mod cap_tests {
         let t = 1_800_000_000;
         let mut bonds = BondSet::default();
         assert!(!any_can_sign(&bonds, t));
-        let edge = est_midstate_height(t) + MIN_REMAINING_BOND_LOCK;
+        let edge = est_midstate_height(t) + min_remaining_bond_lock(t);
         bonds.insert(
             [7; 32],
             BondEntry {
@@ -1421,7 +1538,7 @@ mod cap_tests {
         few.insert(
             [3; 32],
             BondEntry {
-                value: MIN_MINING_BOND / 2,
+                value: min_mining_bond(0) / 2,
                 ..eligible_bond()
             },
         );
@@ -1628,7 +1745,7 @@ mod cap_tests {
                 },
             )
         };
-        let edge = est_midstate_height(t) + MIN_REMAINING_BOND_LOCK;
+        let edge = est_midstate_height(t) + min_remaining_bond_lock(t);
         let mut set: BondSet = (0..20).map(lasting).collect();
         let reversed: BondSet = (0..20).rev().map(lasting).collect();
         assert_eq!(set.root(), reversed.root());
@@ -1698,11 +1815,267 @@ mod cap_tests {
                     .unwrap(),
             },
         };
-        let edge = est_midstate_height(t) + MIN_REMAINING_BOND_LOCK;
+        let edge = est_midstate_height(t) + min_remaining_bond_lock(t);
         let none = BondSet::default();
         precheck_registrations(&none, &[reg(edge)], t).unwrap();
         let err = precheck_registrations(&none, &[reg(edge - 1)], t).unwrap_err();
         assert!(err.to_string().contains("not eligible"), "{err}");
+    }
+
+    /// A bond whose value and lock come from the arguments, locked as long
+    /// as wanted, with nothing else of note.
+    fn entry(value: u64, bonded_until: u64) -> BondEntry {
+        BondEntry {
+            value,
+            bonded_until,
+            ..eligible_bond()
+        }
+    }
+
+    /// The early phase: before `EARLY_BONDS_UNTIL` the early minimums
+    /// decide, from it the full ones. An early bond that falls short of them
+    /// stops counting exactly at the switch, leaves the set with the first
+    /// block that cannot be stamped before it, and cannot be registered any
+    /// more; a full bond carries on as if nothing happened.
+    #[test]
+    fn the_early_phase_ends_at_its_switch() {
+        if EARLY_BONDS_UNTIL == 0 {
+            // A launch without an early phase: the full minimums, always.
+            for t in [0, 1_800_000_000, u64::MAX] {
+                assert!(!in_early_phase(t));
+                assert_eq!(min_mining_bond(t), MIN_MINING_BOND);
+                assert_eq!(min_remaining_bond_lock(t), MIN_REMAINING_BOND_LOCK);
+            }
+            return;
+        }
+        let (last, first) = (EARLY_BONDS_UNTIL - 1, EARLY_BONDS_UNTIL);
+        assert!(in_early_phase(last) && !in_early_phase(first));
+        assert_eq!(min_mining_bond(last), EARLY_MIN_MINING_BOND);
+        assert_eq!(min_mining_bond(first), MIN_MINING_BOND);
+        assert_eq!(min_remaining_bond_lock(last), EARLY_MIN_REMAINING_BOND_LOCK);
+        assert_eq!(min_remaining_bond_lock(first), MIN_REMAINING_BOND_LOCK);
+
+        // Small but long-locked; full-sized but locked only as long as the
+        // early phase asks; full on both counts.
+        let small = entry(EARLY_MIN_MINING_BOND, u64::MAX);
+        let short = entry(
+            MIN_MINING_BOND,
+            est_midstate_height(last) + EARLY_MIN_REMAINING_BOND_LOCK,
+        );
+        let full = entry(
+            MIN_MINING_BOND,
+            est_midstate_height(first) + MIN_REMAINING_BOND_LOCK,
+        );
+        for e in [&small, &short, &full] {
+            assert!(e.eligible_at(last), "{e:?} counts in the early phase");
+        }
+        assert!(full.eligible_at(first));
+        assert_eq!(
+            small.eligible_at(first),
+            EARLY_MIN_MINING_BOND >= MIN_MINING_BOND
+        );
+        assert_eq!(
+            short.eligible_at(first),
+            EARLY_MIN_REMAINING_BOND_LOCK >= MIN_REMAINING_BOND_LOCK
+        );
+
+        // The set: everything stays while the next block may still be
+        // stamped before the switch; the short-falling bonds go once it
+        // cannot.
+        let mut set: BondSet = [(bond_id(1), small), (bond_id(2), short), (bond_id(3), full)]
+            .into_iter()
+            .collect();
+        assert!(set.prune_expired(last).is_empty());
+        let gone: Vec<[u8; 32]> = set
+            .prune_expired(first)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let mut expected = Vec::new();
+        if EARLY_MIN_MINING_BOND < MIN_MINING_BOND {
+            expected.push(bond_id(1));
+        }
+        if EARLY_MIN_REMAINING_BOND_LOCK < MIN_REMAINING_BOND_LOCK {
+            expected.push(bond_id(2));
+        }
+        expected.sort();
+        assert_eq!(gone, expected);
+        assert!(set.contains_key(&bond_id(3)));
+        // Signing follows the same line: a lone early bond can sign the last
+        // early block, and nothing can sign the first one after.
+        let lone: BondSet = [(bond_id(1), small)].into_iter().collect();
+        assert!(any_can_sign(&lone, last));
+        assert_eq!(
+            any_can_sign(&lone, first),
+            EARLY_MIN_MINING_BOND >= MIN_MINING_BOND
+        );
+
+        // Registrations: an early bond registers until the switch, not after.
+        if EARLY_MIN_MINING_BOND < MIN_MINING_BOND {
+            let reg = BondRegistration {
+                proof: BondProof {
+                    coin: BondCoin {
+                        script: BondScript {
+                            mining_key: [1; 32],
+                            bonded_until: est_midstate_height(first)
+                                + MIN_REMAINING_BOND_LOCK,
+                            owner_pk: [2; 32],
+                        },
+                        value: EARLY_MIN_MINING_BOND,
+                        salt: [3; 32],
+                    },
+                    midstate_height: 300_000,
+                    roots: MidstateRoots {
+                        coins: [0; 32],
+                        commitments: [0; 32],
+                        chain_mmr: [0; 32],
+                        burned_wots: None,
+                    },
+                    smt: UtxoAccumulator::from_set([[0; 32]], true)
+                        .prove(&[0; 32], true)
+                        .unwrap(),
+                },
+            };
+            let none = BondSet::default();
+            precheck_registrations(&none, std::slice::from_ref(&reg), last).unwrap();
+            let err = precheck_registrations(&none, &[reg], first)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("early phase is over"), "{err}");
+        }
+    }
+
+    /// Whether, under `rules`, some bond is eligible at a later moment but
+    /// not at an earlier one, over a grid of sizes, locks and moments around
+    /// the rules' switch: the one thing `prune_expired` may never meet.
+    fn eligibility_comes_back(rules: &BondRules) -> Option<String> {
+        let switch = rules.early_until.max(1_792_122_068);
+        let times = [
+            switch - 7 * 86_400,
+            switch - 3_600,
+            switch - 1,
+            switch,
+            switch + 1,
+            switch + 3_600,
+            switch + 40 * 86_400,
+        ];
+        let values = [
+            rules.early_min_bond / 2,
+            rules.early_min_bond,
+            rules.min_bond / 2,
+            rules.min_bond,
+            rules.min_bond * 2,
+        ];
+        let base = est_midstate_height(switch);
+        let locks = [
+            base,
+            base + rules.early_min_lock,
+            base + rules.min_lock,
+            base + rules.min_lock + 20 * 1_440,
+            u64::MAX,
+        ];
+        for &value in &values {
+            for &until in &locks {
+                for (i, &earlier) in times.iter().enumerate() {
+                    for &later in &times[i..] {
+                        if rules.eligible(value, until, later)
+                            && !rules.eligible(value, until, earlier)
+                        {
+                            return Some(format!(
+                                "value {value}, locked until {until}: eligible at {later} but not at {earlier}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Eligibility never comes back: whatever a bond's size and lock, once
+    /// it cannot sign at some time it cannot sign at any later one, across
+    /// the switch too. `prune_expired` depends on it. It holds for this
+    /// build's rules and for any whose early phase asks less; an early phase
+    /// asking more would break it, which is why `types.rs` refuses one.
+    #[test]
+    fn eligibility_only_runs_down_with_time() {
+        let switch = 1_793_404_800;
+        let mainnet = BondRules {
+            min_bond: 1 << 37,
+            min_lock: 43_200,
+            early_until: 0,
+            early_min_bond: 1 << 37,
+            early_min_lock: 43_200,
+        };
+        let early = BondRules {
+            early_until: switch,
+            early_min_bond: 1 << 24,
+            early_min_lock: 2_880,
+            ..mainnet
+        };
+        let smaller_only = BondRules {
+            early_min_lock: 43_200,
+            ..early
+        };
+        let shorter_only = BondRules {
+            early_min_bond: 1 << 37,
+            ..early
+        };
+        for rules in [BOND_RULES, mainnet, early, smaller_only, shorter_only] {
+            assert!(rules.early_phase_asks_less());
+            assert_eq!(eligibility_comes_back(&rules), None, "{rules:?}");
+        }
+        for wrong in [
+            BondRules {
+                early_min_bond: 1 << 38,
+                ..early
+            },
+            BondRules {
+                early_min_lock: 43_201,
+                ..early
+            },
+        ] {
+            assert!(!wrong.early_phase_asks_less());
+            assert!(eligibility_comes_back(&wrong).is_some(), "{wrong:?}");
+        }
+    }
+
+    /// The rules on their own: the early minimums decide before the switch
+    /// and the full ones from it, whatever this build was launched with.
+    #[test]
+    fn bond_rules_switch_at_their_early_until() {
+        let switch = 1_793_404_800;
+        let rules = BondRules {
+            min_bond: 1 << 37,
+            min_lock: 43_200,
+            early_until: switch,
+            early_min_bond: 1 << 24,
+            early_min_lock: 2_880,
+        };
+        assert!(rules.in_early_phase(switch - 1) && !rules.in_early_phase(switch));
+        assert_eq!(rules.min_bond_at(switch - 1), 1 << 24);
+        assert_eq!(rules.min_bond_at(switch), 1 << 37);
+        assert_eq!(rules.min_lock_at(switch - 1), 2_880);
+        assert_eq!(rules.min_lock_at(switch), 43_200);
+        let lasting = u64::MAX;
+        assert!(rules.eligible(1 << 24, lasting, switch - 1));
+        assert!(!rules.eligible(1 << 24, lasting, switch), "too small from the switch");
+        let early_lock = est_midstate_height(switch - 1) + 2_880;
+        assert!(rules.eligible(1 << 37, early_lock, switch - 1));
+        assert!(!rules.eligible(1 << 37, early_lock, switch), "too short from the switch");
+        let full_lock = est_midstate_height(switch) + 43_200;
+        assert!(rules.eligible(1 << 37, full_lock, switch - 1));
+        assert!(rules.eligible(1 << 37, full_lock, switch));
+        // Without an early phase the full rules hold from the start.
+        let none = BondRules {
+            early_until: 0,
+            ..rules
+        };
+        assert!(!none.in_early_phase(0));
+        assert!(!none.eligible(1 << 24, lasting, switch - 1));
+        // This build's rules are what its launch parameters say.
+        assert_eq!(BOND_RULES.min_bond, crate::core::types::LAUNCH_MIN_MINING_BOND);
+        assert_eq!(BOND_RULES.early_until, crate::core::types::LAUNCH_EARLY_BONDS_UNTIL);
     }
 
     #[test]
@@ -1960,32 +2333,41 @@ mod tests {
     /// the reason `types.rs` refuses the worst of them at compile time.
     #[test]
     fn bond_parameters_stay_usable() {
-        assert_eq!(
-            MIN_MINING_BOND.count_ones(),
-            1,
-            "a bond is one midstate coin, and coin values are powers of two"
-        );
-        assert!(MIN_MINING_BOND >= 1 << 20, "a bond has to cost something");
-        assert!(
-            MIN_REMAINING_BOND_LOCK >= 24 * 60,
-            "the unbonding delay must outlast a reorg"
-        );
-        // Eligibility follows whatever this build was given, both ways.
-        let t = 1_800_000_000;
-        let bond = Bond {
-            id: [0; 32],
-            mining_key: [0x11; 32],
-            value: MIN_MINING_BOND,
-            bonded_until: est_midstate_height(t) + MIN_REMAINING_BOND_LOCK,
-            proven_at: 300_000,
-        };
-        assert!(bond.eligible_at(t));
-        assert!(!bond.eligible_at(t + 60), "the lock runs down");
-        assert!(!Bond {
-            value: MIN_MINING_BOND / 2,
-            ..bond
+        for (bond, lock) in [
+            (MIN_MINING_BOND, MIN_REMAINING_BOND_LOCK),
+            (EARLY_MIN_MINING_BOND, EARLY_MIN_REMAINING_BOND_LOCK),
+        ] {
+            assert_eq!(
+                bond.count_ones(),
+                1,
+                "a bond is one midstate coin, and coin values are powers of two"
+            );
+            assert!(bond >= 1 << 20, "a bond has to cost something");
+            assert!(lock >= 24 * 60, "the unbonding delay must outlast a reorg");
         }
-        .eligible_at(t));
+        assert!(
+            BOND_RULES.early_phase_asks_less(),
+            "the early phase asks less, never more"
+        );
+        // Eligibility follows whatever this build was given, both ways, in
+        // whichever phase the moment falls (the day before the switch, if
+        // there is one, and a moment after it).
+        for t in [EARLY_BONDS_UNTIL.max(1_792_122_068) - 86_400, 1_800_000_000] {
+            let bond = Bond {
+                id: [0; 32],
+                mining_key: [0x11; 32],
+                value: min_mining_bond(t),
+                bonded_until: est_midstate_height(t) + min_remaining_bond_lock(t),
+                proven_at: 300_000,
+            };
+            assert!(bond.eligible_at(t));
+            assert!(!bond.eligible_at(t + 60), "the lock runs down");
+            assert!(!Bond {
+                value: min_mining_bond(t) / 2,
+                ..bond
+            }
+            .eligible_at(t));
+        }
     }
 
     #[test]
@@ -1994,8 +2376,8 @@ mod tests {
         let bond = Bond {
             id: [0; 32],
             mining_key: [0x11; 32],
-            value: MIN_MINING_BOND,
-            bonded_until: est_midstate_height(t) + MIN_REMAINING_BOND_LOCK,
+            value: min_mining_bond(t),
+            bonded_until: est_midstate_height(t) + min_remaining_bond_lock(t),
             proven_at: 300_000,
         };
         assert!(bond.eligible_at(t));
@@ -2003,7 +2385,7 @@ mod tests {
         // a bond unbonds, with no state to track.
         assert!(!bond.eligible_at(t + 60));
         assert!(!Bond {
-            value: MIN_MINING_BOND / 2,
+            value: min_mining_bond(t) / 2,
             ..bond
         }
         .eligible_at(t));

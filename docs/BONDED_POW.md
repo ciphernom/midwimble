@@ -209,9 +209,19 @@ the size of the set, and the work of every rule that reads it.
 A block is authorised when its key belongs to a registered bond with:
 
 ```text
-value        >= MIN_MINING_BOND
-bonded_until >= est_midstate_height(block.timestamp) + MIN_REMAINING_BOND_LOCK
+value        >= min_mining_bond(block.timestamp)
+bonded_until >= est_midstate_height(block.timestamp) + min_remaining_bond_lock(block.timestamp)
 ```
+
+The two minimums are `MIN_MINING_BOND` and `MIN_REMAINING_BOND_LOCK`, except
+during an early phase: blocks stamped before `EARLY_BONDS_UNTIL` take
+`EARLY_MIN_MINING_BOND` and `EARLY_MIN_REMAINING_BOND_LOCK` instead, which may
+be smaller, never larger (`bond::BondRules`). That is how a network opens as
+a testnet, cheap for anyone to mine, and becomes mainnet in place: from the
+switch, the bonds below the full minimums stop counting, and leave the set with
+the first block that cannot be stamped before it. Because the early minimums
+are at most the full ones, a bond's eligibility still only ever runs down with
+time, which is what lets the set forget a bond for good.
 
 where
 
@@ -236,6 +246,7 @@ deterministic from midwimble's chain alone.
 |---|---|---|
 | `MIN_MINING_BOND` | 2^37 units (128 gMDS) | About 9 days of revenue for a miner with 1% of midstate's hashrate (three months at 0.1%): real capital, within a committed miner's reach. It puts 32 gMDS behind every block that counts in full, so once 360 bonds are eligible a day of blocks is backed by 46,080 gMDS. Must be a power of two. A launch parameter (`--min-bond`): a testnet uses 2^24, since nobody will lock real money to test someone else's chain, and the bonded path is exercised just as well by a trivial coin. |
 | `MIN_REMAINING_BOND_LOCK` | 43,200 blocks (30 days) | The effective unbonding delay. Also a launch parameter (`--bond-lock-days`); a testnet uses two days so testers' coins come back quickly. |
+| `EARLY_BONDS_UNTIL`, `EARLY_MIN_MINING_BOND`, `EARLY_MIN_REMAINING_BOND_LOCK` | none, or a time and smaller minimums | An early phase, during which the network is a testnet anyone can mine. Launch parameters (`--early-bonds-until`, `--early-min-bond`, `--early-bond-lock-days`); without one, the full minimums hold from the first block. |
 | `CLOCK_MARGIN` | 10,080 blocks (7 days) | Covers midstate running ahead of its schedule. |
 | `REGISTRATION_WORK_BLOCKS` | 1,440 | A day, in blocks of the registering block's target. |
 | `REGISTRATION_MIN_HEADERS` | 60 | Caps any one header at 1/60 of the requirement. |
@@ -314,11 +325,13 @@ And if every registered bond ever lapses, the chain does not stop. Before
 this rule it would have: only blocks move the relay, so with no bond to sign
 a block, a new bond whose proof is more than about a day past the relay's
 tip could never register. Unsigned blocks relay midstate's headers until a
-new bond can.
+new bond can. The end of an early phase is such a moment if no bond of the
+full size is registered by then: the early bonds lapse together, and the chain
+carries on unsigned until one is.
 
-A producer whose own bond can no longer sign (its lock run down) does not
-hold up its co-bonds: their registrations ride along in its blocks as they
-would beside a registered bond, and they sign.
+A producer whose own bond can no longer sign (lapsed, or retired by the end
+of an early phase) does not hold up its co-bonds: their registrations ride
+along in its blocks as they would beside a registered bond, and they sign.
 
 Only MDS holders mine once a bond is registered, so the 30-day slow start
 doubles as the window to acquire MDS and register, and the launch script's

@@ -544,10 +544,15 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
             };
             out!("script       {}", hex::encode(script.to_bytecode()));
             out!("address      {}", hex::encode(script.address()));
+            let now = midwimble::core::state::current_timestamp();
             out!(
-                "Lock one coin of at least {} gMDS there on midstate. It can mine while more than 30 days of the lock remain.",
-                MIN_MINING_BOND >> 30
+                "Lock one coin of at least {} there on midstate. It can mine while more than {} days of the lock remain.",
+                bond_units(min_mining_bond(now)),
+                min_remaining_bond_lock(now) / 1440
             );
+            for warning in bond_warnings(None, until, now) {
+                out!("{warning}");
+            }
         }
         BondCmd::Register {
             file,
@@ -569,6 +574,25 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
                 salt: key32(&salt, "--salt")?,
             };
             out!("bond coin    {}", hex::encode(coin.coin_id()));
+            let now = midwimble::core::state::current_timestamp();
+            if value < min_mining_bond(now) {
+                anyhow::bail!(
+                    "this coin holds {}; a mining bond needs at least {} now",
+                    bond_units(value),
+                    bond_units(min_mining_bond(now))
+                );
+            }
+            let shortest = est_midstate_height(now) + min_remaining_bond_lock(now);
+            if until < shortest {
+                anyhow::bail!(
+                    "a bond locked until midstate height {until} cannot register: it needs more \
+                     than {} days of its lock left, so a lock until height {shortest} or later",
+                    min_remaining_bond_lock(now) / 1440
+                );
+            }
+            for warning in bond_warnings(Some(value), until, now) {
+                out!("{warning}");
+            }
             let midstate = RpcClient::new(midstate_rpc);
 
             // 1. The proof, taken once, against midstate's tip.
@@ -720,6 +744,51 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
     Ok(())
 }
 
+/// A bond size for people: whole gMDS (2^30 units) where it is that.
+fn bond_units(units: u64) -> String {
+    if units >= 1 << 30 && units % (1 << 30) == 0 {
+        format!("{} gMDS", units >> 30)
+    } else {
+        format!("{units} units ({:.6} gMDS)", units as f64 / (1u64 << 30) as f64)
+    }
+}
+
+/// What someone locking a bond of `value` (when known) until midstate
+/// height `until` should hear, judged at `now`: that the lock is already too
+/// short to mine, or whether the bond keeps counting when the early phase
+/// ends.
+fn bond_warnings(value: Option<u64>, until: u64, now: u64) -> Vec<String> {
+    use midwimble::core::bond::*;
+    let shortest = est_midstate_height(now) + min_remaining_bond_lock(now);
+    if until < shortest {
+        return vec![format!(
+            "warning: a lock until midstate height {until} is already too short to mine: a bond \
+             needs more than {} days of its lock left, so a lock until height {shortest} or later",
+            min_remaining_bond_lock(now) / 1440
+        )];
+    }
+    if !in_early_phase(now) {
+        return Vec::new();
+    }
+    let after = est_midstate_height(EARLY_BONDS_UNTIL) + MIN_REMAINING_BOND_LOCK;
+    let verdict = match (value.map(|v| v < MIN_MINING_BOND), until < after) {
+        (Some(false), false) => return Vec::new(),
+        (None, false) => "this lock is long enough for that; a smaller coin locked here stops counting then",
+        (None | Some(false), true) => "this lock ends too soon for that, so the bond stops counting then",
+        (Some(true), false) => "this coin is too small for that, so the bond stops counting then",
+        (Some(true), true) => {
+            "this coin is too small and its lock ends too soon for that, so the bond stops counting then"
+        }
+    };
+    vec![format!(
+        "note: the early phase ends {}. From then on a bond must hold at least {} and keep more \
+         than {} days of its lock (a lock until midstate height {after} or later): {verdict}.",
+        utc(EARLY_BONDS_UNTIL),
+        bond_units(MIN_MINING_BOND),
+        MIN_REMAINING_BOND_LOCK / 1440
+    )]
+}
+
 /// `YYYY-MM-DD HH:MM UTC` for a Unix timestamp (Hinnant's civil-from-days,
 /// to avoid a date crate for one command).
 fn utc(ts: u64) -> String {
@@ -742,7 +811,10 @@ fn utc(ts: u64) -> String {
 }
 
 fn print_params() {
-    use midwimble::core::bond::{BONDED_MINING_FROM, MIN_MINING_BOND, MIN_REMAINING_BOND_LOCK};
+    use midwimble::core::bond::{
+        BONDED_MINING_FROM, EARLY_BONDS_UNTIL, EARLY_MIN_MINING_BOND,
+        EARLY_MIN_REMAINING_BOND_LOCK, MIN_MINING_BOND, MIN_REMAINING_BOND_LOCK,
+    };
     use midwimble::core::state::calculate_work;
     use midwimble::core::types::{
         count_leading_zeros, network_anchor, ASERT_HALF_LIFE, BITCOIN_BLOCK_HASH,
@@ -791,18 +863,30 @@ fn print_params() {
         ASERT_HALF_LIFE / 3600
     );
     out!("relay fee floor      {MIN_FEE_PER_WEIGHT} units per weight");
+    let bond = |units: u64| {
+        if units >= 1 << 30 {
+            format!("{} gMDS", units >> 30)
+        } else {
+            format!("2^{} units", units.trailing_zeros())
+        }
+    };
     if BONDED_MINING_FROM == u64::MAX {
         out!("bonded mining        optional in this test build (verified when present)");
     } else {
-        let bond = if MIN_MINING_BOND >= 1 << 30 {
-            format!("{} gMDS", MIN_MINING_BOND >> 30)
-        } else {
-            format!("2^{} units", MIN_MINING_BOND.trailing_zeros())
-        };
         out!(
             "bonded mining        every block from height {BONDED_MINING_FROM} that a registered \
-             bond could sign; bonds of at least {bond}, locked {} more days to mine",
+             bond could sign; bonds of at least {}, locked {} more days to mine",
+            bond(MIN_MINING_BOND),
             MIN_REMAINING_BOND_LOCK / 1440
+        );
+    }
+    if EARLY_BONDS_UNTIL > 0 {
+        out!(
+            "early phase          blocks stamped before {} ({EARLY_BONDS_UNTIL}) take bonds of \
+             at least {}, locked {} more days",
+            utc(EARLY_BONDS_UNTIL),
+            bond(EARLY_MIN_MINING_BOND),
+            EARLY_MIN_REMAINING_BOND_LOCK / 1440
         );
     }
     out!("");
@@ -1041,6 +1125,16 @@ fn run(cli: Cli) -> Result<()> {
                 if let (Some(r), Some(carried)) = (r, carried) {
                     r.check_carried(carried, &midwimble::core::types::GENESIS_TARGET)
                         .map_err(|e| anyhow::anyhow!("{}: {e:#}", path.display()))?;
+                }
+                // A bond that cannot sign, or that the end of the early phase
+                // will retire, is worth saying so about before mining starts.
+                if let Some(r) = r {
+                    let coin = &r.proof.coin;
+                    let now = midwimble::core::state::current_timestamp();
+                    for warning in bond_warnings(Some(coin.value), coin.script.bonded_until, now)
+                    {
+                        tracing::warn!("{}: {warning}", path.display());
+                    }
                 }
                 Ok(())
             };
