@@ -4,6 +4,15 @@ This is the launch-day procedure, and the reasoning behind each parameter it
 sets. The emission schedule is fixed in code (`src/core/types.rs`) and does not
 change on launch day; four network-identity values do.
 
+**Mainnet is the testnet.** The network launched with this procedure on
+16 October 2026 as the public testnet (`MIDWIMBLE_TESTNET_V3`) becomes mainnet
+in place on 31 October 2026 at 00:00 UTC, when its early phase ends: blocks
+stamped before then take the testnet's small bond, blocks from then on
+mainnet's. There is no separate `MIDWIMBLE_MAINNET_V1` launch. What happens at
+the switch, and what operators do around it, is in `docs/TESTNET.md`. The rest
+of this document is how any network is launched, and why its parameters are
+what they are.
+
 ## What gets set on launch day
 
 Everything lives in one generated block in `src/core/types.rs`, between
@@ -20,12 +29,17 @@ obviously broken or unfair launch.
 | `LAUNCH_GENESIS_TARGET` | Midstate's live target ÷ expected merged-mining share | The reference hashrate ASERT adjusts around. |
 | `LAUNCH_MIN_MINING_BOND` | 2^37 units (128 gMDS) | What a miner must lock on midstate. A testnet sets it to 2^24 (`--testnet`). |
 | `LAUNCH_MIN_REMAINING_BOND_LOCK` | 43,200 blocks (30 days) | The unbonding delay; two days on a testnet. |
-| `LAUNCH_EARLY_BONDS_UNTIL` | 0, or when an early phase ends (`--early-bonds-until`) | Lets a network open as a testnet and become mainnet in place: blocks stamped before it take the two below instead. |
+| `LAUNCH_EARLY_BONDS_UNTIL` | 0, or when an early phase ends (`--early-bonds-until`) | Lets a network open as a testnet and become mainnet in place: blocks stamped before it take the two below instead. Mainnet's: 2026-10-31 00:00 UTC. |
 | `LAUNCH_EARLY_MIN_MINING_BOND` | 2^24 units during an early phase (`--early-min-bond`) | At most the full bond: a bond's eligibility must only ever run down with time. |
 | `LAUNCH_EARLY_MIN_REMAINING_BOND_LOCK` | 2,880 blocks (2 days) during an early phase (`--early-bond-lock-days`) | At most the full lock, for the same reason. |
 | `LAUNCH_PARAMETERS_SET` | `true` | Until it is, the node warns that it is a devnet build. |
 
 ## The sequence
+
+This is the sequence for a network launched as mainnet from its first block.
+The network that is mainnet took another route: it launched as the testnet,
+from frozen code, and its early phase ending is its mainnet launch
+(`docs/TESTNET.md`, "The switch").
 
 **Two weeks before.** Freeze the code. Run a public testnet from the frozen
 code with a different magic (`--magic MIDWIMBLE_TESTNET_V1`). Announce the
@@ -152,6 +166,7 @@ start from, so the cap does not depend on trusting whoever served it.
 | Slow start | 43,200 blocks (30 days) | linear ramp |
 | Halving | every 2,100,000 blocks | Bitcoin's era length |
 | Bonded mining | from block 1, whenever a registered bond could sign | minimum bond 128 gMDS (2^37 units), a launch parameter; while no bond can sign, blocks are unsigned and count for 1/1,024 of their work |
+| Early phase | blocks stamped before 2026-10-31 00:00 UTC | bonds of 2^24 units, locked 2 more days; mainnet's bond and lock from then on |
 | Relayed midstate headers | midstate's own difficulty, timestamps at most 30 minutes ahead | a fake branch costs real midstate work, more the further it runs ahead |
 | Bond eligibility | more than 30 days of lock left | judged on midwimble's clock, 7-day margin |
 | Fork choice | 4 full-weight blocks a bond a day; no block counts above 1.25× the week's lowest | weight, never validity |

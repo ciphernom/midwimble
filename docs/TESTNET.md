@@ -1,20 +1,45 @@
-# The midwimble testnet
+# The midwimble testnet, which becomes mainnet
 
-A public rehearsal of the real thing, running the code mainnet will run, so
-that its mistakes are made with coins worth nothing.
+The network launched on 16 October 2026 as the testnet (network magic
+`MIDWIMBLE_TESTNET_V3`) **becomes mainnet on 31 October 2026 at 00:00 UTC**,
+the whitepaper's anniversary. Nothing restarts: the chain carries on, and so
+do the coins mined on it, the testnet's included. Mining it before then is how
+early participants get in.
 
-Mainnet is planned for **31 October 2026**, the whitepaper's anniversary. The
-testnet runs from early October until the code is frozen for that.
+What changes at that moment is the bond. Blocks stamped before it are in the
+*early phase*, and take a testnet-sized bond; blocks stamped from it on take
+mainnet's:
+
+| | Smallest bond | Must still be locked for |
+|---|---|---|
+| Early phase (blocks stamped before 2026-10-31 00:00 UTC) | 2^24 units, about 0.016 gMDS | 2 days |
+| Mainnet (from then on) | 2^37 units, 128 gMDS | 30 days |
+
+The rule is in consensus (`EARLY_BONDS_UNTIL` in `src/core/bond.rs`, set by
+the launch parameters) and judged by each block's own timestamp, so every node
+draws the line through the same blocks.
 
 ## What a joiner risks
 
-Almost nothing, by design. Testnet coins are worthless and the chain is thrown
-away when it ends. Mining needs a bond, and bonds are real MDS on midstate
-mainnet — but the testnet's bond is 2^24 units, about 0.016 gMDS, locked for
-two days. Mainnet's is 128 gMDS for thirty.
-
+Very little. Mining needs a bond, and bonds are real MDS on midstate mainnet,
+but the early phase's bond is 2^24 units, locked until a week or so past the
+switch.
 That trade is deliberate: the bonded path is the newest code in the project, so
 it should be exercised by many people, which means it has to be cheap to try.
+
+The coins are another matter: **they are real from 31 October**, so treat the
+wallet as a real one. Write down its recovery phrase (`midwimble wallet
+--wallet <file> phrase`), and if the join script made it before mainnet was
+announced, it is protected by the script's old default password, `testnet`:
+change that (`midwimble wallet --wallet <file> password`, below).
+
+The early phase is also when the chain is cheapest to attack: a bond costs
+almost nothing, so fork choice's cap on what each bond's blocks can count for
+(`docs/BONDED_POW.md`) barely binds, and the history is protected by proof of
+work alone. The slow start keeps the stakes small (about 1,270 coins, an
+eighth of a percent of the supply, are issued before the switch), and a
+checkpoint anchored in midstate after the switch makes the early history final
+(below).
 
 ## Joining
 
@@ -31,13 +56,65 @@ same chain: the genesis commits to the magic, both anchors, the time and the
 target together, so a single wrong value gives a different hash and the script
 stops.
 
+It also refuses a binary whose bond rules differ from the published ones
+(`midwimble params` prints them): the genesis does not commit to those, so a
+build could differ there alone, and would fork off at the switch.
+
 With `--mine` it also walks you through locking the bond and registering it,
 which needs a midstate node running the bonded-mining patch
-(`midstate-bonded-pow.patch`), and your midstate wallet.
+(`midstate-bonded-pow.patch`), and your midstate wallet. During the early
+phase it locks an early-phase bond until just past the switch, so it mines
+until then. To keep mining after the switch, lock a mainnet bond before it:
+
+```sh
+python3 scripts/join_testnet.py --mine --full-bond [--mine-days 30]
+```
+
+That locks 128 gMDS for 30 days plus however long you mean to mine, and asks
+before it does. Registering a bond takes a while (a day of the network's work
+must be buried above its proof, an hour or more of midstate blocks), so do it
+well before the switch. After the switch the script locks a mainnet bond
+anyway, and puts aside an early one that can no longer mine, printing the
+command that spends its coin back once its lock opens.
+
+## Upgrading
+
+The switch is a consensus change: **every node must run a build with the early
+phase before 31 October**. A node on an older build parts from the network at
+the first block stamped after the switch, because the two builds disagree about
+which bonds still count.
+
+```sh
+git pull
+python3 scripts/join_testnet.py [--mine]     # rebuilds, then restart your node with it
+```
+
+The script rebuilds whenever the code or the published parameters changed
+(it used to reuse its first build), and checks the new binary as above. If you
+run a node some other way, rebuild it from the updated repository with
+`scripts/set_launch_params.py` and the values in `scripts/testnet.json`, and
+check that `midwimble params` prints the published genesis block and this
+line:
+
+```text
+early phase          blocks stamped before 2026-10-31 00:00 UTC (1793404800) take bonds of at least 2^24 units, locked 2 more days
+```
+
+**Wallets.** The join script used to protect the wallet it made with the
+password `testnet`. Give it one of your own (the new one is read from
+`MIDWIMBLE_NEW_PASSWORD`, or asked for twice):
+
+```sh
+MIDWIMBLE_PASSWORD=testnet midwimble wallet --wallet ../midwimble-testnet/testnet.mww password
+```
+
+and from then on pass it to the script with `MIDWIMBLE_PASSWORD`. A wallet the
+script makes now asks for a password, and shows its recovery phrase once.
 
 ## What we are trying to learn
 
-The testnet exists to answer questions the unit tests cannot:
+Until the switch, the network exists to answer questions the unit tests
+cannot:
 
 - **Does bonded mining work for strangers?** Everything so far has been one
   machine and one bond. Several independent bonds, registered from different
@@ -46,8 +123,8 @@ The testnet exists to answer questions the unit tests cannot:
   path (`docs/POOL_MERGED_MINING.md`) has only a test behind it. A midstate
   pool merge-mining the testnet is the thing to watch.
 - **Does difficulty settle?** The genesis target is a guess about how much
-  hashrate turns up. ASERT should absorb being wrong; watching it do so tells
-  us how to calibrate mainnet's.
+  hashrate turns up. ASERT should absorb being wrong, and watching it do so is
+  the check: mainnet keeps this target.
 - **Do wallets, syncing and reorgs behave in the wild**, on real networks with
   real latency and nodes that come and go.
 
@@ -110,7 +187,7 @@ the node's rewards. It answers only requests addressed to an IP address or
 The first explorer request after a node starts reads every stored block to
 build its index; after that, each request reads only the blocks that are new.
 
-## Launching it (for whoever starts the testnet)
+## How it was launched
 
 ```sh
 scripts/set_launch_params.py --testnet \
@@ -128,6 +205,13 @@ build from that file, so it must carry the target itself rather than a merge
 share: a share recalculated against midstate's live target would give every
 joiner a different chain.
 
+The early phase came later, when the network was made the mainnet: the same
+values with mainnet's bond (`--min-bond 137438953472 --bond-lock-days 30`) and
+`--early-bonds-until 2026-10-31T00:00:00Z`, the early phase keeping the
+testnet's 2^24 units and two days (`--early-min-bond`,
+`--early-bond-lock-days`). The genesis does not commit to the bond rules, so
+the genesis block, and the chain, stayed the same.
+
 Start a bonded producer before announcing. Its bond's proof must be above
 the genesis's midstate anchor, so take it after setting the parameters
 (`midwimble bond register` with the new build) and start the producer with
@@ -135,9 +219,33 @@ the genesis's midstate anchor, so take it after setting the parameters
 buried, about 60 midstate blocks (an hour) later, while they relay midstate's
 headers; then the bond registers by itself and every block after is signed.
 
-## Ending it
+## The switch
 
-The testnet stops when mainnet's code is frozen, about a week before 31
-October. Bonds unlock on their own two days after they are locked; nothing
-needs winding down. Keep your midstate wallet — the bond coins come back to it
-either way.
+On 31 October 2026 at 00:00 UTC (Unix time 1793404800) the early phase ends.
+For the operators of the network, in order:
+
+1. **Before it.** Announce the date and the upgrade widely, and make sure the
+   seeds, the explorers and every known producer run the new build. Producers
+   who mean to keep mining lock and register a mainnet bond (`--full-bond`)
+   at least a day ahead, so that the chain stays signed through the switch. A
+   pool's node needs one too, its own or a co-bond
+   (`docs/POOL_MERGED_MINING.md`); its miners need nothing new.
+2. **At it.** Nothing to do. The first block stamped at or after the switch
+   can only be signed by a mainnet bond; early-phase bonds stop counting and
+   leave the bond set with the first block that cannot be stamped before it.
+   If no mainnet bond is registered by then, blocks carry on unsigned, each
+   counting for a sliver, until one is: the chain does not stop.
+3. **After it.** Anchor a checkpoint from past the switch in midstate
+   (`midwimble anchor --midstate-rpc ...`, `docs/ANCHORING.md`). The command
+   hands the record to the local node, and nodes pass records on to each
+   other. Once the anchor is 1,000 midstate blocks deep and the chain 100
+   blocks past the checkpoint, every node that has it finalizes it
+   (`docs/PRUNING.md` §3): no reorganisation reaches below it, however much
+   work a competing chain carries, and the early phase's history is settled.
+
+Early bonds' coins stay locked until their lock height, a week or so past the
+switch; spend them back with `midstate wallet spend-script` (the join script
+prints the command).
+
+Mainnet keeps the testnet's network magic, `MIDWIMBLE_TESTNET_V3`, for good:
+every signature commits to it, so it cannot change without a new chain.

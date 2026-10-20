@@ -221,7 +221,8 @@ a testnet, cheap for anyone to mine, and becomes mainnet in place: from the
 switch, the bonds below the full minimums stop counting, and leave the set with
 the first block that cannot be stamped before it. Because the early minimums
 are at most the full ones, a bond's eligibility still only ever runs down with
-time, which is what lets the set forget a bond for good.
+time, which is what lets the set forget a bond for good. Mainnet's early phase
+ends on 2026-10-31 00:00 UTC (`docs/TESTNET.md`).
 
 where
 
@@ -246,7 +247,7 @@ deterministic from midwimble's chain alone.
 |---|---|---|
 | `MIN_MINING_BOND` | 2^37 units (128 gMDS) | About 9 days of revenue for a miner with 1% of midstate's hashrate (three months at 0.1%): real capital, within a committed miner's reach. It puts 32 gMDS behind every block that counts in full, so once 360 bonds are eligible a day of blocks is backed by 46,080 gMDS. Must be a power of two. A launch parameter (`--min-bond`): a testnet uses 2^24, since nobody will lock real money to test someone else's chain, and the bonded path is exercised just as well by a trivial coin. |
 | `MIN_REMAINING_BOND_LOCK` | 43,200 blocks (30 days) | The effective unbonding delay. Also a launch parameter (`--bond-lock-days`); a testnet uses two days so testers' coins come back quickly. |
-| `EARLY_BONDS_UNTIL`, `EARLY_MIN_MINING_BOND`, `EARLY_MIN_REMAINING_BOND_LOCK` | none, or a time and smaller minimums | An early phase, during which the network is a testnet anyone can mine. Launch parameters (`--early-bonds-until`, `--early-min-bond`, `--early-bond-lock-days`); without one, the full minimums hold from the first block. |
+| `EARLY_BONDS_UNTIL`, `EARLY_MIN_MINING_BOND`, `EARLY_MIN_REMAINING_BOND_LOCK` | 2026-10-31 00:00 UTC, 2^24 units, 2,880 blocks | An early phase with a testnet's bond: until it ends, the network is the testnet. Launch parameters (`--early-bonds-until`, `--early-min-bond`, `--early-bond-lock-days`); without one, the full minimums hold from the first block. |
 | `CLOCK_MARGIN` | 10,080 blocks (7 days) | Covers midstate running ahead of its schedule. |
 | `REGISTRATION_WORK_BLOCKS` | 1,440 | A day, in blocks of the registering block's target. |
 | `REGISTRATION_MIN_HEADERS` | 60 | Caps any one header at 1/60 of the requirement. |

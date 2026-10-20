@@ -84,5 +84,8 @@ prints the exact command.
 A bond is eligible only while more than 30 days of its lock remain. The
 rehearsal locks for the minimum term plus a day, so its bond can mine for about
 a day, which is all the rehearsal needs. After that it simply waits out its
-lock. For the real launch, lock a new bond shortly before launch day, with a
-term covering as long as you mean to mine (`midwimble bond address --until`).
+lock. For mainnet, which the testnet becomes when its early phase ends on
+31 October 2026 (`docs/TESTNET.md`), lock a new bond a day or more before
+that, with a term covering as long as you mean to mine
+(`scripts/join_testnet.py --mine --full-bond`, or `midwimble bond address
+--until`).

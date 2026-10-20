@@ -1,13 +1,20 @@
 {
   "_comment": [
-    "The midwimble testnet's parameters. scripts/join_testnet.py builds from",
+    "The midwimble network's parameters. scripts/join_testnet.py builds from",
     "exactly these values and refuses to run unless the binary it produces",
-    "prints genesis_block below, so every joiner is provably on one chain.",
+    "prints genesis_block below and carries the bond rules below, so every",
+    "joiner is provably on one chain.",
     "",
-    "Filled in on testnet launch day by whoever launches it: run",
-    "set_launch_params.py --testnet with the day's anchors, then copy the",
-    "values it wrote (and the genesis block id `midwimble params` prints)",
-    "in here and publish it."
+    "The network opened as the testnet on its launch day and becomes mainnet",
+    "when its early phase ends, at early_bonds_until (Unix seconds,",
+    "2026-10-31 00:00 UTC). Blocks stamped before then take a bond of",
+    "early_min_bond units locked early_bond_lock_days more days; blocks from",
+    "then on take min_bond units locked bond_lock_days more days.",
+    "",
+    "The values from network to seeds were filled in on launch day: run",
+    "set_launch_params.py with the day's anchors, then copy the values it",
+    "wrote (and the genesis block id `midwimble params` prints) in here and",
+    "publish it."
   ],
   "network": "MIDWIMBLE_TESTNET_V3",
   "launched": "2026-10-16",
@@ -19,8 +26,11 @@
   "genesis_time": 1792122068,
   "genesis_target": "000006e4720bffffffffffffffffffffffffffffffffffffffffffffffffff9c",
   "genesis_block": "7c45a2ef9d2f76134fe35f6016ef7df0dfef8d4f29dd5d02d4ae8144a10139b5",
-  "min_bond": 16777216,
-  "bond_lock_days": 2,
+  "min_bond": 137438953472,
+  "bond_lock_days": 30,
+  "early_bonds_until": 1793404800,
+  "early_min_bond": 16777216,
+  "early_bond_lock_days": 2,
   "seeds": [
     "/ip4/134.199.148.215/tcp/9433/p2p/12D3KooWCvjd2SBokjWMH712NXNFWHKr7kJAeBsUQ447LHk7wrzu"
   ],

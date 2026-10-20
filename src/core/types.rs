@@ -137,20 +137,23 @@ const LAUNCH_GENESIS_TIMESTAMP: u64 = 1_792_122_068; // 2026-10-16 03:41 UTC
 const LAUNCH_GENESIS_TARGET: [u8; 32] =
     hex32("000006e4720bffffffffffffffffffffffffffffffffffffffffffffffffff9c");
 
-/// Smallest bond that grants mining eligibility, in midstate base units.
-/// 2^24 units
-pub const LAUNCH_MIN_MINING_BOND: u64 = 16_777_216;
+/// Smallest bond that grants mining eligibility once the early phase is
+/// over, in midstate base units. 2^37 units (128 gMDS)
+pub const LAUNCH_MIN_MINING_BOND: u64 = 137_438_953_472;
 
-/// Midstate blocks a bond must still be locked for to be eligible: the
-/// unbonding delay, 2 day(s).
-pub const LAUNCH_MIN_REMAINING_BOND_LOCK: u64 = 2_880;
+/// Midstate blocks a bond must still be locked for to be eligible once the
+/// early phase is over: the unbonding delay, 30 day(s).
+pub const LAUNCH_MIN_REMAINING_BOND_LOCK: u64 = 43_200;
 
-/// End of an early phase with a smaller bond and a shorter lock: none here,
-/// so every block takes the bond above.
-pub const LAUNCH_EARLY_BONDS_UNTIL: u64 = 0;
+/// End of the early phase (2026-10-31 00:00 UTC). Blocks stamped before it
+/// accept the early bond below, so the network can open as a testnet and
+/// become mainnet without a restart. Zero: no early phase.
+pub const LAUNCH_EARLY_BONDS_UNTIL: u64 = 1_793_404_800;
 
-/// Without an early phase, the same as the bond and lock above.
+/// Smallest bond during the early phase. 2^24 units
 pub const LAUNCH_EARLY_MIN_MINING_BOND: u64 = 16_777_216;
+
+/// The unbonding delay during the early phase, 2 day(s).
 pub const LAUNCH_EARLY_MIN_REMAINING_BOND_LOCK: u64 = 2_880;
 
 /// Set by `scripts/set_launch_params.py`: these are real launch parameters.
