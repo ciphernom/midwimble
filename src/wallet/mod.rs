@@ -362,6 +362,16 @@ impl Wallet {
         Ok(())
     }
 
+    /// Encrypts the file under `password` from now on, and saves it.
+    pub fn change_password(&mut self, password: &str) -> Result<()> {
+        if password.is_empty() {
+            bail!("empty password");
+        }
+        self.password.zeroize();
+        self.password = password.to_string();
+        self.save()
+    }
+
     pub fn mnemonic(&self) -> &str {
         &self.data.mnemonic
     }

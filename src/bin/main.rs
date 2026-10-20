@@ -295,6 +295,9 @@ enum WalletCmd {
     ViewKey,
     /// Print the recovery phrase: anyone who sees it can spend every coin.
     Phrase,
+    /// Change the wallet file's password. The current one is read as usual;
+    /// the new one from MIDWIMBLE_NEW_PASSWORD, or prompted for twice.
+    Password,
     /// Scan new blocks from the node and say what changed: payments
     /// received and confirmed, reorganisations, and payments to this wallet
     /// still waiting in the node's mempool.
@@ -1417,6 +1420,27 @@ fn run(cli: Cli) -> Result<()> {
                     let w = Wallet::open(&path, &password()?)?;
                     eprintln!("Anyone with these words can spend this wallet's coins: write them down and keep them offline.");
                     out!("{}", w.mnemonic());
+                }
+                WalletCmd::Password => {
+                    let mut w = Wallet::open(&path, &password()?)?;
+                    let new = match std::env::var("MIDWIMBLE_NEW_PASSWORD") {
+                        Ok(p) if !p.is_empty() => p,
+                        _ => {
+                            let ask = |prompt: &str| -> Result<String> {
+                                eprint!("{prompt} (input is visible; set MIDWIMBLE_NEW_PASSWORD to avoid this prompt): ");
+                                let mut line = String::new();
+                                std::io::stdin().read_line(&mut line)?;
+                                Ok(line.trim_end_matches(['\r', '\n']).to_string())
+                            };
+                            let first = ask("New wallet password")?;
+                            if first != ask("Again")? {
+                                bail!("the two passwords differ; nothing changed");
+                            }
+                            first
+                        }
+                    };
+                    w.change_password(&new)?;
+                    out!("The wallet at {} now opens with the new password.", path.display());
                 }
                 WalletCmd::Sync => {
                     let mut w = Wallet::open(&path, &password()?)?;
