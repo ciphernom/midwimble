@@ -376,8 +376,15 @@ pub fn build_template_relayed(
     // bond could sign it (checked below).
     let mut registrations: Vec<BondRegistration> = Vec::new();
     let mut not_ready: Option<anyhow::Error> = None;
+    // The producer's own bond can no longer sign at all: its lock has run
+    // down. It is not waiting for anything, so it does not hold up its
+    // co-bonds.
+    let mut retired = false;
     if let Some(b) = bond.filter(|b| !state_after_relay.bonds.contains_key(&b.bond_id)) {
         match &b.registration {
+            // Eligibility only runs down with time (`Bond::eligible_at`): a
+            // bond that cannot sign now never can again.
+            Some(registration) if !registration.eligible_at(timestamp) => retired = true,
             Some(registration) => {
                 let ready = crate::core::bond::precheck_registrations(
                     &state_after_relay.bonds,
@@ -409,8 +416,8 @@ pub fn build_template_relayed(
         }
     }
     // Co-bonds' registrations ride along too, one a block, once the
-    // producer's own bond is on chain. One the chain would refuse is skipped
-    // rather than allowed to stop this producer mining.
+    // producer's own bond is on chain (or can never be). One the chain would
+    // refuse is skipped rather than allowed to stop this producer mining.
     if registrations.is_empty() && not_ready.is_none() {
         if let Some(b) = bond {
             let pending = b
@@ -458,6 +465,11 @@ pub fn build_template_relayed(
         && crate::core::bond::any_can_sign(&next.bonds, timestamp)
     {
         return Err(not_ready.unwrap_or_else(|| match bond {
+            Some(_) if retired => anyhow!(
+                "this producer's mining bond is not eligible at this block's time and never will \
+                 be again (its lock ends too soon); none of its co-bonds can sign, and other \
+                 registered bonds can: lock and register a new bond"
+            ),
             Some(_) => anyhow!(
                 "none of this producer's bonds can sign at this time, and other registered bonds can"
             ),

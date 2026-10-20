@@ -604,6 +604,13 @@ impl BondRegistration {
         self.proof.coin.coin_id()
     }
 
+    /// Whether the bond, once registered, could sign a block stamped
+    /// `block_timestamp` ([`Bond::eligible_at`]).
+    pub fn eligible_at(&self, block_timestamp: u64) -> bool {
+        let coin = &self.proof.coin;
+        eligible(coin.value, coin.script.bonded_until, block_timestamp)
+    }
+
     /// Checks a registration against the midstate headers carried with it
     /// (a bond file's): they link and carry valid proof of work, and the
     /// proof rebuilds the state root of its header among them. Returns the

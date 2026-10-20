@@ -198,19 +198,26 @@ fn proven_producer(seed: u8, proven: u64) -> (MinerBond, BondRegistration) {
 /// schedule: far harder than a registration counts any one header for, and
 /// never in a block's future. Their proofs of work are not real.
 fn stand_in_headers(count: u64, registration: &BondRegistration) -> MidstateHeaders {
+    stand_in_headers_for(count, &[registration])
+}
+
+/// [`stand_in_headers`] committing to several registrations' proofs, each
+/// at its own height.
+fn stand_in_headers_for(count: u64, registrations: &[&BondRegistration]) -> MidstateHeaders {
     let root = RelayEntry::root();
-    let proof = &registration.proof;
     let stamp = |h: u64| midstate_schedule(h) - 30 * 24 * 3_600;
     let headers = (root.height + 1..=root.height + count)
         .map(|h| {
             let target = midstate_target(h, stamp(h - 1));
             let seed = hash(&h.to_le_bytes());
+            let proven = registrations
+                .iter()
+                .find(|r| r.proof.midstate_height == h);
             HeaderLink {
                 post_tx_midstate: hash(&[&seed[..], b"post"].concat()),
-                state_root: if h == proof.midstate_height {
-                    proof.roots.state_root(h).unwrap()
-                } else {
-                    hash(&[&seed[..], b"root"].concat())
+                state_root: match proven {
+                    Some(r) => r.proof.roots.state_root(h).unwrap(),
+                    None => hash(&[&seed[..], b"root"].concat()),
                 },
                 timestamp: stamp(h),
                 target,
@@ -313,6 +320,90 @@ fn when_the_last_bond_lapses_the_chain_carries_on() {
         chain.state.bonds.is_empty(),
         "the lapsed bond has left the set"
     );
+}
+
+/// A registration for a bond coin naming `mining_key`, locked until
+/// `bonded_until` and salted `salt`, proven in a stand-in midstate's state at
+/// height `proven`.
+fn proven_bond(
+    mining_key: [u8; 32],
+    bonded_until: u64,
+    salt: [u8; 32],
+    proven: u64,
+) -> BondRegistration {
+    let coin = BondCoin {
+        script: BondScript {
+            mining_key,
+            bonded_until,
+            owner_pk: [2; 32],
+        },
+        value: MIN_MINING_BOND,
+        salt,
+    };
+    let mut coins = UtxoAccumulator::new();
+    coins.insert(coin.coin_id(), true);
+    BondRegistration {
+        proof: BondProof {
+            coin,
+            midstate_height: proven,
+            roots: MidstateRoots {
+                coins: coins.root(true),
+                commitments: hash(b"commitments"),
+                chain_mmr: hash(b"chain"),
+                burned_wots: Some(hash(b"burned")),
+            },
+            smt: coins.prove(&coin.coin_id(), true).unwrap(),
+        },
+    }
+}
+
+/// A producer whose own bond can no longer sign is not waiting for anything,
+/// so it does not hold up its co-bonds: they register, one a block, and
+/// sign. Here the own bond's lock has run down; the end of the early phase
+/// retires an early bond the same way (`BondRegistration::eligible_at`).
+#[test]
+fn a_retired_bond_does_not_hold_up_its_co_bonds() {
+    let mut chain = Chain::new();
+    let secret = Scalar::from_bytes_mod_order([31; 32]);
+    let key = RistrettoPoint::mul_base(&secret).compress().to_bytes();
+    let root = RelayEntry::root().height;
+    let own = proven_bond(key, est_midstate_height(chain_start()), [31; 32], root + 1);
+    let co = proven_bond(key, locked_long(), [32; 32], root + 2);
+    let run = stand_in_headers_for(64, &[&own, &co]);
+    let mut relay = Relay::genesis();
+    relay
+        .extend(
+            &RelayHeaders {
+                prev: run.prev,
+                headers: run.headers,
+            },
+            chain.next_stamp(),
+        )
+        .unwrap();
+    chain.state.relay = relay;
+    assert!(!own.eligible_at(chain.next_stamp()), "its lock is too short");
+    co.verify(&chain.state.relay, &chain.state.target)
+        .expect("buried under a day of work");
+
+    let producer = MinerBond {
+        secret,
+        bond_id: own.bond_id(),
+        registration: Some(own),
+        midstate: None,
+        co_bonds: vec![CoBond {
+            bond_id: co.bond_id(),
+            registration: Some(co.clone()),
+            midstate: None,
+        }],
+    };
+    let block = chain.template(Some(&producer)).unwrap().batch;
+    assert_eq!(block.registrations, vec![co.clone()]);
+    assert_eq!(block.miner.as_ref().unwrap().bond_id, co.bond_id());
+    chain.apply(&block);
+    assert!(chain.state.bonds.contains_key(&co.bond_id()));
+    let next = chain.template(Some(&producer)).unwrap().batch;
+    assert!(next.registrations.is_empty());
+    assert_eq!(next.miner.as_ref().unwrap().bond_id, co.bond_id());
 }
 
 /// A block that registers a bond is signed: the bond it adds could sign it.

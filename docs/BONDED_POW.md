@@ -316,6 +316,10 @@ a block, a new bond whose proof is more than about a day past the relay's
 tip could never register. Unsigned blocks relay midstate's headers until a
 new bond can.
 
+A producer whose own bond can no longer sign (its lock run down) does not
+hold up its co-bonds: their registrations ride along in its blocks as they
+would beside a registered bond, and they sign.
+
 Only MDS holders mine once a bond is registered, so the 30-day slow start
 doubles as the window to acquire MDS and register, and the launch script's
 default `--merge-share` is 0.25.
