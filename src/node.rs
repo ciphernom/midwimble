@@ -1923,6 +1923,7 @@ impl Node {
             last_progress: Instant::now(),
             headers,
             blocks: None,
+            backed: false,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         self.request_headers();
@@ -1987,7 +1988,17 @@ impl Node {
         let Some(s) = self.sync.as_mut() else { return };
         if s.timed_out(self.config.sync_timeout) {
             // The peer went quiet while we waited on it, not on ourselves.
-            self.abort_sync("timed out", Blame::Strike);
+            // Before its headers weigh what it claimed, that is how a peer
+            // that cannot back its claim stalls us: a strike, and three are a
+            // ban. After, it has backed its claim, and quiet is a slow link
+            // or a busy peer (a one-core seed serving many): it is paused,
+            // not struck, so an honest seed is not banned for being slow.
+            let blame = if s.backed {
+                Blame::Pause
+            } else {
+                Blame::Strike
+            };
+            self.abort_sync("timed out", blame);
             return;
         }
         let session_peer = s.peer;
@@ -2105,6 +2116,10 @@ impl Node {
         s.headers.request = None;
         s.last_progress = Instant::now();
         let step = self.examine_headers(&mut s, chunk);
+        // Resuming, the peer has just shown it still has the stored headers.
+        if matches!(step, HeaderStep::Continue) {
+            s.note_backing();
+        }
         let (height, weight) = (s.peer_height, s.peer_weight);
         self.sync = Some(s);
         match step {
@@ -2288,6 +2303,7 @@ impl Node {
         if let Some(last) = chunk.last() {
             s.headers.verified_weight = last.chain_weight;
         }
+        s.note_backing();
         for x in &chunk {
             let work = crate::core::state::calculate_work(&x.target);
             crate::core::bond::cap_work(&mut s.headers.work_floor, x.height, work);

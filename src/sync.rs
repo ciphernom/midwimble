@@ -325,12 +325,25 @@ pub struct SyncSession {
     pub headers: HeaderSync,
     /// Starts once verified headers outweigh our chain from the fork.
     pub blocks: Option<BlockSync>,
+    /// The peer has backed its claim: the verified headers it served in this
+    /// session, or the stored ones it showed it still has, weigh what it
+    /// claimed. Going quiet after that is a slow link or a busy peer, not a
+    /// lie (`Node::check_sync_timeouts`).
+    pub backed: bool,
     /// Set when the session ends, however it ends, so that its background
     /// work stops instead of competing with the next session's.
     pub cancel: Arc<AtomicBool>,
 }
 
 impl SyncSession {
+    /// Records that the peer has backed its claim, once its verified headers
+    /// weigh what it claimed (the opposite of a lie, `Node::maybe_finish_sync`).
+    pub fn note_backing(&mut self) {
+        if self.headers.verified_weight >= self.peer_weight {
+            self.backed = true;
+        }
+    }
+
     /// Whether to drop the session: its peer has sent nothing for `idle`.
     ///
     /// Time spent on our own work does not count against the peer: a header
@@ -605,8 +618,24 @@ mod tests {
                 request: None,
             },
             blocks,
+            backed: false,
             cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn a_claim_is_backed_once_verified_headers_reach_it() {
+        let mut s = session(false, None, Duration::ZERO);
+        s.headers.verified_weight = 99;
+        s.note_backing();
+        assert!(!s.backed, "one short of the claim of 100");
+        s.headers.verified_weight = 100;
+        s.note_backing();
+        assert!(s.backed);
+        // Once backed, it stays so for the session.
+        s.headers.verified_weight = 0;
+        s.note_backing();
+        assert!(s.backed);
     }
 
     #[test]

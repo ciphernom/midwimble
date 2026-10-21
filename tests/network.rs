@@ -890,3 +890,128 @@ async fn browser_wallets_reach_a_node_over_webrtc() {
     );
     node.stop().await;
 }
+
+/// A seed that is slow to serve blocks is waited for, not banned. Once a
+/// peer's verified headers weigh what it claimed it has backed its claim,
+/// and a session that goes quiet after that is paused, not struck. Three
+/// such timeouts used to ban the peer for as long as the node ran: on the
+/// testnet, that is how nodes could lose the one-core seed they all synced
+/// from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_seed_is_waited_for_not_banned() {
+    use midwimble::network::{Message, Network, NetworkEvent, MAX_GETBATCHES_COUNT};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let producer = TestNode::start_with(
+        Some(WalletKeys::random().address()),
+        vec![],
+        Duration::ZERO,
+        None,
+    )
+    .await;
+    wait_until("the producer to mine", 60, || producer.height() > 30).await;
+    producer.handle.set_mining(None);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let tip = producer.tip();
+
+    let follower =
+        TestNode::start_tuned(None, vec![], Duration::from_millis(250), None, |config| {
+            config.sync_timeout = Duration::from_secs(2);
+            config.sync_cooldown = Duration::from_millis(300);
+        })
+        .await;
+
+    // The seed serves the producer's chain over a link that answers state
+    // and header requests at once, and holds block requests until `serve`.
+    let target: libp2p::Multiaddr = follower.dial_addr().await.parse().unwrap();
+    let mut net = Network::new(
+        libp2p::identity::Keypair::generate_ed25519(),
+        "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+        vec![],
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let seed = net.local_peer_id().to_string();
+    let serve = Arc::new(AtomicBool::new(false));
+    let serving = serve.clone();
+    let source = producer.handle.clone();
+    let task = tokio::spawn(async move {
+        let info = |source: &NodeHandle| {
+            let s = source.state();
+            Message::StateInfo {
+                height: s.height,
+                depth: s.depth,
+                weight: s.weight(),
+                mw_midstate: s.mw_midstate,
+            }
+        };
+        let (mut victim, mut held) = (None, Vec::new());
+        let mut tick = tokio::time::interval(Duration::from_millis(200));
+        loop {
+            tokio::select! {
+                event = net.next_event() => match event {
+                    NetworkEvent::PeerConnected(peer, _) => victim = Some(peer),
+                    NetworkEvent::PeerDisconnected(_) => victim = None,
+                    NetworkEvent::MessageReceived { message, channel: Some(channel), .. } => {
+                        let reply = match message {
+                            Message::GetState => Some(info(&source)),
+                            Message::GetHeaders { start_height, count } => Some(Message::Headers {
+                                start_height,
+                                headers: source.storage().load_headers(start_height, count.min(5000)).unwrap(),
+                            }),
+                            Message::GetBatches { start_height, count } if serving.load(Ordering::SeqCst) => {
+                                Some(Message::Batches {
+                                    start_height,
+                                    batches: source
+                                        .storage()
+                                        .load_batches(start_height, count.min(MAX_GETBATCHES_COUNT), usize::MAX)
+                                        .unwrap(),
+                                })
+                            }
+                            Message::GetBatches { .. } => None,
+                            _ => Some(Message::Pong { nonce: 0 }),
+                        };
+                        match reply {
+                            Some(reply) => net.respond(channel, reply),
+                            None => held.push(channel),
+                        }
+                    }
+                    _ => {}
+                },
+                _ = tick.tick() => match victim {
+                    Some(v) => net.send(v, info(&source)),
+                    None => net.dial_trusted(target.clone()),
+                },
+            }
+        }
+    });
+
+    wait_until("the seed to connect", 20, || {
+        follower.handle.info().peers.contains(&seed)
+    })
+    .await;
+    // Session after session takes its headers and then waits on its blocks
+    // until it times out.
+    wait_until("several sessions to time out", 60, || {
+        follower.stats().sessions >= 4
+    })
+    .await;
+    assert!(
+        follower.handle.info().peers.contains(&seed),
+        "the slow seed was dropped"
+    );
+    assert!(follower.height() < producer.height());
+
+    // When it gets round to the blocks, the follower takes them.
+    serve.store(true, Ordering::SeqCst);
+    wait_until("the follower to sync from the seed", 60, || {
+        follower.tip() == tip
+    })
+    .await;
+
+    task.abort();
+    follower.stop().await;
+    producer.stop().await;
+}
