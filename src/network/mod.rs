@@ -53,7 +53,7 @@ use libp2p::{
 use light_protocol::{
     LightNotification, LightRequest, LightResponse, LIGHT_PROTOCOL, LIGHT_PUSH_PROTOCOL,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -480,6 +480,10 @@ pub struct Network {
     connected_since: HashMap<PeerId, Instant>,
     /// When the log last said a peer seems to have banned this node.
     refusal_noted: HashMap<PeerId, Instant>,
+    /// Connected peers that have identified themselves as midwimble nodes.
+    identified: HashSet<PeerId>,
+    /// Events to hand out before the next swarm event.
+    queued: VecDeque<NetworkEvent>,
 }
 
 impl Network {
@@ -532,6 +536,8 @@ impl Network {
             pending_dials: HashSet::new(),
             connected_since: HashMap::new(),
             refusal_noted: HashMap::new(),
+            identified: HashSet::new(),
+            queued: VecDeque::new(),
         };
         for peer in banned_peers {
             net.bans.ban_for_good(peer, "banned at startup");
@@ -975,8 +981,8 @@ impl Network {
         }
     }
 
-    /// Says, at most every ten minutes per peer, that a peer closed this
-    /// node's connection as soon as it opened.
+    /// Says, at most every ten minutes per peer, that a peer this node
+    /// dialled hung up before identifying itself.
     fn note_refusal(&mut self, peer: PeerId) {
         let now = Instant::now();
         let every = Duration::from_secs(600);
@@ -993,8 +999,8 @@ impl Network {
         }
         self.refusal_noted.insert(peer, now);
         tracing::info!(
-            "{} closed this node's connection as soon as it opened: it may have banned \
-             this node (it says nothing either way), or be full",
+            "{} hung up before saying what it is: it may have banned this node (midstate \
+             nodes refuse the whole subnet of a peer that is not theirs), or be full",
             peer
         );
     }
@@ -1003,6 +1009,9 @@ impl Network {
 
     pub async fn next_event(&mut self) -> NetworkEvent {
         loop {
+            if let Some(event) = self.queued.pop_front() {
+                return event;
+            }
             tokio::select! {
                 Some((peer, stream)) = self.light_incoming.next() => {
                     self.accept_light_stream(peer, stream).await;
@@ -1199,6 +1208,16 @@ impl Network {
                     .add_server(peer_id, Some(info.observed_addr.clone()));
                 listening.sort();
                 listening.dedup();
+                if self.identified.insert(peer_id) {
+                    if let Some(endpoint) = self.connected.get(&peer_id) {
+                        tracing::info!(
+                            "Peer connected: {} via {} (total {})",
+                            peer_id,
+                            endpoint.get_remote_address(),
+                            self.identified.len()
+                        );
+                    }
+                }
                 return Some(NetworkEvent::PeerIdentified {
                     peer: peer_id,
                     dialled,
@@ -1302,11 +1321,13 @@ impl Network {
                 }
                 self.connected.insert(peer_id, endpoint.clone());
                 self.connected_since.insert(peer_id, Instant::now());
-                tracing::info!(
-                    "Peer connected: {} via {} (total {})",
+                // Logged as a peer once it identifies as a midwimble node
+                // (most of what connects is midstate's, or refuses us).
+                tracing::debug!(
+                    "Connection {} {} via {}",
+                    if endpoint.is_dialer() { "to" } else { "from" },
                     peer_id,
-                    remote_addr,
-                    self.connected.len()
+                    remote_addr
                 );
                 let full = if extract_peer_id(&remote_addr).is_some() {
                     remote_addr.to_string()
@@ -1330,6 +1351,7 @@ impl Network {
                 self.pending_dials.remove(&peer_id);
                 if num_established == 0 {
                     let accepted = self.connected.remove(&peer_id).is_some();
+                    let identified = self.identified.remove(&peer_id);
                     let lasted = self.connected_since.remove(&peer_id).map(|t| t.elapsed());
                     self.relay_reservations.remove(&peer_id);
                     if self.light_peers.remove(&peer_id) {
@@ -1355,20 +1377,46 @@ impl Network {
                         Some(e) => format!("closed: {e}"),
                     };
                     let lasted = lasted.unwrap_or_default();
-                    tracing::info!(
-                        "Peer disconnected: {} after {:.1}s ({}, {}) (total {})",
-                        peer_id,
-                        lasted.as_secs_f64(),
-                        if endpoint.is_dialer() {
-                            "dialled by this node"
+                    let who = if endpoint.is_dialer() {
+                        "dialled by this node"
+                    } else {
+                        "it dialled"
+                    };
+                    if identified {
+                        tracing::info!(
+                            "Peer disconnected: {} after {:.1}s ({}, {}) (total {})",
+                            peer_id,
+                            lasted.as_secs_f64(),
+                            who,
+                            how,
+                            self.identified.len()
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Connection with {} closed before it identified, after {:.1}s ({}, {})",
+                            peer_id,
+                            lasted.as_secs_f64(),
+                            who,
+                            how
+                        );
+                    }
+                    if endpoint.is_dialer() && cause.is_some() && !identified {
+                        // It hung up before saying what it is: a midstate node
+                        // that has banned this node, a peer that is full. Not a
+                        // dial failure to the transport, but the address did
+                        // not prove itself either, so the address book counts
+                        // it as one (unchecked addresses go at once).
+                        let addr = endpoint.get_remote_address();
+                        let addr = if extract_peer_id(addr).is_some() {
+                            addr.clone()
                         } else {
-                            "it dialled"
-                        },
-                        how,
-                        self.connected.len()
-                    );
-                    if endpoint.is_dialer() && cause.is_some() && lasted < Duration::from_secs(3) {
-                        self.note_refusal(peer_id);
+                            addr.clone().with(libp2p::multiaddr::Protocol::P2p(peer_id))
+                        };
+                        self.queued
+                            .push_back(NetworkEvent::OutgoingConnectionFailed(addr.to_string()));
+                        if lasted < Duration::from_secs(3) {
+                            self.note_refusal(peer_id);
+                        }
                     }
                     return Some(NetworkEvent::PeerDisconnected(peer_id));
                 }

@@ -1304,3 +1304,132 @@ async fn a_slow_seed_is_waited_for_not_banned() {
     follower.stop().await;
     producer.stop().await;
 }
+
+/// A peer this node dials that hangs up before identifying itself (a midstate
+/// node that has banned this node's subnet, a peer that is full) counts as a
+/// failed dial, so an unchecked address is not dialled again and again. Its
+/// connection opened, so the transport had reported nothing. A peer that
+/// identified, and then went, counts as nothing of the kind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_hangs_up_before_identifying_counts_as_a_failed_dial() {
+    use futures::StreamExt;
+    use libp2p::swarm::{dummy, SwarmEvent};
+    use libp2p::{noise, tcp, yamux, Multiaddr};
+    use midwimble::network::{Network, NetworkEvent};
+
+    init_logging();
+    let mut net = Network::new(
+        libp2p::identity::Keypair::generate_ed25519(),
+        "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+        vec![],
+        Default::default(),
+    )
+    .await
+    .unwrap();
+
+    // Accepts a connection and closes it at once, saying nothing.
+    let mut refuser = libp2p::SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )
+        .unwrap()
+        .with_behaviour(|_| dummy::Behaviour)
+        .unwrap()
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build();
+    refuser
+        .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .unwrap();
+    let refuser_id = *refuser.local_peer_id();
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel::<Multiaddr>();
+    let refusing = tokio::spawn(async move {
+        let mut addr_tx = Some(addr_tx);
+        loop {
+            match refuser.select_next_some().await {
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    if let Some(tx) = addr_tx.take() {
+                        let _ = tx.send(address);
+                    }
+                }
+                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    let _ = refuser.disconnect_peer_id(peer_id);
+                }
+                _ => {}
+            }
+        }
+    });
+    let refuser_addr = addr_rx
+        .await
+        .unwrap()
+        .with(libp2p::multiaddr::Protocol::P2p(refuser_id));
+
+    // A midwimble peer, which identifies, and later goes away.
+    let mut friend = Network::new(
+        libp2p::identity::Keypair::generate_ed25519(),
+        "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+        vec![],
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let friend_id = friend.local_peer_id();
+    let friend_addr = loop {
+        tokio::select! {
+            _ = friend.next_event() => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                if let Some(a) = friend.listen_addrs().into_iter().find(|a| a.to_string().contains("/tcp/")) {
+                    break a.with(libp2p::multiaddr::Protocol::P2p(friend_id));
+                }
+            }
+        }
+    };
+    let befriending = tokio::spawn(async move {
+        loop {
+            friend.next_event().await;
+        }
+    });
+
+    net.dial_trusted(refuser_addr.clone());
+    net.dial_trusted(friend_addr.clone());
+    let mut failed = Vec::new();
+    let mut identified = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while failed.is_empty() || !identified {
+        let event = tokio::time::timeout_at(deadline, net.next_event())
+            .await
+            .expect("the refusal to count as a failed dial, and the friend to identify");
+        match event {
+            NetworkEvent::OutgoingConnectionFailed(a) => failed.push(a),
+            NetworkEvent::PeerIdentified { peer, dialled, .. } if peer == friend_id => {
+                // Loopback addresses are not routable, so none is kept.
+                assert_eq!(dialled, None);
+                identified = true;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(failed, vec![refuser_addr.to_string()]);
+
+    // The friend goes away: an identified peer's disconnection is not a
+    // failed dial.
+    befriending.abort();
+    let until = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut gone = false;
+    while let Ok(event) = tokio::time::timeout_at(until, net.next_event()).await {
+        match event {
+            NetworkEvent::PeerDisconnected(peer) if peer == friend_id => gone = true,
+            NetworkEvent::OutgoingConnectionFailed(a) => {
+                assert!(
+                    !a.contains(&friend_id.to_string()),
+                    "counted against the friend: {a}"
+                )
+            }
+            _ => {}
+        }
+    }
+    assert!(gone, "the friend's going was noticed");
+    refusing.abort();
+}

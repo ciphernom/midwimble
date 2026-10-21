@@ -150,12 +150,17 @@ for N min", explorers that disagree about a block at the same height.
 - `banned` in `/state` lists the peers this node has banned, why, and for how
   much longer. Bans end, an hour at first and twice as long for each further
   ban of the same peer, up to a day, so a mistaken ban heals by itself.
-- "… closed this node's connection as soon as it opened: it may have banned
-  this node" means the other side is refusing this node. Its own log says why,
-  in a line `Banning peer <this node's peer id> for …: <reason>`.
+- "… hung up before saying what it is: it may have banned this node" means
+  the other side is refusing this node. A midwimble peer's own log says why,
+  in a line `Banning peer <this node's peer id> for …: <reason>`; midstate
+  nodes refuse the whole subnet of any peer that is not one of theirs. Either
+  way the address counts as a failed dial, so an unchecked one is not tried
+  again.
 - "Dropped …: it speaks none of midwimble's protocols (a midstate node?)" is
   harmless. Midstate's nodes share our transports, and the seed shares a
   machine with midstate's bootstrap node; they are kept out for a day each.
+  Connections are logged as peers only once they identify as midwimble
+  nodes; the rest are at debug level.
 - `--peer`s are redialled for as long as they are not connected, so a node
   started while its seed was down finds it when it is back.
 - Once the two sides hear each other, the heavier branch wins and the other
