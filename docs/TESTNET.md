@@ -141,6 +141,30 @@ midwimble node --data-dir ~/midwimble-testnet --listen /ip4/0.0.0.0/tcp/9433 \
 
 The testnet's seed runs on the same host as midstate's bootstrap node.
 
+## When nodes lose each other
+
+A node that cannot hear the others mines a branch of its own, and the chain
+splits. The signs: `"peers": []` (or few) in `/state`, a log warning "No peers
+for N min", explorers that disagree about a block at the same height.
+
+- `banned` in `/state` lists the peers this node has banned, why, and for how
+  much longer. Bans end, an hour at first and twice as long for each further
+  ban of the same peer, up to a day, so a mistaken ban heals by itself.
+- "… closed this node's connection as soon as it opened: it may have banned
+  this node" means the other side is refusing this node. Its own log says why,
+  in a line `Banning peer <this node's peer id> for …: <reason>`.
+- "Dropped …: it speaks none of midwimble's protocols (a midstate node?)" is
+  harmless. Midstate's nodes share our transports, and the seed shares a
+  machine with midstate's bootstrap node; they are kept out for a day each.
+- `--peer`s are redialled for as long as they are not connected, so a node
+  started while its seed was down finds it when it is back.
+- Once the two sides hear each other, the heavier branch wins and the other
+  side reorganises onto it, if it is no more than 1,000 blocks past the split.
+  A node further out than that has to be synced again from scratch, so while
+  a split lasts, the side that will lose should stop mining. Heavier means
+  `weight` in `/state`, not height: under the per-bond cap a branch signed by
+  many bonds outweighs a longer one signed by few.
+
 ## Browser wallets
 
 `web-wallet/` is a wallet that runs in the browser and reaches nodes over

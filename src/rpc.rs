@@ -17,7 +17,7 @@
 //!
 //! | method | path | purpose |
 //! |---|---|---|
-//! | GET | `/state` | tip, supply, peers, sync and mining status |
+//! | GET | `/state` | tip, supply, peers (and those banned), sync and mining status |
 //! | GET | `/blocks/{start}/{count}` | hex-encoded blocks, for wallet scanning |
 //! | GET | `/headers/{start}/{count}` | hex-encoded headers |
 //! | GET | `/utxo/{commitment}` | whether an output is unspent |
@@ -364,6 +364,7 @@ async fn state(AxState(node): AxState<NodeHandle>) -> Json<Value> {
         "kernels": s.kernels.len(),
         "peer_id": info.peer_id,
         "peers": info.peers,
+        "banned": info.banned,
         "listen_addrs": info.listen_addrs,
         "webrtc_addrs": info.webrtc_addrs,
         "syncing": info.syncing,

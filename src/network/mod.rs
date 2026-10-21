@@ -17,10 +17,20 @@
 //!   midstate. Bootstrap is config peers, the Amino DHT rendezvous
 //!   (`amino.rs`), the on-disk address book and PEX.
 //! * WebRTC-direct (browser light clients) is behind the `webrtc` feature.
+//! * Foreign peers are told apart by identify: one that does not list our
+//!   protocol is dropped, banned and forgotten as soon as it identifies, and
+//!   only peers that list it enter Kademlia and the address book
+//!   (`addrbook.rs`), so midstate's nodes, which share transports and often
+//!   machines with ours, are no longer recorded, redialled and handed on.
+//! * Bans end (`bans.rs`), so a mistaken ban of an honest peer heals.
 
+pub mod addrbook;
 pub mod amino;
+pub mod bans;
 pub mod light_protocol;
 pub mod protocol;
+
+pub use bans::BannedPeer;
 
 pub use protocol::{
     Message, MidwimbleCodec, MAX_GETBATCHES_COUNT, MAX_GETHEADERS_COUNT, MIDWIMBLE_PROTOCOL,
@@ -430,6 +440,17 @@ pub enum NetworkEvent {
     RequestFailed(PeerId),
     /// Handshake completed but the peer speaks none of our protocols.
     ProtocolMismatch(PeerId),
+    /// A peer identified itself as a midwimble node. `dialled` is the
+    /// address this node reached it at, if this node dialled it; `listening`
+    /// are the routable addresses the peer says it listens on, unchecked.
+    PeerIdentified {
+        peer: PeerId,
+        dialled: Option<String>,
+        listening: Vec<String>,
+    },
+    /// A peer identified itself and lists none of our protocols: a node of
+    /// another network (midstate's, typically).
+    ForeignPeer(PeerId),
 }
 
 type LightJob = (
@@ -453,8 +474,12 @@ pub struct Network {
     listen_addrs: Vec<Multiaddr>,
     external_addrs: Vec<Multiaddr>,
     subnet_peers: HashMap<IpAddr, HashSet<PeerId>>,
-    pub static_banned_peers: HashSet<PeerId>,
+    bans: bans::Bans,
     pending_dials: HashSet<PeerId>,
+    /// When each connected peer's first connection opened.
+    connected_since: HashMap<PeerId, Instant>,
+    /// When the log last said a peer seems to have banned this node.
+    refusal_noted: HashMap<PeerId, Instant>,
 }
 
 impl Network {
@@ -462,26 +487,20 @@ impl Network {
         keypair: Keypair,
         listen_addr: Multiaddr,
         bootstrap_peers: Vec<Multiaddr>,
-        static_banned_peers: HashSet<PeerId>,
+        banned_peers: HashSet<PeerId>,
     ) -> Result<Self> {
-        Self::with_data_dir(
-            keypair,
-            listen_addr,
-            bootstrap_peers,
-            static_banned_peers,
-            None,
-        )
-        .await
+        Self::with_data_dir(keypair, listen_addr, bootstrap_peers, banned_peers, None).await
     }
 
     /// [`Self::new`], keeping what must outlive a restart in `data_dir`:
     /// with the `webrtc` feature, the certificate whose hash is part of the
-    /// address browser wallets dial.
+    /// address browser wallets dial. `banned_peers` stay banned until the
+    /// node stops; bans made while it runs end ([`Self::ban_peer`]).
     pub async fn with_data_dir(
         keypair: Keypair,
         listen_addr: Multiaddr,
         bootstrap_peers: Vec<Multiaddr>,
-        static_banned_peers: HashSet<PeerId>,
+        banned_peers: HashSet<PeerId>,
         data_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
         tracing::info!("Local peer id: {}", keypair.public().to_peer_id());
@@ -509,9 +528,14 @@ impl Network {
             listen_addrs: Vec::new(),
             external_addrs: Vec::new(),
             subnet_peers: HashMap::new(),
-            static_banned_peers,
+            bans: bans::Bans::default(),
             pending_dials: HashSet::new(),
+            connected_since: HashMap::new(),
+            refusal_noted: HashMap::new(),
         };
+        for peer in banned_peers {
+            net.bans.ban_for_good(peer, "banned at startup");
+        }
 
         net.swarm.listen_on(listen_addr.clone())?;
         if let Some(quic) = tcp_to_quic(&listen_addr) {
@@ -622,7 +646,7 @@ impl Network {
                 e.is_dialer()
                     && !self.light_peers.contains(p)
                     && !self.relay_reservations.contains(p)
-                    && !self.static_banned_peers.contains(p)
+                    && !self.bans.is_banned(p, Instant::now())
             })
             .map(|(p, e)| (*p, e.get_remote_address().clone()))
             .collect();
@@ -763,10 +787,31 @@ impl Network {
             .choose(&mut rand::thread_rng())
     }
 
-    /// Bans a peer for the rest of this session and drops any relay routed
-    /// through it (midstate `drop_relay_reservation`).
-    pub fn ban_peer(&mut self, peer: PeerId) {
-        self.static_banned_peers.insert(peer);
+    pub fn is_connected(&self, peer: &PeerId) -> bool {
+        self.connected.contains_key(peer)
+    }
+
+    /// Whether a dial to `peer` is under way.
+    pub fn is_dialing(&self, peer: &PeerId) -> bool {
+        self.pending_dials.contains(peer)
+    }
+
+    pub fn is_banned(&self, peer: &PeerId) -> bool {
+        self.bans.is_banned(peer, Instant::now())
+    }
+
+    /// The peers banned now, soonest to be heard again first.
+    pub fn banned_peers(&self) -> Vec<BannedPeer> {
+        self.bans.active(Instant::now())
+    }
+
+    /// Bans a peer for `base`, longer if it was banned before
+    /// ([`bans::Bans::ban`]), and returns for how long. Disconnects it,
+    /// takes it out of Kademlia, so that no query dials it, and drops any
+    /// relay routed through it (midstate `drop_relay_reservation`).
+    pub fn ban_peer(&mut self, peer: PeerId, reason: &str, base: Duration) -> Duration {
+        let length = self.bans.ban(peer, reason, base, Instant::now());
+        self.swarm.behaviour_mut().kademlia.remove_peer(&peer);
         if self.relay_reservations.remove(&peer) {
             let circuit = format!("/p2p/{peer}/p2p-circuit");
             self.external_addrs
@@ -775,6 +820,7 @@ impl Network {
                 .retain(|a| !a.to_string().contains(&circuit));
         }
         self.disconnect_peer(peer);
+        length
     }
 
     // ── PEX ─────────────────────────────────────────────────────────────
@@ -908,7 +954,7 @@ impl Network {
             tracing::debug!("Ignoring address without a peer id: {}", addr);
             return;
         };
-        if self.static_banned_peers.contains(&peer)
+        if self.bans.is_banned(&peer, Instant::now())
             || self.connected.contains_key(&peer)
             || peer == *self.swarm.local_peer_id()
             || self.pending_dials.contains(&peer)
@@ -927,6 +973,30 @@ impl Network {
             self.pending_dials.remove(&peer);
             tracing::debug!("Dial {} failed: {}", addr, e);
         }
+    }
+
+    /// Says, at most every ten minutes per peer, that a peer closed this
+    /// node's connection as soon as it opened.
+    fn note_refusal(&mut self, peer: PeerId) {
+        let now = Instant::now();
+        let every = Duration::from_secs(600);
+        if self
+            .refusal_noted
+            .get(&peer)
+            .is_some_and(|t| now.duration_since(*t) < every)
+        {
+            return;
+        }
+        if self.refusal_noted.len() >= 1_000 {
+            self.refusal_noted
+                .retain(|_, t| now.duration_since(*t) < every);
+        }
+        self.refusal_noted.insert(peer, now);
+        tracing::info!(
+            "{} closed this node's connection as soon as it opened: it may have banned \
+             this node (it says nothing either way), or be full",
+            peer
+        );
     }
 
     // ── Event loop ──────────────────────────────────────────────────────
@@ -950,7 +1020,7 @@ impl Network {
     }
 
     async fn accept_light_stream(&mut self, peer: PeerId, stream: libp2p::Stream) {
-        if self.static_banned_peers.contains(&peer) {
+        if self.bans.is_banned(&peer, Instant::now()) {
             let _ = self.swarm.disconnect_peer_id(peer);
             return;
         }
@@ -1084,11 +1154,32 @@ impl Network {
             SwarmEvent::Behaviour(MidwimbleBehaviourEvent::Identify(
                 identify::Event::Received { peer_id, info, .. },
             )) => {
-                // Foreign-network isolation (midstate): only peers speaking our
-                // protocol may populate the address graph.
-                if !info.protocols.iter().any(|p| *p == MIDWIMBLE_PROTOCOL) {
+                // Browser wallets speak only the light protocols; peers whose
+                // connection was refused are on their way out.
+                if self.light_peers.contains(&peer_id) || !self.connected.contains_key(&peer_id) {
                     return None;
                 }
+                // Foreign-network isolation (midstate): only peers speaking our
+                // protocol may populate the address graph. A peer that lists
+                // none of it is a node of another network.
+                if !info.protocols.iter().any(|p| *p == MIDWIMBLE_PROTOCOL) {
+                    return Some(NetworkEvent::ForeignPeer(peer_id));
+                }
+                let with_id = |a: &Multiaddr| {
+                    if extract_peer_id(a).is_some() {
+                        a.clone()
+                    } else {
+                        a.clone().with(libp2p::multiaddr::Protocol::P2p(peer_id))
+                    }
+                };
+                let dialled = self
+                    .connected
+                    .get(&peer_id)
+                    .filter(|e| e.is_dialer())
+                    .map(|e| with_id(e.get_remote_address()))
+                    .filter(is_routable)
+                    .map(|a| a.to_string());
+                let mut listening = Vec::new();
                 for addr in &info.listen_addrs {
                     if addr.to_string().contains("webrtc-direct") {
                         continue;
@@ -1097,11 +1188,22 @@ impl Network {
                         .behaviour_mut()
                         .kademlia
                         .add_address(&peer_id, addr.clone());
+                    let addr = with_id(addr);
+                    if is_routable(&addr) {
+                        listening.push(addr.to_string());
+                    }
                 }
                 self.swarm
                     .behaviour_mut()
                     .autonat
                     .add_server(peer_id, Some(info.observed_addr.clone()));
+                listening.sort();
+                listening.dedup();
+                return Some(NetworkEvent::PeerIdentified {
+                    peer: peer_id,
+                    dialled,
+                    listening,
+                });
             }
             SwarmEvent::Behaviour(MidwimbleBehaviourEvent::Autonat(
                 autonat::Event::StatusChanged { old, new },
@@ -1147,7 +1249,13 @@ impl Network {
                     return None;
                 }
                 self.pending_dials.remove(&peer_id);
-                if self.static_banned_peers.contains(&peer_id) {
+                if let Some(reason) = self.bans.reason(&peer_id, Instant::now()) {
+                    tracing::debug!(
+                        "Refusing {} via {}: banned ({})",
+                        peer_id,
+                        endpoint.get_remote_address(),
+                        reason
+                    );
                     let _ = self.swarm.disconnect_peer_id(peer_id);
                     return None;
                 }
@@ -1187,15 +1295,13 @@ impl Network {
                     let _ = self.swarm.disconnect_peer_id(peer_id);
                     return None;
                 }
+                // Not into Kademlia yet: whatever connects is not known to
+                // speak midwimble until it identifies (above).
                 if is_webrtc {
                     self.light_peers.insert(peer_id);
-                } else {
-                    self.swarm
-                        .behaviour_mut()
-                        .kademlia
-                        .add_address(&peer_id, remote_addr.clone());
                 }
                 self.connected.insert(peer_id, endpoint.clone());
+                self.connected_since.insert(peer_id, Instant::now());
                 tracing::info!(
                     "Peer connected: {} via {} (total {})",
                     peer_id,
@@ -1215,6 +1321,7 @@ impl Network {
                 peer_id,
                 endpoint,
                 num_established,
+                cause,
                 ..
             } => {
                 if peer_id == *self.swarm.local_peer_id() {
@@ -1222,7 +1329,8 @@ impl Network {
                 }
                 self.pending_dials.remove(&peer_id);
                 if num_established == 0 {
-                    self.connected.remove(&peer_id);
+                    let accepted = self.connected.remove(&peer_id).is_some();
+                    let lasted = self.connected_since.remove(&peer_id).map(|t| t.elapsed());
                     self.relay_reservations.remove(&peer_id);
                     if self.light_peers.remove(&peer_id) {
                         self.light_guard.remove_peer(&peer_id).await;
@@ -1237,11 +1345,31 @@ impl Network {
                             }
                         }
                     }
+                    if !accepted {
+                        // Refused when it opened (banned, subnet or inbound
+                        // limits): never reported as connected.
+                        return None;
+                    }
+                    let how = match &cause {
+                        None => "closed by this node".to_string(),
+                        Some(e) => format!("closed: {e}"),
+                    };
+                    let lasted = lasted.unwrap_or_default();
                     tracing::info!(
-                        "Peer disconnected: {} (total {})",
+                        "Peer disconnected: {} after {:.1}s ({}, {}) (total {})",
                         peer_id,
+                        lasted.as_secs_f64(),
+                        if endpoint.is_dialer() {
+                            "dialled by this node"
+                        } else {
+                            "it dialled"
+                        },
+                        how,
                         self.connected.len()
                     );
+                    if endpoint.is_dialer() && cause.is_some() && lasted < Duration::from_secs(3) {
+                        self.note_refusal(peer_id);
+                    }
                     return Some(NetworkEvent::PeerDisconnected(peer_id));
                 }
             }

@@ -201,6 +201,14 @@ Midstate anchors serve as the horizon instead.
   relay, DCUtR hole punching, AutoNAT, peer exchange, and the IPFS-DHT
   rendezvous.
 - **Limits:** connection caps per /24 subnet and on inbound peers.
+- **Address book:** an address is saved only once this node has dialled it
+  and the peer there has identified itself as a midwimble node. Midstate's nodes share our transports
+  and often our machines; one is dropped as soon as it identifies, forgotten,
+  and not dialled or let in for a day. Addresses heard in peer exchange are
+  tried and dropped at their first failure; saved ones survive a few; the
+  operator's `--peer`s are redialled whenever they are not connected.
+- **Bans end:** an hour at first, twice as long for each further ban of the
+  same peer, up to a day. `/state` lists the peers banned now, and why.
 - **Light clients:** a light-client protocol with a reputation-based rate
   limiter.
 - **Dandelion++:** expired stem transactions are aggregated before fluffing.
@@ -249,7 +257,7 @@ The integration tests run real nodes on localhost:
 
 | Test | What it shows |
 |---|---|
-| `network` (8) | gossip sync and a Dandelion++ payment; shallow and deep reorgs; late-joiner sync with restart; resumed sync; multi-peer download; forged-block peers banned |
+| `network` (15; 16 with `webrtc`) | gossip sync and a Dandelion++ payment; shallow and deep reorgs; late-joiner sync with restart; resumed sync; multi-peer download; forged-block and lying peers banned; bans that end and grow; a slow seed waited for, not banned; midstate-style foreign peers kept out; `--peer`s redialled until they are back |
 | `merge_mining` (1) | one search mines both chains against a midstate stand-in built from midstate's own types; merged-mining anchors recorded and verified; a second node syncs the merged-mined chain |
 | `pool` (1) | two auditing miners paid in coinbases; fee to the operator; supply audit holds |
 | `quantum_recovery` (3) | an attacker holding every elliptic-curve secret cannot claim anchored coins while owners can; a genuinely broken commitment binding still cannot inflate a claim; anchoring round trip with chained checkpoints and tamper detection |

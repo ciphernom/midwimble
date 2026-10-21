@@ -77,6 +77,8 @@ const PEERS: TableDefinition<&str, &[u8]> = TableDefinition::new("peers");
 /// Undo records always kept (at least); more if a retained checkpoint needs them.
 pub const UNDO_KEEP: u64 = 1_200;
 const MAX_PEERS_STORED: usize = 500;
+/// The value an address saved as proven carries (`Storage::save_peers`).
+const PROVEN_PEER: &[u8] = &[1];
 
 /// The scalar part of [`State`] (everything except the sets and the MMR).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1305,34 +1307,37 @@ impl Storage {
 
     // ── Address book ────────────────────────────────────────────────────
 
-    pub fn save_peers(&self, addrs: &[String]) -> Result<()> {
+    /// Replaces the saved address book with `proven` (`network::addrbook`):
+    /// addresses where a midwimble peer was reached. Saving used to only add,
+    /// so an address once written (a midstate node's, say) stayed for good.
+    pub fn save_peers(&self, proven: &[String]) -> Result<()> {
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(PEERS)?;
-            for a in addrs.iter().take(MAX_PEERS_STORED) {
-                table.insert(a.as_str(), [].as_slice())?;
+            let old: Vec<String> = table
+                .iter()?
+                .map(|e| e.map(|(k, _)| k.value().to_string()))
+                .collect::<std::result::Result<_, _>>()?;
+            for k in &old {
+                table.remove(k.as_str())?;
             }
-            while table.len()? > MAX_PEERS_STORED as u64 {
-                let first = table.first()?.map(|(k, _)| k.value().to_string());
-                match first {
-                    Some(k) => {
-                        table.remove(k.as_str())?;
-                    }
-                    None => break,
-                }
+            for a in proven.iter().take(MAX_PEERS_STORED) {
+                table.insert(a.as_str(), PROVEN_PEER)?;
             }
         }
         txn.commit()?;
         Ok(())
     }
 
-    pub fn load_peers(&self) -> Result<Vec<String>> {
+    /// The saved address book: each address, with whether it was proven.
+    /// Books saved before addresses were checked come back unproven.
+    pub fn load_peers(&self) -> Result<Vec<(String, bool)>> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(PEERS)?;
         let mut out = Vec::new();
         for entry in table.iter()? {
-            let (k, _) = entry?;
-            out.push(k.value().to_string());
+            let (k, v) = entry?;
+            out.push((k.value().to_string(), v.value() == PROVEN_PEER));
         }
         Ok(out)
     }
@@ -2222,13 +2227,32 @@ mod tests {
     fn peers_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(dir.path()).unwrap();
+        // A book saved by an older version: added to, never trimmed, and
+        // unchecked.
+        {
+            let txn = storage.db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(PEERS).unwrap();
+                table
+                    .insert("/ip4/9.9.9.9/tcp/9333", [].as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        assert_eq!(
+            storage.load_peers().unwrap(),
+            vec![("/ip4/9.9.9.9/tcp/9333".to_string(), false)]
+        );
+        // Saving replaces it.
         storage
             .save_peers(&["/ip4/1.2.3.4/tcp/1".to_string()])
             .unwrap();
         assert_eq!(
             storage.load_peers().unwrap(),
-            vec!["/ip4/1.2.3.4/tcp/1".to_string()]
+            vec![("/ip4/1.2.3.4/tcp/1".to_string(), true)]
         );
+        storage.save_peers(&[]).unwrap();
+        assert!(storage.load_peers().unwrap().is_empty());
     }
 }
 

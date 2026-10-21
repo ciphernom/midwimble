@@ -54,6 +54,7 @@ use crate::finality::{
 };
 use crate::mempool::{Mempool, ReorgCache};
 use crate::miner::{MinedBlock, Miner};
+use crate::network::addrbook::AddressBook;
 use crate::network::amino::{self, AminoHandle};
 use crate::network::light_protocol::{
     LightNotification, LightRequest, LightResponse, LIGHT_BLOCKS_BYTE_LIMIT, MAX_LIGHT_BLOCKS,
@@ -63,7 +64,9 @@ use crate::network::protocol::BATCH_RESPONSE_SOFT_LIMIT;
 use crate::network::protocol::{
     ANCHORS_RESPONSE_SOFT_LIMIT, MAX_ANCHORS_PER_MESSAGE, SNAPSHOT_PART_BYTES,
 };
-use crate::network::{Message, Network, NetworkEvent, MAX_GETBATCHES_COUNT, MAX_GETHEADERS_COUNT};
+use crate::network::{
+    BannedPeer, Message, Network, NetworkEvent, MAX_GETBATCHES_COUNT, MAX_GETHEADERS_COUNT,
+};
 use crate::storage::FinalityInfo;
 use crate::storage::Storage;
 use crate::sync::{
@@ -105,6 +108,15 @@ const STORE_RECORDS_PER_READ: usize = 256;
 /// block requests and one header request outstanding with us.
 const MAX_SERVE_JOBS: usize = 16;
 const MAX_SERVE_JOBS_PER_PEER: usize = MAX_BATCH_REQUESTS_IN_FLIGHT + 2;
+/// How long a misbehaving peer is first banned for (`NodeConfig::ban_duration`;
+/// each further ban doubles it, up to a day: `network::bans`).
+pub const BAN_SECS: u64 = 3600;
+/// How long a peer of another network (a midstate node) is not dialled or
+/// let in again.
+const FOREIGN_BAN: Duration = Duration::from_secs(24 * 3600);
+/// A node with no peers this long says so, and again this often.
+const ALONE_WARN_AFTER: Duration = Duration::from_secs(120);
+const ALONE_WARN_EVERY: Duration = Duration::from_secs(600);
 
 // ── Configuration and handle ────────────────────────────────────────────────
 
@@ -147,6 +159,9 @@ pub struct NodeConfig {
     /// serve it, may not start another session (doubling with each strike;
     /// `sync::SyncRecord`).
     pub sync_cooldown: Duration,
+    /// How long a peer that misbehaves is first banned for; each further ban
+    /// of the same peer lasts twice as long, up to a day (`network::bans`).
+    pub ban_duration: Duration,
     /// A midstate node's RPC (`host:port`), polled for the headers this
     /// node's blocks relay (`core/relay.rs`). Registrations need midstate's
     /// chain relayed, so every producer should set one.
@@ -180,6 +195,7 @@ impl NodeConfig {
             bootstrap_timeout: Duration::from_secs(600),
             sync_timeout: Duration::from_secs(SYNC_TIMEOUT_SECS),
             sync_cooldown: Duration::from_secs(SYNC_COOLDOWN_SECS),
+            ban_duration: Duration::from_secs(BAN_SECS),
             midstate_rpc: None,
             relay_poll: Duration::from_secs(20),
             #[cfg(feature = "fast-mining")]
@@ -208,6 +224,8 @@ pub struct NodeInfo {
     pub sync_stats: SyncStats,
     pub finality: FinalityInfo,
     pub anchors_known: usize,
+    /// Peers banned now, soonest to be heard again first.
+    pub banned: Vec<BannedPeer>,
 }
 
 pub enum Command {
@@ -521,7 +539,10 @@ pub struct Node {
     batch_sources: HashSet<PeerId>,
     miner: Miner,
     mined_rx: mpsc::UnboundedReceiver<MinedBlock>,
-    known_addrs: HashSet<String>,
+    addr_book: AddressBook,
+    /// Since when the node has had no peers, and when it last said so.
+    alone_since: Option<Instant>,
+    alone_warned: Option<Instant>,
     amino: Option<(AminoHandle, mpsc::Receiver<Vec<String>>)>,
     internal_tx: mpsc::UnboundedSender<Internal>,
     internal_rx: mpsc::UnboundedReceiver<Internal>,
@@ -552,6 +573,25 @@ pub struct Node {
     feeder: Option<tokio::task::JoinHandle<()>>,
     snapshot_cache: Option<([u8; 32], Arc<Vec<u8>>)>,
     snapshot_building: Option<[u8; 32]>,
+}
+
+/// "45 min", "2 h", "1 day": how long a ban lasts, for the log.
+fn describe_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if d == Duration::MAX {
+        "as long as this node runs".to_string()
+    } else if secs >= 86_400 && secs % 86_400 == 0 {
+        match secs / 86_400 {
+            1 => "1 day".to_string(),
+            n => format!("{n} days"),
+        }
+    } else if secs >= 3600 && secs % 3600 == 0 {
+        format!("{} h", secs / 3600)
+    } else if secs >= 60 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs} s")
+    }
 }
 
 fn load_or_create_identity(dir: &std::path::Path) -> Result<Keypair> {
@@ -625,7 +665,7 @@ impl Node {
         let (miner, mined_rx) = Miner::new(config.mining_threads);
         let (internal_tx, internal_rx) = mpsc::unbounded_channel();
         let (cmd_tx, commands) = mpsc::unbounded_channel();
-        let known_addrs = storage.load_peers()?.into_iter().collect();
+        let addr_book = AddressBook::new(storage.load_peers()?, &config.bootstrap);
 
         let info = Arc::new(RwLock::new(NodeInfo {
             state: state.clone(),
@@ -641,6 +681,7 @@ impl Node {
             sync_stats: SyncStats::default(),
             finality: storage.finality()?,
             anchors_known: 0,
+            banned: Vec::new(),
         }));
         // Headers the producer's bond files carry, for registrations the
         // relay cannot back yet. A live midstate node's view replaces them.
@@ -689,7 +730,9 @@ impl Node {
             batch_sources: HashSet::new(),
             miner,
             mined_rx,
-            known_addrs,
+            addr_book,
+            alone_since: None,
+            alone_warned: None,
             amino,
             internal_tx,
             internal_rx,
@@ -814,6 +857,7 @@ impl Node {
         info.sync_stats = self.sync_stats.clone();
         info.finality = self.storage.finality().unwrap_or_default();
         info.anchors_known = self.finality.len();
+        info.banned = self.network.banned_peers();
     }
 
     fn cache_state(&mut self) {
@@ -847,16 +891,55 @@ impl Node {
         true
     }
 
+    /// Bans a misbehaving peer for `NodeConfig::ban_duration` (longer if it
+    /// was banned before: `network::bans`) and forgets its addresses.
     fn ban_peer(&mut self, peer: PeerId, reason: &str) {
-        tracing::warn!("Banning peer {}: {}", peer, reason);
+        if self.network.is_banned(&peer) {
+            // Several of its messages can fail at once; one ban is enough.
+            self.network.disconnect_peer(peer);
+            return;
+        }
+        let lasts = self
+            .network
+            .ban_peer(peer, reason, self.config.ban_duration);
+        tracing::warn!(
+            "Banning peer {} for {}: {}",
+            peer,
+            describe_duration(lasts),
+            reason
+        );
+        self.addr_book.forget_peer(&peer);
         // Gone before the session ends, so the next one cannot pick it.
         self.peer_tips.remove(&peer);
-        self.network.ban_peer(peer);
         if self.sync.as_ref().map_or(false, |s| s.peer == peer) {
             // Whatever it made us verify is suspect; do not resume from it.
             let _ = self.storage.clear_sync_headers();
             self.abort_sync("sync peer banned", Blame::None);
         }
+    }
+
+    /// A peer of another network (a midstate node: same transports, often
+    /// the same machine) is dropped, forgotten, and not dialled or let in
+    /// for a day. It did nothing wrong; it is just not ours.
+    fn drop_foreign_peer(&mut self, peer: PeerId) {
+        if self.network.is_banned(&peer) {
+            self.network.disconnect_peer(peer);
+            return;
+        }
+        self.network
+            .ban_peer(peer, "speaks none of our protocols", FOREIGN_BAN);
+        let forgotten = self.addr_book.forget_peer(&peer);
+        self.peer_tips.remove(&peer);
+        tracing::info!(
+            "Dropped {}: it speaks none of midwimble's protocols (a midstate node?); \
+             not dialling it for a day{}",
+            peer,
+            if forgotten > 0 {
+                format!(", and its {forgotten} address(es) are forgotten")
+            } else {
+                String::new()
+            }
+        );
     }
 
     fn respond(&mut self, channel: Option<ResponseChannel<Message>>, msg: Message) {
@@ -884,13 +967,21 @@ impl Node {
             self.network.send(peer, info.clone());
             self.network.send(peer, Message::GetState);
         }
+        // The operator's `--peer`s are kept connected: redialled whenever
+        // they are not (a seed that was restarting when this node started,
+        // or that restarted since).
+        for (addr, peer) in self.addr_book.pinned().to_vec() {
+            if !self.network.is_connected(&peer) {
+                if let Ok(a) = addr.parse() {
+                    self.network.dial_trusted(a);
+                }
+            }
+        }
         if self.network.outbound_peer_count() < TARGET_OUTBOUND_PEERS {
-            use rand::seq::IteratorRandom;
-            let picks: Vec<String> = self
-                .known_addrs
-                .iter()
-                .cloned()
-                .choose_multiple(&mut rand::thread_rng(), 3);
+            let network = &self.network;
+            let picks = self.addr_book.pick(3, |p| {
+                network.is_connected(p) || network.is_dialing(p) || network.is_banned(p)
+            });
             for a in picks {
                 self.network.dial_addr(&a);
             }
@@ -898,13 +989,45 @@ impl Node {
                 self.network.send(peer, Message::GetAddr);
             }
         }
+        self.check_alone();
+    }
+
+    /// Says so when the node has had no peers for a while: it is on a chain
+    /// of its own, and what it mines (or hands its pool and miners to mine)
+    /// is likely to be orphaned when it finds the network again.
+    fn check_alone(&mut self) {
+        if !self.network.connected_peers().is_empty() {
+            if self.alone_warned.is_some() {
+                tracing::info!("Peers again: {}", self.network.connected_peers().len());
+            }
+            self.alone_since = None;
+            self.alone_warned = None;
+            return;
+        }
+        let since = *self.alone_since.get_or_insert_with(Instant::now);
+        let due = self
+            .alone_warned
+            .map_or(true, |t| t.elapsed() >= ALONE_WARN_EVERY);
+        if since.elapsed() >= ALONE_WARN_AFTER && due {
+            self.alone_warned = Some(Instant::now());
+            let (proven, heard) = self.addr_book.counts();
+            tracing::warn!(
+                "No peers for {} min: this node cannot hear the network, and blocks mined on it \
+                 now are likely to be orphaned when it reconnects ({} known and {} unchecked \
+                 addresses, {} pinned, {} peers banned; see `banned` in /state)",
+                since.elapsed().as_secs() / 60,
+                proven,
+                heard,
+                self.addr_book.pinned().len(),
+                self.network.banned_peers().len()
+            );
+        }
     }
 
     async fn maintenance(&mut self) {
         self.network.gc_stale_light_peers().await;
         self.network.maintain_relays();
-        let addrs: Vec<String> = self.known_addrs.iter().cloned().collect();
-        if let Err(e) = self.storage.save_peers(&addrs) {
+        if let Err(e) = self.storage.save_peers(&self.addr_book.to_save()) {
             tracing::debug!("Saving address book failed: {}", e);
         }
         if let Some((handle, _)) = &self.amino {
@@ -1008,7 +1131,7 @@ impl Node {
                 }
                 let _ = respond.send(response);
             }
-            NetworkEvent::PeerConnected(peer, addr) => {
+            NetworkEvent::PeerConnected(peer, _) => {
                 // Browser wallets (WebRTC) speak only the light protocols.
                 // Asking one for its state fails as an unsupported protocol,
                 // which would get it banned on the spot (midstate skips them
@@ -1017,12 +1140,8 @@ impl Node {
                     tracing::info!("Light client connected: {}", peer);
                     return;
                 }
-                let routable = addr
-                    .parse::<Multiaddr>()
-                    .map_or(false, |a| crate::network::is_routable(&a));
-                if routable {
-                    self.known_addrs.insert(addr);
-                }
+                // Its address is written down once it identifies as a
+                // midwimble node (`PeerIdentified`), not before.
                 self.network.send(peer, Message::GetState);
                 self.network.send(peer, Message::GetAddr);
                 self.network.send(peer, Message::GetAnchors);
@@ -1032,14 +1151,24 @@ impl Node {
                 self.peer_unavailable(peer);
             }
             NetworkEvent::RequestFailed(peer) => self.peer_unavailable(peer),
-            NetworkEvent::ProtocolMismatch(peer) => {
+            NetworkEvent::ProtocolMismatch(peer) | NetworkEvent::ForeignPeer(peer) => {
                 if !self.network.is_light_peer(&peer) {
-                    self.ban_peer(peer, "speaks none of our protocols")
+                    self.drop_foreign_peer(peer)
                 }
             }
-            NetworkEvent::OutgoingConnectionFailed(addr) => {
-                self.known_addrs.remove(&addr);
+            NetworkEvent::PeerIdentified {
+                dialled, listening, ..
+            } => {
+                // Where this node reached a midwimble peer is proven; where
+                // a peer says it listens is only heard, until dialled.
+                if let Some(a) = dialled {
+                    self.addr_book.proven(&a);
+                }
+                for a in listening {
+                    self.addr_book.heard(&a);
+                }
             }
+            NetworkEvent::OutgoingConnectionFailed(addr) => self.addr_book.dial_failed(&addr),
         }
     }
 
@@ -1133,7 +1262,7 @@ impl Node {
                             if need {
                                 self.network.dial_addr(&a);
                             }
-                            self.known_addrs.insert(a);
+                            self.addr_book.heard(&a);
                         }
                     }
                 }
@@ -2780,9 +2909,7 @@ impl Node {
         }
         self.sync = Some(s);
         if let Some((peer, e)) = ban_other {
-            tracing::warn!("Banning peer {}: served an invalid block ({})", peer, e);
-            self.peer_tips.remove(&peer);
-            self.network.ban_peer(peer);
+            self.ban_peer(peer, &format!("served an invalid block ({e})"));
         }
         match fatal {
             Some((true, e)) => {
@@ -3615,7 +3742,7 @@ async fn bootstrap_from_checkpoint(
                                 }
                                 Err(fault) => {
                                     tracing::warn!("checkpoint sync: forged anchor from {}: {}", peer, fault);
-                                    network.ban_peer(peer);
+                                    network.ban_peer(peer, "forged anchor", config.ban_duration);
                                 }
                             }
                         }
@@ -3651,7 +3778,7 @@ async fn bootstrap_from_checkpoint(
                             }
                             Err(e) => {
                                 tracing::warn!("checkpoint sync: snapshot from {} rejected: {:#}", peer, e);
-                                network.ban_peer(peer);
+                                network.ban_peer(peer, "served an invalid snapshot", config.ban_duration);
                                 source = None;
                                 parts.clear();
                             }

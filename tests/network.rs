@@ -891,6 +891,294 @@ async fn browser_wallets_reach_a_node_over_webrtc() {
     node.stop().await;
 }
 
+/// A node keeps its `--peer`s: one that is down when the node starts, or that
+/// restarts later, is redialled until it is back. Each failed dial used to
+/// erase the address, and the startup dial was the only one, so a node
+/// started while its seed was restarting never dialled the seed again (on the
+/// testnet, the seed ended up with no peers and mined a branch of its own).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_redials_its_peer_until_it_is_back() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let miner = WalletKeys::random();
+    let start_seed = |reuse: Option<std::sync::Arc<tempfile::TempDir>>| {
+        TestNode::start_tuned(
+            Some(miner.address()),
+            vec![],
+            Duration::from_millis(250),
+            reuse,
+            move |config| config.listen = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap(),
+        )
+    };
+    let seed = start_seed(None).await;
+    let (seed_addr, seed_id) = (seed.dial_addr().await, seed.handle.info().peer_id);
+    wait_until("the seed to mine", 60, || seed.height() >= 3).await;
+    let dir = seed.dir.clone();
+    seed.stop().await;
+
+    // The follower starts while its seed is down.
+    let follower = TestNode::start(None, vec![seed_addr]).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(follower.handle.info().peers.is_empty());
+
+    let seed = start_seed(Some(dir)).await;
+    wait_until("the follower to reach its seed", 30, || {
+        follower.handle.info().peers.contains(&seed_id)
+    })
+    .await;
+    wait_until("the follower to sync", 60, || follower.height() >= 3).await;
+
+    // The seed restarts: the follower sees it go, and dials it again.
+    let dir = seed.dir.clone();
+    seed.stop().await;
+    wait_until("the follower to see its seed go", 30, || {
+        !follower.handle.info().peers.contains(&seed_id)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let seed = start_seed(Some(dir)).await;
+    wait_until("the follower to reach its seed again", 30, || {
+        follower.handle.info().peers.contains(&seed_id)
+    })
+    .await;
+    let height = seed.height() + 2;
+    wait_until("the follower to follow its seed", 60, || {
+        follower.height() >= height
+    })
+    .await;
+
+    follower.stop().await;
+    seed.stop().await;
+}
+
+/// A node of another network that shares our transports (a midstate node,
+/// say: same machines, same code) is dropped as soon as it identifies, and
+/// banned for a day, once; its redials are refused, and it never counts as a
+/// peer. Midwimble peers are not affected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn foreign_peers_are_dropped_once_and_kept_out() {
+    use futures::StreamExt;
+    use libp2p::swarm::SwarmEvent;
+    use libp2p::{identify, noise, tcp, yamux};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let node = TestNode::start(Some(WalletKeys::random().address()), vec![]).await;
+    let target: libp2p::Multiaddr = node.dial_addr().await.parse().unwrap();
+    let friend = TestNode::start(None, vec![node.dial_addr().await]).await;
+    let friend_id = friend.handle.info().peer_id;
+
+    // Midstate's identify, and none of midwimble's protocols.
+    let mut foreign = libp2p::SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )
+        .unwrap()
+        .with_behaviour(|key| {
+            identify::Behaviour::new(identify::Config::new(
+                "/midstate/id/1.0.0".to_string(),
+                key.public(),
+            ))
+        })
+        .unwrap()
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build();
+    let foreign_id = foreign.local_peer_id().to_string();
+    let node_id: libp2p::PeerId = node.handle.info().peer_id.parse().unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let counted = connections.clone();
+    let dialler = tokio::spawn(async move {
+        // It keeps dialling, as a midstate node holding our address does.
+        let mut tick = tokio::time::interval(Duration::from_millis(300));
+        loop {
+            tokio::select! {
+                event = foreign.select_next_some() => {
+                    if let SwarmEvent::ConnectionEstablished { .. } = event {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                _ = tick.tick() => {
+                    if !foreign.is_connected(&node_id) {
+                        let _ = foreign.dial(target.clone());
+                    }
+                }
+            }
+        }
+    });
+
+    let banned_for = |node: &TestNode| {
+        let banned = node.handle.info().banned;
+        let mine: Vec<_> = banned.iter().filter(|b| b.peer == foreign_id).collect();
+        assert!(
+            mine.len() <= 1,
+            "one ban, not one per failed request: {banned:?}"
+        );
+        mine.first().map(|b| (b.reason.clone(), b.seconds_left))
+    };
+    wait_until("the foreign peer to be banned", 20, || {
+        banned_for(&node).is_some()
+    })
+    .await;
+    let (reason, left) = banned_for(&node).unwrap();
+    assert_eq!(reason, "speaks none of our protocols");
+    assert!(left.unwrap() > 23 * 3600, "banned for a day: {left:?}");
+
+    // It keeps knocking, and is refused: never a peer.
+    let after_ban = connections.load(Ordering::SeqCst);
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until {
+        assert!(!node.handle.info().peers.contains(&foreign_id));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        connections.load(Ordering::SeqCst) > after_ban,
+        "it kept dialling (and the node kept refusing it)"
+    );
+    assert!(banned_for(&node).is_some());
+    // The midwimble peer stays.
+    assert!(node.handle.info().peers.contains(&friend_id));
+    assert!(node
+        .handle
+        .info()
+        .banned
+        .iter()
+        .all(|b| b.peer != friend_id));
+
+    dialler.abort();
+    friend.stop().await;
+    node.stop().await;
+}
+
+/// Bans end. A peer banned for misbehaving is let back in when its ban is
+/// over, and banned for twice as long if it misbehaves again. Bans used to
+/// last as long as the node ran, so one mistaken ban of an honest peer, the
+/// seed everyone syncs from say, split the network for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bans_end_and_grow_for_repeat_offenders() {
+    use midwimble::network::{Message, Network, NetworkEvent};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let producer = TestNode::start(Some(WalletKeys::random().address()), vec![]).await;
+    let follower = TestNode::start_tuned(
+        None,
+        vec![producer.dial_addr().await],
+        Duration::from_millis(250),
+        None,
+        |config| {
+            config.ban_duration = Duration::from_secs(3);
+            config.sync_cooldown = Duration::from_millis(300);
+        },
+    )
+    .await;
+    wait_until("the follower to catch up", 60, || {
+        producer.height() > 3 && follower.height() + 1 >= producer.height()
+    })
+    .await;
+
+    // A peer that claims the heaviest chain and answers the follower's
+    // header request with an acknowledgement, which is banned at once. It
+    // dials the follower again whenever it is not connected.
+    let target: libp2p::Multiaddr = follower.dial_addr().await.parse().unwrap();
+    let mut net = Network::new(
+        libp2p::identity::Keypair::generate_ed25519(),
+        "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+        vec![],
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let liar = net.local_peer_id().to_string();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let heard = asked.clone();
+    let task = tokio::spawn(async move {
+        let claim = Message::StateInfo {
+            height: 1_000_000,
+            depth: u128::MAX,
+            weight: u128::MAX,
+            mw_midstate: [0; 32],
+        };
+        let mut victim = None;
+        let mut tick = tokio::time::interval(Duration::from_millis(200));
+        loop {
+            tokio::select! {
+                event = net.next_event() => match event {
+                    NetworkEvent::PeerConnected(peer, _) => victim = Some(peer),
+                    NetworkEvent::PeerDisconnected(_) => victim = None,
+                    NetworkEvent::MessageReceived { message, channel: Some(channel), .. } => {
+                        let reply = match message {
+                            Message::GetState => {
+                                heard.fetch_add(1, Ordering::SeqCst);
+                                claim.clone()
+                            }
+                            _ => Message::Pong { nonce: 0 },
+                        };
+                        net.respond(channel, reply);
+                    }
+                    _ => {}
+                },
+                _ = tick.tick() => match victim {
+                    Some(v) => net.send(v, claim.clone()),
+                    None => net.dial_trusted(target.clone()),
+                },
+            }
+        }
+    });
+
+    let ban_of = |node: &TestNode| {
+        node.handle
+            .info()
+            .banned
+            .into_iter()
+            .find(|b| b.peer == liar)
+    };
+    wait_until("the liar to be banned", 30, || ban_of(&follower).is_some()).await;
+    let ban = ban_of(&follower).unwrap();
+    assert_eq!(ban.reason, "answered a sync request with something else");
+    assert!(ban.seconds_left.unwrap() <= 3, "{ban:?}");
+
+    // While banned it is refused, however often it dials.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let during = asked.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(ban_of(&follower).is_some());
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        during,
+        "a banned peer was let in"
+    );
+
+    // Then the ban ends and it is heard again...
+    wait_until("the liar to be heard again", 30, || {
+        asked.load(Ordering::SeqCst) > during
+    })
+    .await;
+    // ...and, lying again, banned for twice as long.
+    wait_until("the liar to be banned again", 30, || {
+        ban_of(&follower).is_some_and(|b| b.seconds_left.unwrap() > 3)
+    })
+    .await;
+    assert!(ban_of(&follower).unwrap().seconds_left.unwrap() <= 6);
+    // The honest producer was never banned.
+    let producer_id = producer.handle.info().peer_id;
+    assert!(follower
+        .handle
+        .info()
+        .banned
+        .iter()
+        .all(|b| b.peer != producer_id));
+
+    task.abort();
+    follower.stop().await;
+    producer.stop().await;
+}
+
 /// A seed that is slow to serve blocks is waited for, not banned. Once a
 /// peer's verified headers weigh what it claimed it has backed its claim,
 /// and a session that goes quiet after that is paused, not struck. Three
@@ -1002,6 +1290,7 @@ async fn a_slow_seed_is_waited_for_not_banned() {
         follower.handle.info().peers.contains(&seed),
         "the slow seed was dropped"
     );
+    assert!(follower.handle.info().banned.is_empty());
     assert!(follower.height() < producer.height());
 
     // When it gets round to the blocks, the follower takes them.
