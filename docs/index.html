@@ -4,10 +4,254 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#07070a">
-  <meta name="description" content="Midwimble — a private cryptocurrency anchored to Midstate for durable checkpoints and post-quantum recovery.">
-  <title>Midwimble — Private state. Durable anchor.</title>
+  <title>Midwimble: a MimbleWimble privacy chain merge-mined with Midstate</title>
+  <meta name="description" content="Midwimble is a MimbleWimble privacy chain merge-mined with and anchored to Midstate. Hidden amounts, no addresses on chain, view keys, a fixed 1,000,000 coin supply and dormant post-quantum recovery. Mainnet 31 October 2026.">
+  <link rel="canonical" href="https://ciphernom.github.io/midwimble/">
+  <meta name="robots" content="index,follow">
+
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Midwimble">
+  <meta property="og:url" content="https://ciphernom.github.io/midwimble/">
+  <meta property="og:title" content="Midwimble: private money with a place to return to">
+  <meta property="og:description" content="A MimbleWimble privacy chain merge-mined with and anchored to Midstate. Hidden amounts, view keys, 1,000,000 coin cap, dormant post-quantum recovery. Mainnet 31 Oct 2026.">
+  <meta property="og:image" content="https://ciphernom.github.io/midwimble/assets/midwimble-logo.png">
+  <meta property="og:image:alt" content="Midwimble logo">
+
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Midwimble: private money with a place to return to">
+  <meta name="twitter:description" content="A MimbleWimble privacy chain merge-mined with and anchored to Midstate. Mainnet 31 Oct 2026.">
+  <meta name="twitter:image" content="https://ciphernom.github.io/midwimble/assets/midwimble-logo.png">
+
   <link rel="icon" href="assets/midwimble-logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="site.css">
+
+  <style>
+    /* Page-specific additions on top of site.css. Same palette and type. */
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .nav { flex-wrap: wrap; gap: 12px 28px; }
+    .nav nav { flex-wrap: wrap; gap: 8px 22px; }
+
+    .hero { min-height: 640px; }
+    .hero h1 { font-size: clamp(46px, 6.2vw, 84px); }
+
+    .sec {
+      width: min(calc(100% - 40px), var(--max));
+      margin: 0 auto;
+      padding: 100px 0 0;
+      scroll-margin-top: 20px;
+    }
+    .sec .section-head { margin-bottom: 44px; }
+    .sec h3 { font-size: 20px; margin: 0 0 10px; letter-spacing: -.01em; }
+    .sec p, .sec li { color: #c5c1cc; }
+    .sec p.dim, .dim { color: var(--muted); }
+    .sec a:not(.button), .faq a, footer a { color: var(--purple2); }
+    .sec a:not(.button):hover, .faq a:hover { color: var(--text); }
+    code {
+      font: 500 .88em ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: #d8d2e6;
+      background: rgba(167,139,250,.09);
+      border: 1px solid rgba(167,139,250,.14);
+      border-radius: 5px;
+      padding: 1px 5px;
+      overflow-wrap: anywhere;
+    }
+    pre code { background: none; border: 0; padding: 0; color: inherit; font: inherit; }
+
+    .prose { max-width: 760px; }
+    .prose p { font-size: 17px; }
+
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+    .card {
+      padding: 30px;
+      border: 1px solid rgba(255,255,255,.075);
+      background: var(--panel);
+      border-radius: 14px;
+      min-width: 0;
+    }
+    .card .num { display: block; margin-bottom: 18px; }
+    .card p { font-size: 15px; color: var(--muted); margin: 0 0 10px; }
+    .card p:last-child { margin-bottom: 0; }
+    .card ul { padding-left: 18px; margin: 0; color: #c6c2ce; font-size: 15px; }
+    .card li { margin: 6px 0; }
+    .card.green { border-color: rgba(0,255,65,.18); }
+    .card.green .tag { color: var(--green); }
+    .card.purple .tag { color: var(--purple2); }
+    .tag {
+      display: block;
+      margin-bottom: 14px;
+      font: 700 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: .17em;
+    }
+
+    /* Specs table */
+    .specs-wrap {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: linear-gradient(180deg, rgba(139,92,246,.045), rgba(255,255,255,.008));
+      overflow: hidden;
+    }
+    table.specs { width: 100%; border-collapse: collapse; font-size: 15px; }
+    table.specs caption { text-align: left; padding: 0; }
+    table.specs th, table.specs td {
+      padding: 13px 22px;
+      border-bottom: 1px solid rgba(255,255,255,.06);
+      vertical-align: top;
+      text-align: left;
+    }
+    table.specs tr:last-child th, table.specs tr:last-child td { border-bottom: 0; }
+    table.specs th {
+      width: 32%;
+      color: var(--muted);
+      font: 600 12px/1.9 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+    table.specs td { color: #e6e3ec; }
+    table.specs td small { color: var(--muted); }
+
+    .tbc {
+      color: #6f6b78;
+      font: 500 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+      border: 1px dashed rgba(255,255,255,.14);
+      border-radius: 5px;
+      padding: 1px 6px;
+      white-space: nowrap;
+    }
+
+    .note {
+      margin-top: 18px;
+      padding: 16px 20px;
+      border-left: 2px solid var(--purple);
+      background: rgba(139,92,246,.06);
+      border-radius: 0 10px 10px 0;
+      color: #c5c1cc;
+      font-size: 15px;
+    }
+    .note.warn { border-left-color: var(--green); background: rgba(0,255,65,.04); }
+
+    .term {
+      border: 1px solid rgba(167,139,250,.22);
+      background: #08070b;
+      border-radius: 14px;
+      overflow: hidden;
+      min-width: 0;
+    }
+    .term pre { padding: 20px 22px; font-size: 13px; }
+
+    .timeline { list-style: none; padding: 0; margin: 0; border-left: 1px solid var(--line); }
+    .timeline li { position: relative; padding: 0 0 26px 26px; }
+    .timeline li::before {
+      content: ""; position: absolute; left: -6px; top: 7px;
+      width: 9px; height: 9px; border-radius: 50%;
+      background: var(--bg); border: 2px solid var(--purple2);
+    }
+    .timeline li.done::before { border-color: var(--green); background: var(--green); box-shadow: 0 0 12px rgba(0,255,65,.6); }
+    .timeline b { color: var(--text); }
+
+    .steps { counter-reset: s; }
+    .steps .card { position: relative; }
+
+    /* FAQ */
+    .faq { max-width: 860px; }
+    .faq details {
+      border: 1px solid rgba(255,255,255,.075);
+      background: var(--panel);
+      border-radius: 12px;
+      margin-bottom: 10px;
+    }
+    .faq summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 18px 54px 18px 22px;
+      font-weight: 700;
+      position: relative;
+    }
+    .faq summary::-webkit-details-marker { display: none; }
+    .faq summary::after {
+      content: "+";
+      position: absolute; right: 22px; top: 50%;
+      transform: translateY(-50%);
+      color: var(--purple2);
+      font: 700 20px ui-monospace, monospace;
+    }
+    .faq details[open] summary::after { content: "−"; }
+    .faq summary:focus-visible { outline: 2px solid var(--purple2); outline-offset: 2px; border-radius: 12px; }
+    .faq details > div { padding: 0 22px 20px; color: #c5c1cc; }
+    .faq details > div p { margin: 0; }
+
+    .links { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .links a.card { display: block; transition: border-color .15s ease, transform .15s ease; }
+    .links a.card:hover { border-color: rgba(167,139,250,.35); transform: translateY(-1px); }
+    .links .card b { display: block; color: var(--text); margin-bottom: 4px; }
+    .links .card span { color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
+    .links div.card b { display: block; color: var(--text); margin-bottom: 4px; }
+
+    .checkpoint { margin-top: 40px; }
+    footer { flex-wrap: wrap; }
+
+    @media (max-width: 900px) {
+      .grid2, .grid3, .links { grid-template-columns: 1fr; }
+      .sec { padding-top: 80px; }
+    }
+    @media (max-width: 620px) {
+      /* site.css hides all but the last nav link at this width; keep them all, scrollable. */
+      .nav { min-height: 0; padding: 18px 0 6px; }
+      .nav nav {
+        width: 100%;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        gap: 18px;
+        padding-bottom: 6px;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: none;
+      }
+      .nav nav::-webkit-scrollbar { display: none; }
+      .nav nav a:not(:last-child) { display: inline; }
+      .nav nav a { white-space: nowrap; }
+      .hero { padding-top: 30px; }
+      .hero h1 { font-size: 44px; }
+      .lede { font-size: 18px; }
+      .sec .section-head { margin-bottom: 30px; }
+      .card { padding: 22px; }
+      table.specs th, table.specs td { display: block; width: 100%; padding: 4px 18px; border: 0; }
+      table.specs th { padding-top: 14px; }
+      table.specs tr { display: block; border-bottom: 1px solid rgba(255,255,255,.06); padding-bottom: 12px; }
+      table.specs tr:last-child { border-bottom: 0; }
+      .manifesto { margin-bottom: 40px; }
+    }
+  </style>
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {"@type": "Question", "name": "Is Midwimble part of Midstate?",
+       "acceptedAnswer": {"@type": "Answer", "text": "No. Midwimble is its own chain with its own coin, supply and consensus rules. Nothing is pegged to Midstate and no Midstate coins move into it. It is merge-mined with Midstate (shared hashing) and anchors checkpoints into Midstate for finality and recovery."}},
+      {"@type": "Question", "name": "Do I need Midstate coins to use Midwimble?",
+       "acceptedAnswer": {"@type": "Answer", "text": "Not to hold or send Midwimble. Block producers need a bond locked on Midstate. Pool miners do not, because the pool holds the bonds."}},
+      {"@type": "Question", "name": "Was there a premine or a sale?",
+       "acceptedAnswer": {"@type": "Answer", "text": "There is no premine in the emission code: every coin comes from a block reward, starting from a genesis that could not have been computed before the Bitcoin and Midstate blocks it commits to. There was no sale."}},
+      {"@type": "Question", "name": "Are coins mined on the testnet real?",
+       "acceptedAnswer": {"@type": "Answer", "text": "From 31 October 2026, 00:00 UTC, yes. The testnet becomes mainnet in place and nothing restarts, so coins mined before then carry over."}},
+      {"@type": "Question", "name": "How private is Midwimble?",
+       "acceptedAnswer": {"@type": "Answer", "text": "Amounts are hidden, there are no addresses on chain, and Dandelion++ obscures where a payment started. Which outputs a transaction spends is visible, outputs in one range-proof group are linked, and there is no classic cut-through."}},
+      {"@type": "Question", "name": "What is a view key for?",
+       "acceptedAnswer": {"@type": "Answer", "text": "It lets someone see the payments to your address and their amounts without being able to spend anything, for example an accountant, an auditor or your mining pool."}},
+      {"@type": "Question", "name": "Is Midwimble quantum-safe?",
+       "acceptedAnswer": {"@type": "Answer", "text": "Not in normal operation. Every output carries a dormant hash-based recovery claim and checkpoints are anchored in post-quantum Midstate, so coins could be recovered after a break through a future hard fork."}},
+      {"@type": "Question", "name": "What does release on a pending payment do?",
+       "acceptedAnswer": {"@type": "Answer", "text": "It stops your wallet waiting on that payment and makes the coins spendable again in the wallet. It does not cancel anything on the network: if the transaction was broadcast it can still confirm."}},
+      {"@type": "Question", "name": "Can I speed up or cancel a payment?",
+       "acceptedAnswer": {"@type": "Answer", "text": "Not yet. The mempool is first-seen and does not accept fee-bumped replacements."}},
+      {"@type": "Question", "name": "Why is the pool fee 12.5%?",
+       "acceptedAnswer": {"@type": "Answer", "text": "It is temporary, while Midwimble gets going."}},
+      {"@type": "Question", "name": "Has Midwimble been audited?",
+       "acceptedAnswer": {"@type": "Answer", "text": "No. A cryptographic review of the ownership scheme, the merged-mining proof and the recovery commitments is still to do. Treat it as experimental."}}
+    ]
+  }
+  </script>
 </head>
 <body>
   <div class="noise" aria-hidden="true"></div>
@@ -18,34 +262,41 @@
       <span>midwimble</span>
     </a>
 
-    <nav>
-      <a href="#architecture">Architecture</a>
-      <a href="#status">Status</a>
-      <a href="wallet/">Wallet</a>
+    <nav aria-label="Main">
+      <a href="#overview">Overview</a>
+      <a href="#specs">Specs</a>
+      <a href="#privacy">Privacy</a>
+      <a href="#mining">Mining</a>
+      <a href="#launch">Launch</a>
+      <a href="#get-started">Get started</a>
+      <a href="#faq">FAQ</a>
       <a href="https://github.com/ciphernom/midwimble">GitHub</a>
     </nav>
   </header>
 
   <main id="top">
+
+    <!-- 1. HERO -->
     <section class="hero">
       <div class="hero-copy">
         <div class="eyebrow">PRIVATE STATE · DURABLE ANCHOR</div>
-        <h1>Money can be private<br><span>without forgetting where safety is.</span></h1>
+        <h1>Private money<br><span>with a place to return to.</span></h1>
         <p class="lede">
-          Midwimble is a MimbleWimble-inspired privacy chain that periodically
-          anchors its state into <strong>Midstate</strong> — creating durable
-          checkpoints for recovery, finality and eventually anchored cut-through.
+          Midwimble is a MimbleWimble privacy chain, merge-mined with and
+          anchored to <strong>Midstate</strong>. Amounts are hidden, there are
+          no addresses on chain, and every coin carries a dormant hash-based
+          claim that could recover it if elliptic curves are ever broken.
         </p>
 
         <div class="actions">
-          <a class="button primary" href="https://github.com/ciphernom/midwimble">View the code</a>
-          <a class="button ghost" href="#architecture">How it works</a>
-          <a class="button ghost" href="wallet/">Open the wallet</a>
+          <a class="button primary" href="wallet/">Open the wallet</a>
+          <a class="button ghost" href="#mining">Mine it</a>
+          <a class="button ghost" href="https://github.com/ciphernom/midwimble">Read the code</a>
         </div>
 
         <div class="status-line">
           <span class="dot"></span>
-          <span>Research devnet · Rust · not for real value</span>
+          <span>Mainnet 31 Oct 2026, 00:00 UTC · GPL-3.0 · experimental, not audited</span>
         </div>
       </div>
 
@@ -62,15 +313,16 @@
       <h2>Money should be private by default.</h2>
     </section>
 
-    <section id="architecture" class="architecture">
+    <!-- 2. WHAT IS MIDWIMBLE -->
+    <section id="overview" class="architecture">
       <div class="section-head">
         <div>
-          <span class="kicker">TWO RIVERS</span>
+          <span class="kicker">WHAT IS MIDWIMBLE</span>
           <h2>One flows. One remembers.</h2>
         </div>
         <p>
-          Midwimble handles private economic activity. Midstate provides an
-          external, post-quantum-oriented cryptographic memory.
+          A privacy coin that gets its security from Midstate's miners and its
+          long-term memory from Midstate's post-quantum chain.
         </p>
       </div>
 
@@ -88,19 +340,15 @@
               <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
             </filter>
           </defs>
-
           <path class="river state" d="M20 85 C190 15 310 145 470 85 S770 18 930 85 S1100 145 1180 85"/>
           <path class="river wimble" d="M20 235 C190 305 310 175 470 235 S770 302 930 235 S1100 175 1180 235"/>
-
           <g class="anchors">
             <line x1="310" y1="103" x2="310" y2="217"/>
             <circle cx="310" cy="103" r="8"/>
             <circle cx="310" cy="217" r="8"/>
-
             <line x1="685" y1="72" x2="685" y2="248"/>
             <circle cx="685" cy="72" r="8"/>
             <circle cx="685" cy="248" r="8"/>
-
             <line x1="1010" y1="105" x2="1010" y2="215"/>
             <circle cx="1010" cy="105" r="8"/>
             <circle cx="1010" cy="215" r="8"/>
@@ -109,56 +357,283 @@
         <div class="river-label midwimble-label">MIDWIMBLE</div>
       </div>
 
+      <div class="grid2" style="margin-bottom:55px">
+        <div class="prose">
+          <p>
+            Most blockchains publish every payment forever: who sent it, who
+            got it, and how much. Midwimble doesn't. Amounts are hidden inside
+            cryptographic commitments, and outputs pay one-time keys instead of
+            visible addresses. Anyone can still check that no coins were
+            created out of thin air, because the maths proves the totals
+            balance without showing them.
+          </p>
+          <p>
+            Midwimble is its own chain, with its own coin, its own supply and
+            its own consensus rules. It isn't pegged to Midstate and doesn't
+            move Midstate coins.
+          </p>
+        </div>
+        <div class="prose">
+          <p>
+            <b>Merge-mining.</b> Midstate and Midwimble use the same proof of
+            work, so a Midstate miner can mine both chains with the same
+            hashing, at almost no extra cost.
+          </p>
+          <p>
+            <b>Anchoring.</b> Checkpoints of Midwimble's state are written into
+            Midstate. They give Midwimble a finality floor and a recovery point
+            if its cryptography ever breaks. Midstate needs no changes for
+            either: to a Midstate node an anchor is just an ordinary
+            transaction or a value in a coinbase.
+          </p>
+          <p class="dim">
+            About 23,000 lines of Rust: Midstate's networking and consensus,
+            Pluribit's MimbleWimble transactions (hardened, with an ownership
+            fix), and new code for merged mining, anchoring, recovery and
+            pruning.
+          </p>
+        </div>
+      </div>
+
       <div class="feature-grid">
         <article>
           <span class="num">01</span>
           <h3>Private transactions</h3>
-          <p>
-            Confidential commitments, range proofs, stealth-style outputs and
-            one-time ownership keys are built into the accounting model.
-          </p>
+          <p>Confidential amounts, aggregated range proofs, stealth outputs and one-time owner keys. Only the recipient can spend.</p>
         </article>
-
         <article>
           <span class="num">02</span>
-          <h3>Midstate anchors</h3>
-          <p>
-            Midwimble checkpoints can be committed into Midstate explicitly
-            or through merged mining, without turning Midstate into a privacy chain.
-          </p>
+          <h3>Merge-mined, anchored</h3>
+          <p>Mined alongside Midstate with the same hashing. Checkpoints are committed into Midstate as a transaction or free through merged mining.</p>
         </article>
-
         <article>
           <span class="num">03</span>
           <h3>Dormant recovery</h3>
-          <p>
-            Outputs can carry hidden hash-based recovery commitments that remain
-            unused unless a future cryptographic catastrophe requires migration.
-          </p>
+          <p>Every output carries a hidden hash-based recovery commitment that stays unused unless elliptic curves are ever broken.</p>
         </article>
-
         <article>
           <span class="num">04</span>
-          <h3>Anchored cut-through</h3>
-          <p>
-            The planned pruning model uses finalized Midstate checkpoints as
-            horizons below which old spent history can eventually disappear.
-          </p>
+          <h3>Anchored pruning</h3>
+          <p>Optional: nodes can delete old block bodies below a finalized Midstate checkpoint and bootstrap from a verified snapshot.</p>
         </article>
       </div>
     </section>
 
-    <section class="checkpoint">
+    <!-- 3. KEY SPECS -->
+    <section id="specs" class="sec">
+      <div class="section-head">
+        <div>
+          <span class="kicker">KEY SPECS</span>
+          <h2>The numbers.</h2>
+        </div>
+        <p>Every figure here is fixed in the code (<code>src/core/types.rs</code>) or the published launch parameters. Anyone can check them with <code>midwimble params</code>.</p>
+      </div>
+
+      <div class="specs-wrap">
+        <table class="specs">
+          <caption class="sr-only" style="position:absolute;left:-9999px">Midwimble key specifications</caption>
+          <tbody>
+            <tr><th scope="row">Type</th><td>MimbleWimble privacy chain, merge-mined with and anchored to Midstate. Its own coin, supply and consensus; no peg.</td></tr>
+            <tr><th scope="row">Ticker</th><td><!-- CONFIRM: ticker / unit name. Nothing in the code defines one. --><span class="tbc">to be announced</span></td></tr>
+            <tr><th scope="row">Decimals</th><td>8 <small>(1 coin = 100,000,000 base units)</small></td></tr>
+            <tr><th scope="row">Max supply</th><td>1,000,000 coins, reached exactly</td></tr>
+            <tr><th scope="row">Premine</th><td><!-- CONFIRM: OK to state "no premine, no sale" outright? Verified: all issuance is block rewards (types.rs emission). -->None. Every coin is a block reward.</td></tr>
+            <tr><th scope="row">Block time</th><td>60 seconds (target)</td></tr>
+            <tr><th scope="row">Difficulty</th><td>ASERT, 4-hour half-life, anchored to genesis</td></tr>
+            <tr><th scope="row">Proof of work</th><td>Sequential BLAKE3, 1,000,000 iterations (same as Midstate)</td></tr>
+            <tr><th scope="row">Merge-mining</th><td>With Midstate. Proofs about 220 bytes; no Midstate changes.</td></tr>
+            <tr><th scope="row">Mining requirement</th><td>A bond locked on Midstate: 128 gMDS (2<sup>37</sup> units) with 30 days of lock left, from 31 Oct 2026</td></tr>
+            <tr><th scope="row">Block reward</th><td>Ramps up over the first 30 days, then 0.23932616 per block</td></tr>
+            <tr><th scope="row">Halving</th><td>Every 2,100,000 blocks (about 4 years). First around 13 Oct 2030.</td></tr>
+            <tr><th scope="row">End of issuance</th><td>About block 49.7 million (around 2121); fees only after that</td></tr>
+            <tr><th scope="row">Coinbase maturity</th><td>100 blocks</td></tr>
+            <tr><th scope="row">Transactions</th><td>Pedersen commitments on Ristretto255, aggregated Bulletproofs, stealth one-time owner keys</td></tr>
+            <tr><th scope="row">Addresses</th><td>Bech32, prefix <code>mw</code>, v1: scan key + spend key + post-quantum recovery key</td></tr>
+            <tr><th scope="row">Propagation</th><td>Dandelion++ <small>(being hardened)</small></td></tr>
+            <tr><th scope="row">Min relay fee</th><td>100 base units per weight unit (node policy). A typical payment: 0.000046 coins.</td></tr>
+            <tr><th scope="row">Block / tx limit</th><td>40,000 / 10,000 weight units</td></tr>
+            <tr><th scope="row">Finality</th><td>100 blocks after a checkpoint anchored with 1,000 Midstate confirmations</td></tr>
+            <tr><th scope="row">Anchoring</th><td>About every 10,000 blocks (about a week)</td></tr>
+            <tr><th scope="row">Post-quantum</th><td>Dormant hash-based (MSS) recovery commitment on every output</td></tr>
+            <tr><th scope="row">Genesis</th><td>16 Oct 2026, 03:41 UTC. Anchored to Bitcoin block 971,656 and Midstate block 334,607.</td></tr>
+            <tr><th scope="row">Genesis block</th><td><code>7c45a2ef9d2f76134fe35f6016ef7df0dfef8d4f29dd5d02d4ae8144a10139b5</code></td></tr>
+            <tr><th scope="row">Network magic</th><td><code>MIDWIMBLE_TESTNET_V3</code> <small>(kept for good on mainnet)</small></td></tr>
+            <tr><th scope="row">Mainnet</th><td>31 Oct 2026, 00:00 UTC, in place, with no restart</td></tr>
+            <tr><th scope="row">Licence</th><td>GPL-3.0-or-later</td></tr>
+            <tr><th scope="row">Audit</th><td>None yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 4. EMISSION -->
+    <section id="emission" class="sec">
+      <div class="section-head">
+        <div>
+          <span class="kicker">EMISSION AND SUPPLY</span>
+          <h2>One million coins. No more, ever.</h2>
+        </div>
+        <p>The whole supply is mined out as block rewards on a fixed schedule written into consensus. The last block to mint pays whatever is left, so issuance stops at exactly 1,000,000.00000000.</p>
+      </div>
+
+      <div class="grid2">
+        <ol class="timeline">
+          <li class="done"><b>Slow start: first 30 days (43,200 blocks).</b><br><span class="dim">The reward climbs in a straight line from almost nothing. Day one pays about 5.7 coins in total, the whole first month about 5,170. Launch day is when anyone with a head start could take the most; the ramp makes that window nearly worthless.</span></li>
+          <li><b>Era 0: 0.23932616 per block.</b><br><span class="dim">Until block 2,100,000. Roughly half the supply is issued in this first era.</span></li>
+          <li><b>Halvings every 2,100,000 blocks.</b><br><span class="dim">126,000,000 seconds, the same wall-clock length as Bitcoin's era. First around 13 Oct 2030, second around 10 Oct 2034.</span></li>
+          <li><b>The end: about block 49.7 million.</b><br><span class="dim">Roughly 95 years in. After that a block pays only its fees, and a block with no fees has no coinbase at all.</span></li>
+        </ol>
+        <div>
+          <div class="card">
+            <span class="tag" style="color:var(--purple2)">CHECKABLE BY ANYONE</span>
+            <p>The schedule is defined by its running total, so any node can check a claimed supply at any height in microseconds. Nodes that start from a checkpoint snapshot check the snapshot's supply too, so the cap never depends on trusting whoever served it.</p>
+          </div>
+          <div class="card" style="margin-top:14px">
+            <span class="tag" style="color:var(--green)">KEPT CLEAR OF MIDSTATE'S HALVINGS</span>
+            <p>Midstate halves around late February each year. Midwimble's launch date keeps its halvings months away from Midstate's, so merge-miners never take two revenue cuts at once.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 5. PRIVACY -->
+    <section id="privacy" class="sec">
+      <div class="section-head">
+        <div>
+          <span class="kicker">PRIVACY</span>
+          <h2>Private by default.</h2>
+        </div>
+        <p>What Midwimble hides, and an honest list of what it doesn't.</p>
+      </div>
+
+      <div class="grid2">
+        <div class="card green">
+          <span class="tag">HIDDEN</span>
+          <ul>
+            <li><b>Amounts.</b> Every output is a Pedersen commitment, with an aggregated Bulletproof range proof showing it isn't negative. Anyone can verify that inputs, outputs and fees balance without seeing a number.</li>
+            <li><b>Recipients.</b> No addresses on chain. Each output pays a one-time owner key, so two payments to the same address don't look related. Only the recipient can find and spend them.</li>
+            <li><b>Where a payment started.</b> New transactions travel a random stem of peers before being broadcast (Dandelion++), and stem transactions that time out together are combined first. <span class="dim">Dandelion++ is being hardened.</span></li>
+          </ul>
+        </div>
+        <div class="card purple">
+          <span class="tag">NOT HIDDEN</span>
+          <ul>
+            <li><b>That a transaction happened:</b> its number of inputs and outputs, its fee, and which outputs it spends.</li>
+            <li><b>Linked outputs:</b> outputs in the same range-proof group are visibly linked. That's the cost of keeping proofs aggregated.</li>
+            <li><b>No classic cut-through.</b> Receiver-only ownership needs each spent output's owner key and signature to stay, so Midwimble uses anchored pruning instead. History is more permanent than in Grin.</li>
+            <li><b>Your node sees what you send through it.</b> It never sees your keys, but it learns which coins are yours from payments you send through it.</li>
+          </ul>
+        </div>
+      </div>
+      <p class="note">
+        <b>Receiver-only spend authority.</b> Every output carries a one-time
+        owner key (<code>Ko = H(t)·G + B</code>), so the recipient and only the
+        recipient can spend it. Sending needs only the recipient's address, with
+        no back-and-forth between wallets.
+      </p>
+    </section>
+
+    <!-- 6. VIEW KEYS -->
+    <section id="view-keys" class="sec">
+      <div class="section-head">
+        <div>
+          <span class="kicker">VIEW KEYS</span>
+          <h2>Show your books, keep your keys.</h2>
+        </div>
+        <p>A view key sees every payment to your address and its amount, and can spend none of them. Privacy becomes a choice you can selectively waive, not an all-or-nothing wall.</p>
+      </div>
+      <div class="grid3">
+        <div class="card">
+          <span class="num">01</span>
+          <h3>Who it's for</h3>
+          <p>An accountant, an auditor, or anyone who should see what you receive. You decide who gets it.</p>
+        </div>
+        <div class="card">
+          <span class="num">02</span>
+          <h3>Where to find it</h3>
+          <p>Browser wallet: Receive → View key → Show view key. Command line: <code>midwimble wallet view-key</code>.</p>
+        </div>
+        <div class="card">
+          <span class="num">03</span>
+          <h3>Pool miners use it</h3>
+          <p>A miner's own software uses its view key to confirm the pool paid exactly what it owes, without the key leaving the miner.</p>
+        </div>
+      </div>
+      <p class="note warn">
+        The view key covers payments <i>to</i> the address.
+        <!-- CONFIRM: is "it doesn't show what the wallet spends" the right way to state the outgoing side? -->
+        Never share your recovery phrase: that's the spend key. The view key is the one you share.
+      </p>
+    </section>
+
+    <!-- 7. MINING -->
+    <section id="mining" class="sec">
+      <div class="section-head">
+        <div>
+          <span class="kicker">MINING</span>
+          <h2>Secured by hashrate that already exists.</h2>
+        </div>
+        <p>A Midstate miner puts a small commitment to a Midwimble block in its Midstate coinbase. If that Midstate block also meets Midwimble's target, it's a Midwimble block too. One search mines both chains.</p>
+      </div>
+
+      <div class="grid3">
+        <div class="card">
+          <span class="num">01 · EASIEST</span>
+          <h3>Through a pool</h3>
+          <p>The merge-mining pool at <a href="https://rpc.cypherpunk.gold/pool">rpc.cypherpunk.gold/pool</a> mines Midwimble alongside Midstate. Keep mining as normal and add a Midwimble address. No bond needed.</p>
+          <p class="dim">Pool fee: 12.5% for now. It's temporary while Midwimble gets going.</p>
+        </div>
+        <div class="card">
+          <span class="num">02</span>
+          <h3>Solo merge-mining</h3>
+          <p>Against your own Midstate node: <code>midwimble merge-mine</code>. Needs a bond.</p>
+        </div>
+        <div class="card">
+          <span class="num">03</span>
+          <h3>Run a pool</h3>
+          <p><code>midwimble pool</code> and <code>midwimble pool-mine</code>. The provably fair design pays PPLNS directly in the coinbase.</p>
+        </div>
+      </div>
+
+      <div class="grid2" style="margin-top:14px">
+        <div class="card">
+          <span class="tag" style="color:var(--purple2)">BONDS: A TICKET, NOT A WEIGHT</span>
+          <p>A block must be signed by a mining key that a bond on Midstate authorises. A bond is an ordinary Midstate coin locked until a set height. Proof of work alone decides who finds a block: a 1,000 gMDS bond mines exactly as hard as the minimum, and there's no slashing.</p>
+          <ul>
+            <li>Before 31 Oct 2026, 00:00 UTC: at least 2<sup>24</sup> units (about 0.016 gMDS), 2 days of lock left.</li>
+            <li>From then on: 2<sup>37</sup> units (128 gMDS), 30 days of lock left.</li>
+            <li>Each bond's blocks count in full only up to its share of the day: four blocks a day once 360 bonds are eligible. Co-bonders can lend bonds to a pool and keep sole control of their coins.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <span class="tag" style="color:var(--green)">A POOL MINERS CAN AUDIT</span>
+          <ul>
+            <li>PPLNS, paid directly in the coinbase, so there's nothing to settle afterwards.</li>
+            <li>Each miner hashes its own copy of the job, bound to its own address, so shares can't be stolen.</li>
+            <li>Miners spot-check the pool's share accounting, and check their payout with their view key before hashing.</li>
+            <li>A coinbase pays at most 31 miners, so very small miners are paid by fair sampling: exactly their share on average, in fewer, larger payouts.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- 8. ANCHORING / FINALITY / PQ -->
+    <section id="anchoring" class="checkpoint">
       <div class="checkpoint-copy">
-        <span class="kicker">WHY ANCHOR?</span>
+        <span class="kicker">ANCHORING · FINALITY · RECOVERY</span>
         <h2>A place to return to.</h2>
         <p>
-          If the cryptography protecting Midwimble ever becomes unsafe, an
-          externally recorded checkpoint gives the network a deterministic
-          candidate state from before the break.
+          About every 10,000 blocks, a checkpoint of Midwimble's state is
+          written into Midstate: as an ordinary Commit transaction, or for free
+          inside a merge-mined Midstate block. It records that a state existed,
+          not who paid whom.
         </p>
         <p>
-          The anchor does not expose who paid whom. It records only enough to say:
+          <b style="color:var(--text)">Finality.</b> Once the anchor has 1,000
+          Midstate confirmations, the chain is 100 blocks past the checkpoint,
+          and no conflicting anchor is known, no reorganisation can reach below
+          it, however much work a competing chain claims. Forging the evidence
+          would cost about an hour of Midstate's entire network.
         </p>
         <blockquote>This state existed.</blockquote>
       </div>
@@ -166,55 +641,290 @@
       <div class="checkpoint-card">
         <div class="terminal-head">
           <span></span><span></span><span></span>
-          <b>checkpoint</b>
+          <b>checkpoint · field layout</b>
         </div>
         <pre><code>version          1
 network          midwimble
-height           2,500,000
-header_hash      9f2a…71c4
-state_root       a84d…02b1
-cumulative_work  0000…e912
-previous         53bc…90af
+height           &lt;block height&gt;
+header_hash      &lt;32 bytes&gt;
+state_root       &lt;32 bytes&gt;
+cumulative_work  &lt;chain work&gt;
+previous         &lt;previous checkpoint&gt;
 
-anchor → MIDSTATE</code></pre>
+anchor → MIDSTATE
+  commit tx  |  merge-mined coinbase
+finality   1,000 midstate confs + 100 blocks</code></pre>
       </div>
     </section>
 
+    <section class="sec" style="padding-top:20px">
+      <div class="grid2">
+        <div class="card">
+          <span class="tag" style="color:var(--purple2)">DORMANT POST-QUANTUM RECOVERY</span>
+          <p>Midwimble's everyday cryptography uses elliptic curves, like most privacy coins, and a large enough quantum computer would break it. So every output also carries a hidden recovery commitment tied to the recipient's hash-based (MSS) key, which is part of every v1 address.</p>
+          <p>If curves are ever broken, a future hard fork can activate a recovery epoch at an anchored checkpoint from before the break. Owners reclaim their coins with hash-based signatures. Elliptic-curve keys aren't consulted, so an attacker holding every curve secret still can't claim them, and total claims are capped at the checkpoint's supply.</p>
+        </div>
+        <div class="card">
+          <span class="tag" style="color:var(--green)">WHAT THIS ISN'T</span>
+          <ul>
+            <li>Midwimble is not post-quantum in normal operation.</li>
+            <li>The recovery path is designed and tested, but activating it is a hard fork, and it isn't wired into the node today.</li>
+            <li>Recovery commitments are written by senders and consensus can't check them. Wallets flag bad ones.</li>
+            <li>Your wallet builds its recovery key once, when it's created. It takes from a few seconds to a minute.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- 9. FEES / LIMITS / PRUNING -->
+    <section id="fees" class="sec">
+      <div class="section-head">
+        <div>
+          <span class="kicker">FEES, LIMITS AND PRUNING</span>
+          <h2>Cheap to use, bounded to verify.</h2>
+        </div>
+        <p>Weights follow Grin: an input is 1, an output 21, a kernel 3. Outputs cost the most to verify and store, so they cost the most to send.</p>
+      </div>
+      <div class="grid3">
+        <div class="card">
+          <h3>Fees</h3>
+          <p>Nodes relay transactions paying at least 100 base units per weight unit. An ordinary payment (one input, two outputs) costs 4,600 base units: 0.000046 coins. The floor is node policy, not consensus.</p>
+        </div>
+        <div class="card">
+          <h3>Limits</h3>
+          <p>A block holds up to 40,000 weight units (about 1,900 outputs); a transaction up to 10,000. Every kernel id is unique across the chain (replay protection). Coinbase outputs mature after 100 blocks.</p>
+        </div>
+        <div class="card">
+          <h3>Pruning (optional)</h3>
+          <p>Off by default. With <code>--prune</code>, a node deletes block bodies below the finalized checkpoint and keeps headers, kernels, UTXO records and range proofs. New nodes can start from a snapshot verified against its anchor (<code>--checkpoint</code>). The network relies on archive nodes for now.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 10. LAUNCH -->
+    <section id="launch" class="sec">
+      <div class="section-head">
+        <div>
+          <span class="kicker">LAUNCH</span>
+          <h2>Launched in the open, provably from zero.</h2>
+        </div>
+        <p>The network that launched on 16 October as the public testnet becomes mainnet in place on 31 October 2026 at 00:00 UTC. Nothing restarts: the chain carries on, and so do the coins mined on it.</p>
+      </div>
+
+      <div class="grid2">
+        <ol class="timeline">
+          <li class="done"><b>16 Oct 2026, 03:41 UTC: genesis.</b><br><span class="dim">It commits to Bitcoin block 971,656 and Midstate block 334,607, both mined after the code freeze. Nobody could compute the genesis, or quietly pre-mine against it, before those blocks existed.</span></li>
+          <li class="done"><b>Slow start.</b><br><span class="dim">The reward ramps over the first 30 days. About 1,270 coins, an eighth of a percent of the supply, are issued before mainnet.</span></li>
+          <li><b>31 Oct 2026, 00:00 UTC: mainnet.</b><br><span class="dim">Only the bond changes. Blocks stamped from then on need mainnet's 128 gMDS bond. Every node must run a build with the early phase before then; older builds split off at the first block after the switch.</span></li>
+          <li><b>After the switch: anchor.</b><br><span class="dim">A checkpoint from past the switch is anchored in Midstate. Once it's final, the early history is settled for good.</span></li>
+        </ol>
+        <div>
+          <div class="card">
+            <span class="tag" style="color:var(--green)">WHY TESTNET COINS CARRY OVER</span>
+            <!-- CONFIRM: wording of the carry-over reason (low testnet participation). -->
+            <p>Testnet participation was low, so the people who did turn up to run nodes, mine and test the bonded path took real risk on new code. Carrying their coins into mainnet rewards that, and the slow start keeps the amount small.</p>
+          </div>
+          <div class="card" style="margin-top:14px">
+            <span class="tag" style="color:var(--purple2)">ONE HASH TO CHECK</span>
+            <p>Run <code>midwimble params</code> on your own build and compare one hash, the genesis block id <code>7c45a2ef…0139b5</code>. It commits to the network name, both anchors, the genesis time and the starting difficulty. The join script refuses to run unless its build reproduces it.</p>
+          </div>
+          <p class="note warn">
+            <b>Joined during the testnet?</b> Your coins become real on 31 October.
+            Write down your recovery phrase (<code>midwimble wallet --wallet &lt;file&gt; phrase</code>).
+            If the join script made your wallet before mainnet was announced, its
+            password is the old default <code>testnet</code>: change it with
+            <code>midwimble wallet --wallet &lt;file&gt; password</code>.
+          </p>
+          <p class="dim" style="font-size:14px">
+            Release: <!-- CONFIRM: release name "SafeWord"? Not in the repo; no git tags; Cargo.toml is 0.1.0. Will there be a tagged release with binaries? --><span class="tbc">release name and binaries to be announced</span>
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 11. GET STARTED -->
+    <section id="get-started" class="sec">
+      <div class="section-head">
+        <div>
+          <span class="kicker">GET STARTED</span>
+          <h2>Four ways in.</h2>
+        </div>
+        <p>A browser wallet takes two minutes. Running a node or mining takes a little longer.</p>
+      </div>
+
+      <div class="grid2 steps">
+        <div class="card">
+          <span class="num">01</span>
+          <h3>Get a wallet</h3>
+          <p>Open the <a href="wallet/">browser wallet</a>. Create a wallet, or restore one from 24 words or a <code>.mww</code> file. Write down the 24-word recovery phrase: it's the only way back in if you lose the browser data.</p>
+          <p class="dim">The wallet talks straight to Midwimble nodes over WebRTC and never shows them your keys. It shares phrases, addresses and the wallet file with the command-line wallet.</p>
+        </div>
+        <div class="card">
+          <span class="num">02</span>
+          <h3>Run a node</h3>
+          <div class="term"><pre><code>git clone https://github.com/ciphernom/midwimble
+cd midwimble
+python3 scripts/join_testnet.py</code></pre></div>
+          <p class="dim" style="margin-top:10px">The script builds, checks the genesis and follows the chain. Its name still says "testnet"; it joins the network that becomes mainnet.</p>
+        </div>
+        <div class="card">
+          <span class="num">03</span>
+          <h3>Mine</h3>
+          <p>Easiest: point a Midstate miner at <a href="https://rpc.cypherpunk.gold/pool">the merge-mining pool</a> and add a Midwimble address. The 12.5% pool fee is temporary while Midwimble gets going.</p>
+          <p>Solo, with your own bond: <code>python3 scripts/join_testnet.py --mine</code> walks you through locking and registering a bond. Add <code>--full-bond</code> to keep mining after 31 Oct. You'll need a Midstate node with the bonded-mining patch and a Midstate wallet.</p>
+        </div>
+        <div class="card">
+          <span class="num">04</span>
+          <h3>Look things up</h3>
+          <p>The <a href="https://mw.cypherpunk.gold/">explorer</a> follows an output from the block that created it to the block that spent it, and shows each bond's share of the fork-choice window.</p>
+          <div class="term"><pre><code>midwimble wallet --wallet w.mww create
+midwimble wallet --wallet w.mww balance
+midwimble wallet --wallet w.mww send --to &lt;address&gt; --amount 0.25
+midwimble wallet view-key</code></pre></div>
+        </div>
+      </div>
+      <p class="note warn">
+        <b>Safety.</b> Never publish a node's RPC port (9434 by default): anyone
+        who can reach it can redirect the node's mining rewards. To share an
+        explorer, use <code>--explorer</code>, which only reads. "Release" on a
+        pending payment doesn't cancel it on the network. It makes the coins
+        spendable again in your wallet, and is only for a payment that will
+        never confirm.
+      </p>
+    </section>
+
+    <!-- 12. STATUS / SECURITY / LIMITATIONS -->
     <section id="status" class="status">
       <div class="section-head">
         <div>
-          <span class="kicker">CURRENT STATUS</span>
-          <h2>Working code, unfinished protocol.</h2>
+          <span class="kicker">STATUS AND SECURITY</span>
+          <h2>Working network, unfinished review.</h2>
         </div>
         <p>
-          Midwimble is research software. The interesting parts are implemented
-          far enough to test, break and improve — not to pretend the work is done.
+          Midwimble is experimental software. The network is running and
+          becomes mainnet on 31 October. The code has not had an independent
+          security audit. Only put in what you can afford to lose.
         </p>
       </div>
 
       <div class="status-grid">
         <div class="status-card implemented">
-          <span>IMPLEMENTED</span>
+          <span>IMPLEMENTED AND RUNNING</span>
           <ul>
-            <li>MimbleWimble-style transaction core</li>
-            <li>Confidential commitments and range proofs</li>
-            <li>Stealth-style outputs and receiver ownership</li>
-            <li>P2P networking, sync, reorg handling and mining</li>
-            <li>Midstate checkpoint construction and verification</li>
-            <li>Explicit and merged-mining anchor paths</li>
+            <li>MimbleWimble transaction core with receiver-only ownership</li>
+            <li>Confidential commitments and aggregated range proofs</li>
+            <li>Merged mining with unmodified Midstate nodes</li>
+            <li>Bonded proof of work and the provably fair pool</li>
+            <li>P2P networking, sync, reorg handling, Dandelion++ (being hardened)</li>
+            <li>Midstate anchoring (commit tx and merged mining) and finality</li>
             <li>Dormant recovery commitments and recovery logic</li>
+            <li>Optional anchored pruning and checkpoint sync</li>
+            <li>Browser wallet, explorer, view keys</li>
+            <li>Launch parameters set and published</li>
           </ul>
+          <p class="dim" style="margin:18px 0 0;font-size:14px">Tests: 190 unit, 16 integration and 11 doc tests. The integration tests run real nodes through sync, reorgs, lying peers, Dandelion++ payments, merged mining, the pool, quantum-recovery attacks and pruning.</p>
         </div>
 
         <div class="status-card planned">
-          <span>IN PROGRESS</span>
+          <span>STILL TO DO</span>
           <ul>
-            <li>Anchored cut-through / pruning</li>
-            <li>Protocol hardening and adversarial review</li>
+            <li>Independent cryptographic review: ownership scheme, merged-mining proof, recovery commitments</li>
             <li>Security audit</li>
-            <li>Production network parameters</li>
           </ul>
         </div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <span class="tag" style="color:var(--purple2)">KNOWN LIMITATIONS</span>
+        <div class="grid2" style="gap:0 40px">
+          <ul>
+            <li>Not post-quantum day to day; recovery after a curve break needs a future hard fork.</li>
+            <li>Recovery commitments are written by senders and can't be checked by consensus; wallets flag bad ones.</li>
+            <li>Anchor verification is SPV-level.</li>
+            <li>Conflicting anchors stop finalization rather than resolving automatically.</li>
+            <li>Outputs in the same range-proof group are visibly linked.</li>
+            <li>Pruned nodes can't serve history; wallets restored from them lose outgoing history.</li>
+          </ul>
+          <ul>
+            <li>No fee bumping or cancelling yet: the mempool is first-seen, so there's no replace-by-fee.</li>
+            <li>Unconfirmed coins can't be spent, which also rules out child-pays-for-parent.</li>
+            <li>A coinbase pays at most 31 pool miners.</li>
+            <li>The CLI wallet has no history command (the browser wallet does).</li>
+            <li>GPU mining is verified on software Vulkan only, not real GPU hardware.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- 13. ROADMAP -->
+    <section id="roadmap" class="sec" style="padding-top:0">
+      <div class="section-head">
+        <div>
+          <span class="kicker">ROADMAP</span>
+          <h2>What's next.</h2>
+        </div>
+        <p>Only work grounded in the code and docs. <!-- CONFIRM: dates for anything after 31 Oct. --><span class="tbc">dates to be announced</span></p>
+      </div>
+      <ol class="timeline">
+        <li class="done"><b>16 Oct 2026:</b> <span class="dim">network launched as the public testnet.</span></li>
+        <li><b>31 Oct 2026:</b> <span class="dim">mainnet switch, then the first post-switch checkpoint anchored in Midstate.</span></li>
+        <li><b>Tagged releases with binaries.</b> <!-- CONFIRM: no releases or tags exist yet. --><span class="dim">So you don't have to build from source.</span></li>
+        <li><b>Independent cryptographic review.</b> <span class="dim">Ownership scheme, merged-mining proof, recovery commitments.</span></li>
+        <li><b>Full verification from snapshots,</b> <span class="dim">instead of downloading every block.</span></li>
+        <li><b>Better handling of conflicting anchors.</b></li>
+        <li><b>Fee bumping and real cancel (replace-by-fee).</b> <!-- CONFIRM: discussed, not committed. --><span class="dim">Under consideration.</span></li>
+        <li><b>Recovery epoch:</b> <span class="dim">stays dormant unless it's ever needed.</span></li>
+      </ol>
+    </section>
+
+    <!-- 14. FAQ -->
+    <section id="faq" class="sec">
+      <div class="section-head">
+        <div>
+          <span class="kicker">FAQ</span>
+          <h2>Questions people ask.</h2>
+        </div>
+        <p>Something missing? Ask in the community, below.</p>
+      </div>
+      <div class="faq">
+        <details><summary>Is Midwimble part of Midstate?</summary><div><p>No. It's its own chain with its own coin, supply and consensus rules. Nothing is pegged to Midstate and no Midstate coins move into it. It's merge-mined with Midstate (shared hashing) and anchors checkpoints into Midstate for finality and recovery.</p></div></details>
+        <details><summary>Do I need Midstate coins to use Midwimble?</summary><div><p>Not to hold or send Midwimble. Block producers need a bond locked on Midstate. Pool miners don't, because the pool holds the bonds.</p></div></details>
+        <!-- CONFIRM: premine / sale answer before publishing. -->
+        <details><summary>Was there a premine or a sale?</summary><div><p>There's no premine in the emission code: every coin comes from a block reward, starting from a genesis that couldn't have been computed before the Bitcoin and Midstate blocks it commits to. There was no sale.</p></div></details>
+        <details><summary>Are coins mined on the testnet real?</summary><div><p>From 31 October 2026, 00:00 UTC, yes. The testnet becomes mainnet in place and nothing restarts.</p></div></details>
+        <details><summary>How private is it?</summary><div><p>Amounts are hidden, there are no addresses on chain, and Dandelion++ obscures where a payment started. Which outputs a transaction spends is visible, outputs in one proof group are linked, and there's no classic cut-through. See <a href="#privacy">Privacy</a>.</p></div></details>
+        <details><summary>What's a view key for?</summary><div><p>Letting someone see the payments to your address and their amounts without being able to spend anything: an accountant, an auditor, or your mining pool.</p></div></details>
+        <details><summary>Is it quantum-safe?</summary><div><p>Not day to day. Every output carries a dormant hash-based recovery claim, and checkpoints are anchored in post-quantum Midstate, so coins could be recovered after a break through a future hard fork.</p></div></details>
+        <details><summary>What does "release" on a pending payment do?</summary><div><p>It stops your wallet waiting on that payment and makes the coins spendable again in the wallet. It doesn't cancel anything on the network: if the transaction was broadcast it can still confirm.</p></div></details>
+        <details><summary>Can I speed up or cancel a payment?</summary><div><p>Not yet. The mempool is first-seen and doesn't accept fee-bumped replacements.</p></div></details>
+        <details><summary>Why is the pool fee 12.5%?</summary><div><p>It's temporary, while Midwimble gets going.</p></div></details>
+        <details><summary>Has it been audited?</summary><div><p>No. A cryptographic review is on the to-do list. Treat it as experimental.</p></div></details>
+        <!-- CONFIRM: is there a Midwimble whitepaper to link? TESTNET.md:5 says "the whitepaper's anniversary". -->
+        <details><summary>Where's the whitepaper?</summary><div><p>The design is documented in the repo: <a href="https://github.com/ciphernom/midwimble/blob/main/docs/ANCHORING.md">anchoring and recovery</a>, <a href="https://github.com/ciphernom/midwimble/blob/main/docs/BONDED_POW.md">bonded proof of work</a>, <a href="https://github.com/ciphernom/midwimble/blob/main/docs/PRUNING.md">pruning</a> and <a href="https://github.com/ciphernom/midwimble/blob/main/docs/POOL_MERGED_MINING.md">pool merged mining</a>.</p></div></details>
+      </div>
+    </section>
+
+    <!-- 15. LINKS -->
+    <section id="links" class="sec">
+      <div class="section-head">
+        <div>
+          <span class="kicker">LINKS AND COMMUNITY</span>
+          <h2>Everything in one place.</h2>
+        </div>
+        <p>Midwimble is open source. Come and run a node, break something, and tell us.</p>
+      </div>
+      <div class="links">
+        <a class="card" href="wallet/"><b>Wallet</b><span>ciphernom.github.io/midwimble/wallet</span></a>
+        <a class="card" href="https://mw.cypherpunk.gold/"><b>Explorer</b><span>mw.cypherpunk.gold</span></a>
+        <a class="card" href="https://rpc.cypherpunk.gold/pool"><b>Mining pool</b><span>rpc.cypherpunk.gold/pool · 12.5% fee, temporary</span></a>
+        <a class="card" href="https://github.com/ciphernom/midwimble"><b>Source code</b><span>github.com/ciphernom/midwimble</span></a>
+        <a class="card" href="https://github.com/ciphernom/midwimble/tree/main/docs"><b>Design docs</b><span>anchoring, bonds, pruning, pool, testnet</span></a>
+        <a class="card" href="https://midstate.cash/"><b>Midstate</b><span>midstate.cash</span></a>
+        <a class="card" href="https://github.com/ciphernom/midstate"><b>Midstate source</b><span>github.com/ciphernom/midstate</span></a>
+        <!-- CONFIRM: Midwimble Discord invite link. Replace this div with <a class="card" href="https://discord.gg/XXXX">. -->
+        <div class="card"><b>Discord</b><span class="tbc">invite link coming</span></div>
+        <!-- CONFIRM: OK to link the Substack? -->
+        <a class="card" href="https://ciphernom.substack.com/"><b>Blog</b><span>ciphernom.substack.com</span></a>
       </div>
     </section>
 
@@ -222,16 +932,17 @@ anchor → MIDSTATE</code></pre>
       <img src="assets/midwimble-logo.svg" alt="">
       <h2>Private present.<br>Durable past.</h2>
       <p>
-        Midwimble is an experiment in building a privacy chain that knows
-        what to do when cryptography changes.
+        A privacy chain that knows what to do when cryptography changes.
+        Mainnet 31 October 2026.
       </p>
-      <a class="button primary" href="https://github.com/ciphernom/midwimble">Explore Midwimble on GitHub</a>
+      <a class="button primary" href="wallet/">Open the wallet</a>
     </section>
   </main>
 
+  <!-- 16. FOOTER -->
   <footer>
     <span>Midwimble</span>
-    <span>Research software · Do not use for real value</span>
+    <span>Experimental software · Not audited · GPL-3.0-or-later</span>
     <a href="https://github.com/ciphernom/midwimble">github.com/ciphernom/midwimble</a>
   </footer>
 </body>
