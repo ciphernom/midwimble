@@ -35,6 +35,7 @@ use crate::core::mmr::{MerkleMountainRange, UtxoAccumulator};
 use crate::core::mw::crypto::{compress, decompress, scalar_from_bytes, Point32, Scalar32};
 use crate::core::mw::{Kernel, StoredGroup};
 use crate::core::relay::{Relay, RelayEntry};
+use crate::core::scan::{ScanBlock, ScanRun};
 use crate::core::snapshot::{mmr_from_peaks, mmr_peak_values, Snapshot, SNAPSHOT_HEADERS};
 use crate::core::state::{calculate_target, calculate_work};
 use crate::core::types::{block_reward, utxo_leaf, BlockEffects, UtxoEntry};
@@ -401,6 +402,41 @@ impl Storage {
             out.push(bincode::deserialize(raw)?);
         }
         Ok(out)
+    }
+
+    /// The scan data (`core/scan.rs`) of up to `count` consecutive stored
+    /// blocks from `start`, as [`Self::load_batches`] reads the blocks, with
+    /// `byte_limit` on the scan data's encoded size. `None` if there is no
+    /// block at `start`.
+    pub fn load_scan_run(
+        &self,
+        start: u64,
+        count: u64,
+        byte_limit: usize,
+    ) -> Result<Option<ScanRun>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(BATCHES)?;
+        let mut run: Option<ScanRun> = None;
+        let mut bytes = 0usize;
+        for (expect, entry) in (start..).zip(table.range(start..start.saturating_add(count))?) {
+            let (k, v) = entry?;
+            if k.value() != expect {
+                break; // pruned gap
+            }
+            let batch: Batch = bincode::deserialize(v.value())?;
+            let scan = ScanBlock::of(&batch);
+            let size = ScanRun::size_of(&scan);
+            let run = run.get_or_insert_with(|| ScanRun {
+                prev: batch.prev_header_hash,
+                blocks: Vec::new(),
+            });
+            if !run.blocks.is_empty() && bytes + size > byte_limit {
+                break;
+            }
+            bytes += size;
+            run.blocks.push(scan);
+        }
+        Ok(run)
     }
 
     pub fn load_header(&self, height: u64) -> Result<Option<BatchHeader>> {

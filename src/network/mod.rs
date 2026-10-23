@@ -23,6 +23,9 @@
 //!   (`addrbook.rs`), so midstate's nodes, which share transports and often
 //!   machines with ours, are no longer recorded, redialled and handed on.
 //! * Bans end (`bans.rs`), so a mistaken ban of an honest peer heals.
+//! * A node tells browser wallets where its peers take WebRTC-direct
+//!   connections (`get_nodes`), so that wallets spread over the nodes there
+//!   are rather than all using the one in their configuration.
 
 pub mod addrbook;
 pub mod amino;
@@ -52,6 +55,7 @@ use libp2p::{
 };
 use light_protocol::{
     LightNotification, LightRequest, LightResponse, LIGHT_PROTOCOL, LIGHT_PUSH_PROTOCOL,
+    MAX_LIGHT_NODES,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -67,6 +71,8 @@ const MAX_PEERS_PER_SUBNET: usize = 4;
 // ── Light client protection (midstate) ──────────────────────────────────────
 
 const MAX_LIGHT_PEERS: usize = 500;
+/// WebRTC-direct addresses kept of each peer for `get_nodes`.
+const MAX_WEBRTC_ADDRS_PER_PEER: usize = 4;
 const MAX_LIGHT_STREAMS_PER_PEER: usize = 50;
 const LIGHT_RATE_WINDOW_SECS: u64 = 60;
 const LIGHT_BAN_THRESHOLD: u32 = 20;
@@ -482,6 +488,10 @@ pub struct Network {
     refusal_noted: HashMap<PeerId, Instant>,
     /// Connected peers that have identified themselves as midwimble nodes.
     identified: HashSet<PeerId>,
+    /// The WebRTC-direct addresses connected midwimble peers say they listen
+    /// on: where browser wallets can reach them (`get_nodes`). Kept apart
+    /// from Kademlia and the address book, which nodes dial.
+    webrtc_peers: HashMap<PeerId, Vec<Multiaddr>>,
     /// Events to hand out before the next swarm event.
     queued: VecDeque<NetworkEvent>,
 }
@@ -537,6 +547,7 @@ impl Network {
             connected_since: HashMap::new(),
             refusal_noted: HashMap::new(),
             identified: HashSet::new(),
+            webrtc_peers: HashMap::new(),
             queued: VecDeque::new(),
         };
         for peer in banned_peers {
@@ -881,6 +892,48 @@ impl Network {
             .collect()
     }
 
+    /// Where a browser wallet can reach this node and the midwimble nodes
+    /// connected to it (`get_nodes`): at most [`MAX_LIGHT_NODES`], chosen at
+    /// random when there are more. Public addresses only, unless the browser
+    /// asking came from a private or loopback address: a wallet on a node's
+    /// own machine or network can reach the others there too.
+    pub fn webrtc_nodes(&self, asker: &PeerId) -> Vec<String> {
+        let local = self
+            .connected
+            .get(asker)
+            .is_some_and(|e| !is_routable(e.get_remote_address()));
+        let now = Instant::now();
+        let own = self
+            .listen_addrs
+            .iter()
+            .filter(|a| browser_dialable(a))
+            .map(|a| (a, *self.swarm.local_peer_id()));
+        let peers = self
+            .webrtc_peers
+            .iter()
+            .filter(|(p, _)| self.identified.contains(p) && !self.bans.is_banned(p, now))
+            .flat_map(|(p, addrs)| addrs.iter().map(move |a| (a, *p)));
+        let mut nodes = self.webrtc_addrs();
+        for (addr, peer) in own.chain(peers) {
+            if local || is_routable(addr) {
+                let addr = if extract_peer_id(addr).is_some() {
+                    addr.clone()
+                } else {
+                    addr.clone().with(libp2p::multiaddr::Protocol::P2p(peer))
+                };
+                nodes.push(addr.to_string());
+            }
+        }
+        nodes.sort();
+        nodes.dedup();
+        if nodes.len() > MAX_LIGHT_NODES {
+            use rand::seq::SliceRandom;
+            nodes.shuffle(&mut rand::thread_rng());
+            nodes.truncate(MAX_LIGHT_NODES);
+        }
+        nodes
+    }
+
     /// Server-dialable subset (no browser transports).
     pub fn dialable_addrs(&self) -> Vec<String> {
         self.advertisable_addrs()
@@ -1189,8 +1242,13 @@ impl Network {
                     .filter(is_routable)
                     .map(|a| a.to_string());
                 let mut listening = Vec::new();
+                let mut webrtc = Vec::new();
                 for addr in &info.listen_addrs {
                     if addr.to_string().contains("webrtc-direct") {
+                        // For browsers (`get_nodes`); nodes do not dial it.
+                        if browser_dialable(addr) && webrtc.len() < MAX_WEBRTC_ADDRS_PER_PEER {
+                            webrtc.push(addr.clone());
+                        }
                         continue;
                     }
                     self.swarm
@@ -1208,6 +1266,11 @@ impl Network {
                     .add_server(peer_id, Some(info.observed_addr.clone()));
                 listening.sort();
                 listening.dedup();
+                if webrtc.is_empty() {
+                    self.webrtc_peers.remove(&peer_id);
+                } else {
+                    self.webrtc_peers.insert(peer_id, webrtc);
+                }
                 if self.identified.insert(peer_id) {
                     if let Some(endpoint) = self.connected.get(&peer_id) {
                         tracing::info!(
@@ -1352,6 +1415,7 @@ impl Network {
                 if num_established == 0 {
                     let accepted = self.connected.remove(&peer_id).is_some();
                     let identified = self.identified.remove(&peer_id);
+                    self.webrtc_peers.remove(&peer_id);
                     let lasted = self.connected_since.remove(&peer_id).map(|t| t.elapsed());
                     self.relay_reservations.remove(&peer_id);
                     if self.light_peers.remove(&peer_id) {
@@ -1581,6 +1645,14 @@ fn extract_subnet(addr: &Multiaddr) -> Option<IpAddr> {
         }
         _ => None,
     })
+}
+
+/// A WebRTC-direct address a browser can dial: one with the certificate hash
+/// it authenticates the node by.
+fn browser_dialable(addr: &Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().any(|p| p == Protocol::WebRTCDirect)
+        && addr.iter().any(|p| matches!(p, Protocol::Certhash(_)))
 }
 
 fn is_localhost(addr: &Multiaddr) -> bool {

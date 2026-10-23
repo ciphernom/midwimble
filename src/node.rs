@@ -58,7 +58,7 @@ use crate::network::addrbook::AddressBook;
 use crate::network::amino::{self, AminoHandle};
 use crate::network::light_protocol::{
     LightNotification, LightRequest, LightResponse, LIGHT_BLOCKS_BYTE_LIMIT, MAX_LIGHT_BLOCKS,
-    MAX_LIGHT_MEMPOOL_HASHES, MAX_LIGHT_MEMPOOL_TXS,
+    MAX_LIGHT_MEMPOOL_HASHES, MAX_LIGHT_MEMPOOL_TXS, MAX_LIGHT_SCAN_BLOCKS,
 };
 use crate::network::protocol::BATCH_RESPONSE_SOFT_LIMIT;
 use crate::network::protocol::{
@@ -1125,7 +1125,7 @@ impl Node {
                     self.serve_light(peer, request, respond);
                     return;
                 }
-                let response = self.handle_light_request(request);
+                let response = self.handle_light_request(peer, request);
                 if response.ok {
                     self.network.observe_honest_light_peer(peer).await;
                 }
@@ -3419,14 +3419,18 @@ impl Node {
 
     // ── Light clients ───────────────────────────────────────────────────
 
-    fn handle_light_request(&mut self, request: LightRequest) -> LightResponse {
-        match self.light_request_inner(request) {
+    fn handle_light_request(&mut self, peer: PeerId, request: LightRequest) -> LightResponse {
+        match self.light_request_inner(peer, request) {
             Ok(v) => LightResponse::success(v),
             Err(e) => LightResponse::error(format!("{e:#}")),
         }
     }
 
-    fn light_request_inner(&mut self, request: LightRequest) -> Result<serde_json::Value> {
+    fn light_request_inner(
+        &mut self,
+        peer: PeerId,
+        request: LightRequest,
+    ) -> Result<serde_json::Value> {
         use serde_json::json;
         Ok(match request {
             LightRequest::GetState => json!({
@@ -3449,10 +3453,12 @@ impl Node {
             LightRequest::GetHeaders { .. }
             | LightRequest::GetBlock { .. }
             | LightRequest::GetBlocks { .. }
+            | LightRequest::GetScanData { .. }
             | LightRequest::GetUtxos { .. }
             | LightRequest::GetFilters { .. } => {
                 return light_from_storage(&self.storage, self.state.height, request)
             }
+            LightRequest::GetNodes => json!({ "nodes": self.network.webrtc_nodes(&peer) }),
             LightRequest::GetMempool => {
                 let hashes = self.mempool.hashes();
                 json!({
@@ -3580,6 +3586,7 @@ fn request_reads_storage(request: &LightRequest) -> bool {
         LightRequest::GetHeaders { .. }
             | LightRequest::GetBlock { .. }
             | LightRequest::GetBlocks { .. }
+            | LightRequest::GetScanData { .. }
             | LightRequest::GetUtxos { .. }
             | LightRequest::GetFilters { .. }
     )
@@ -3619,6 +3626,20 @@ fn light_from_storage(
                 "start_height": start_height,
                 "count": batches.len(),
                 "blocks_hex": hex::encode(bincode::serialize(&batches)?),
+            })
+        }
+        LightRequest::GetScanData {
+            start_height,
+            count,
+        } => {
+            let count = count
+                .min(MAX_LIGHT_SCAN_BLOCKS)
+                .min(tip.saturating_sub(start_height));
+            let run = storage.load_scan_run(start_height, count, LIGHT_BLOCKS_BYTE_LIMIT)?;
+            json!({
+                "start_height": start_height,
+                "count": run.as_ref().map_or(0, |r| r.blocks.len()),
+                "scan_hex": run.map(|r| hex::encode(r.encode())).unwrap_or_default(),
             })
         }
         LightRequest::GetUtxos { after, limit } => {

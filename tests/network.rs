@@ -787,100 +787,123 @@ async fn peers_that_lie_about_their_chain_neither_stall_the_node_nor_stay() {
     producer.stop().await;
 }
 
+/// A browser wallet's line to a node (`web-wallet/light_client.js`): a
+/// WebRTC-direct connection carrying the light protocol, and nothing else.
+#[cfg(feature = "webrtc")]
+struct Browser {
+    control: libp2p_stream::Control,
+    node: libp2p::PeerId,
+}
+
+#[cfg(feature = "webrtc")]
+impl Browser {
+    /// The node's WebRTC address, as it logs it for browser wallets.
+    async fn address_of(node: &TestNode) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let info = node.handle.info();
+            if let Some(a) = info.listen_addrs.iter().find(|a| a.contains("/certhash/")) {
+                return format!("{a}/p2p/{}", info.peer_id);
+            }
+            assert!(Instant::now() < deadline, "no WebRTC listener");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn connect(node: &TestNode) -> Self {
+        use futures::StreamExt;
+        use libp2p::core::muxing::StreamMuxerBox;
+        use libp2p::Transport;
+
+        let addr: libp2p::Multiaddr = Self::address_of(node).await.parse().unwrap();
+        let cert = libp2p_webrtc::tokio::Certificate::generate(&mut rand::rngs::OsRng).unwrap();
+        let mut swarm = libp2p::SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_other_transport(|key| {
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                    libp2p_webrtc::tokio::Transport::new(key.clone(), cert)
+                        .map(|(p, c), _| (p, StreamMuxerBox::new(c))),
+                )
+            })
+            .unwrap()
+            .with_behaviour(|_| libp2p_stream::Behaviour::new())
+            .unwrap()
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build();
+        let control = swarm.behaviour().new_control();
+        // rust-libp2p's WebRTC transport dials from its listening socket.
+        swarm
+            .listen_on("/ip4/127.0.0.1/udp/0/webrtc-direct".parse().unwrap())
+            .unwrap();
+        let node = midwimble::network::extract_peer_id(&addr).unwrap();
+        swarm.dial(addr).unwrap();
+        tokio::spawn(async move {
+            loop {
+                swarm.select_next_some().await;
+            }
+        });
+        Self { control, node }
+    }
+
+    async fn ask(
+        &mut self,
+        req: &midwimble::network::light_protocol::LightRequest,
+    ) -> midwimble::network::light_protocol::LightResponse {
+        use midwimble::network::light_protocol::{
+            read_response_raw, write_request_raw, LIGHT_PROTOCOL,
+        };
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut s = self
+                .control
+                .open_stream(self.node, LIGHT_PROTOCOL)
+                .await
+                .unwrap();
+            write_request_raw(&mut s, req).await.unwrap();
+            read_response_raw(&mut s).await.unwrap()
+        })
+        .await
+        .expect("the node answers a light client")
+    }
+
+    /// `req`'s answer, which must be a success.
+    async fn data(
+        &mut self,
+        req: &midwimble::network::light_protocol::LightRequest,
+    ) -> serde_json::Value {
+        let r = self.ask(req).await;
+        assert!(r.ok, "{req:?}: {:?}", r.error);
+        r.data.unwrap()
+    }
+}
+
 /// What a browser wallet does (`web-wallet/`): dial the node over
 /// WebRTC-direct, then talk the light protocol. Browsers speak nothing else,
 /// and the node used to ban them on sight for it.
 #[cfg(feature = "webrtc")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn browser_wallets_reach_a_node_over_webrtc() {
-    use futures::StreamExt;
-    use libp2p::core::muxing::StreamMuxerBox;
-    use libp2p::{PeerId, StreamProtocol, Transport};
-    use midwimble::network::light_protocol::{
-        read_response_raw, write_request_raw, LightRequest, LIGHT_PROTOCOL,
-    };
+    use midwimble::network::light_protocol::LightRequest;
 
     let keys = WalletKeys::random();
     let node = TestNode::start(Some(keys.address()), vec![]).await;
     wait_until("a few blocks", 60, || node.height() > 3).await;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let (addr, peer) = loop {
-        let info = node.handle.info();
-        if let Some(a) = info.listen_addrs.iter().find(|a| a.contains("/certhash/")) {
-            break (
-                format!("{a}/p2p/{}", info.peer_id),
-                info.peer_id.parse::<PeerId>().unwrap(),
-            );
-        }
-        assert!(Instant::now() < deadline, "no WebRTC listener");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    let mut browser = Browser::connect(&node).await;
     // The data dir keeps the certificate, so the address survives a restart.
     assert!(node.dir.path().join("webrtc_cert.pem").exists());
 
-    let cert = libp2p_webrtc::tokio::Certificate::generate(&mut rand::rngs::OsRng).unwrap();
-    let mut browser = libp2p::SwarmBuilder::with_new_identity()
-        .with_tokio()
-        .with_other_transport(|key| {
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
-                libp2p_webrtc::tokio::Transport::new(key.clone(), cert)
-                    .map(|(p, c), _| (p, StreamMuxerBox::new(c))),
-            )
-        })
-        .unwrap()
-        .with_behaviour(|_| libp2p_stream::Behaviour::new())
-        .unwrap()
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
-        .build();
-    let mut control = browser.behaviour().new_control();
-    // rust-libp2p's WebRTC transport dials from its listening socket.
-    browser
-        .listen_on("/ip4/127.0.0.1/udp/0/webrtc-direct".parse().unwrap())
-        .unwrap();
-    browser
-        .dial(addr.parse::<libp2p::Multiaddr>().unwrap())
-        .unwrap();
-    tokio::spawn(async move {
-        loop {
-            browser.select_next_some().await;
-        }
-    });
-
-    async fn ask(
-        control: &mut libp2p_stream::Control,
-        peer: PeerId,
-        protocol: StreamProtocol,
-        req: &LightRequest,
-    ) -> midwimble::network::light_protocol::LightResponse {
-        let mut s = control.open_stream(peer, protocol).await.unwrap();
-        write_request_raw(&mut s, req).await.unwrap();
-        read_response_raw(&mut s).await.unwrap()
-    }
-
     // Asked twice, a second apart: a banned client would be gone by then.
     for _ in 0..2 {
-        let r = tokio::time::timeout(
-            Duration::from_secs(20),
-            ask(&mut control, peer, LIGHT_PROTOCOL, &LightRequest::GetState),
-        )
-        .await
-        .expect("the node answers a light client");
-        assert!(r.ok, "{:?}", r.error);
-        assert!(r.data.unwrap()["height"].as_u64().unwrap() > 3);
+        let state = browser.data(&LightRequest::GetState).await;
+        assert!(state["height"].as_u64().unwrap() > 3);
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     // Blocks come in bulk, as a wallet scanning the chain asks for them.
-    let r = ask(
-        &mut control,
-        peer,
-        LIGHT_PROTOCOL,
-        &LightRequest::GetBlocks {
+    let data = browser
+        .data(&LightRequest::GetBlocks {
             start_height: 0,
             count: 3,
-        },
-    )
-    .await;
-    let data = r.data.expect("blocks");
+        })
+        .await;
     let blocks: Vec<midwimble::core::Batch> =
         bincode::deserialize(&hex::decode(data["blocks_hex"].as_str().unwrap()).unwrap()).unwrap();
     assert_eq!(blocks.len(), 3);
@@ -888,6 +911,106 @@ async fn browser_wallets_reach_a_node_over_webrtc() {
         blocks[0].extension.final_hash,
         midwimble::core::Batch::genesis().extension.final_hash
     );
+    node.stop().await;
+}
+
+/// A browser wallet reads scan data rather than whole blocks: a block's
+/// worth tells it whether the block holds its payments, and it is the same
+/// on every node. The node also tells it where else to send its requests:
+/// its own WebRTC address and those of the nodes it is connected to.
+#[cfg(feature = "webrtc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn browser_wallets_read_scan_data_and_find_other_nodes() {
+    use midwimble::core::scan::ScanRun;
+    use midwimble::network::light_protocol::LightRequest;
+
+    let miner = WalletKeys::random();
+    let node = TestNode::start(Some(miner.address()), vec![]).await;
+    let other = TestNode::start(None, vec![node.dial_addr().await]).await;
+    wait_until("a few blocks", 60, || node.height() > 6).await;
+    wait_until("the other node to follow", 60, || other.height() > 6).await;
+    let mut browser = Browser::connect(&node).await;
+    let mut browser2 = Browser::connect(&other).await;
+
+    let scan_of = |data: &serde_json::Value| -> ScanRun {
+        ScanRun::decode(&hex::decode(data["scan_hex"].as_str().unwrap()).unwrap()).unwrap()
+    };
+    let ask_scan = LightRequest::GetScanData {
+        start_height: 0,
+        count: 6,
+    };
+    let data = browser.data(&ask_scan).await;
+    assert_eq!(
+        (data["start_height"].as_u64(), data["count"].as_u64()),
+        (Some(0), Some(6))
+    );
+    let run = scan_of(&data);
+    assert_eq!(run.prev, midwimble::core::Batch::genesis().prev_header_hash);
+    // One block at a time: this test's client (rust-libp2p's WebRTC, unlike
+    // a browser's) cannot read an answer of more than 8 KiB.
+    for height in 0..run.blocks.len() {
+        let data = browser
+            .data(&LightRequest::GetBlock {
+                height: height as u64,
+            })
+            .await;
+        let block: midwimble::core::Batch =
+            bincode::deserialize(&hex::decode(data["block_hex"].as_str().unwrap()).unwrap())
+                .unwrap();
+        assert!(run.describes(height, &block), "block {height}");
+    }
+    // The miner's view key finds its reward in every mined block's scan data.
+    let view = miner.view_only();
+    for s in &run.blocks[1..] {
+        assert!(s.outputs.iter().any(|(r, tag)| view.may_own(r, *tag)));
+    }
+    // The other node serves the same scan data for the same chain.
+    assert_eq!(scan_of(&browser2.data(&ask_scan).await), run);
+
+    // Past the tip there is nothing, and no more than a request's worth.
+    let tip = node.height();
+    let data = browser
+        .data(&LightRequest::GetScanData {
+            start_height: tip + 10,
+            count: 5,
+        })
+        .await;
+    assert_eq!(data["count"].as_u64(), Some(0));
+
+    // Both nodes' WebRTC addresses, as browsers dial them. They are on
+    // loopback, and so is this browser, so loopback addresses are listed.
+    let mine = Browser::address_of(&node).await;
+    let theirs = Browser::address_of(&other).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let data = browser.data(&LightRequest::GetNodes).await;
+        let nodes: Vec<String> = serde_json::from_value(data["nodes"].clone()).unwrap();
+        assert!(nodes.contains(&mine), "{nodes:?}");
+        if nodes.contains(&theirs) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{theirs} never listed: {nodes:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let data = browser2.data(&LightRequest::GetNodes).await;
+    let nodes: Vec<String> = serde_json::from_value(data["nodes"].clone()).unwrap();
+    assert!(
+        nodes.contains(&mine) && nodes.contains(&theirs),
+        "{nodes:?}"
+    );
+
+    // A node that leaves is no longer listed.
+    other.stop().await;
+    wait_until("the other node to be dropped", 30, || {
+        node.handle.info().peers.is_empty()
+    })
+    .await;
+    let data = browser.data(&LightRequest::GetNodes).await;
+    let nodes: Vec<String> = serde_json::from_value(data["nodes"].clone()).unwrap();
+    assert!(!nodes.contains(&theirs), "{nodes:?}");
     node.stop().await;
 }
 

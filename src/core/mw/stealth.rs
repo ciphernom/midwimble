@@ -268,6 +268,15 @@ impl ViewKey {
         parsed
     }
 
+    /// Whether an output with this ephemeral key and view tag may pay this
+    /// key's address: true for every output that does, and for one in 256
+    /// that do not. What a wallet reading scan data (`core/scan.rs`) decides
+    /// by whether to fetch a whole block.
+    pub fn may_own(&self, ephemeral_key: &Point32, tag: u8) -> bool {
+        decompress(ephemeral_key)
+            .is_some_and(|r| view_tag(&shared_secret(&(self.scan_secret * r))) == tag)
+    }
+
     /// The value of `output` if it pays this key's address, and whether its
     /// recovery commitment is right (see [`OwnedOutput::recovery_ok`]).
     pub fn scan(&self, output: &Output) -> Option<(u64, bool)> {

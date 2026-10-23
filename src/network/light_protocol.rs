@@ -3,8 +3,10 @@
 //! Ported from midstate `src/network/light_protocol.rs`: JSON bodies with a
 //! 4-byte little-endian length prefix on a raw `libp2p-stream` stream, plus a
 //! push protocol for new-tip notifications. The request set is reduced to what
-//! a MimbleWimble wallet needs: headers and filters to follow the chain, whole
-//! blocks to scan with a view key, UTXO proofs, and transaction submission.
+//! a MimbleWimble wallet needs: headers and filters to follow the chain, scan
+//! data (`core/scan.rs`) to scan with a view key, whole blocks where the scan
+//! data says they matter, UTXO proofs, transaction submission, and the other
+//! nodes a browser can reach.
 
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::StreamProtocol;
@@ -46,6 +48,18 @@ pub enum LightRequest {
     /// zero unless `start_height` is past its tip.
     #[serde(rename = "get_blocks")]
     GetBlocks { start_height: u64, count: u64 },
+    /// Consecutive blocks' scan data from `start_height`, as one hex-encoded
+    /// `core::scan::ScanRun` (`ScanRun::encode`): what a wallet reads to find
+    /// which blocks it needs whole. As `get_blocks`, the node may return
+    /// fewer than `count`, never zero unless `start_height` is past its tip
+    /// or below the blocks it has pruned.
+    #[serde(rename = "get_scan_data")]
+    GetScanData { start_height: u64, count: u64 },
+    /// WebRTC addresses of this node and of the nodes it is connected to
+    /// (at most [`MAX_LIGHT_NODES`]): where else a browser wallet can send
+    /// its requests.
+    #[serde(rename = "get_nodes")]
+    GetNodes,
     /// One page of the unspent outputs, as the RPC's `/utxos` gives it: for
     /// a wallet restoring from a node that has pruned the blocks it would
     /// otherwise scan (`docs/PRUNING.md`). `after` is the last commitment of
@@ -87,6 +101,7 @@ impl LightRequest {
             LightRequest::GetFilters { .. }
                 | LightRequest::GetHeaders { .. }
                 | LightRequest::GetBlocks { .. }
+                | LightRequest::GetScanData { .. }
                 | LightRequest::GetUtxos { .. }
                 | LightRequest::SubmitTransaction { .. }
         )
@@ -95,6 +110,12 @@ impl LightRequest {
 
 /// Most blocks one `get_blocks` returns.
 pub const MAX_LIGHT_BLOCKS: u64 = 200;
+/// Most blocks one `get_scan_data` covers. The node reads each block whole
+/// to answer, so this bounds its work rather than the response, which is
+/// about 100 bytes a block.
+pub const MAX_LIGHT_SCAN_BLOCKS: u64 = 2_000;
+/// Most addresses one `get_nodes` lists.
+pub const MAX_LIGHT_NODES: usize = 32;
 /// Most transaction hashes one `get_mempool` lists.
 pub const MAX_LIGHT_MEMPOOL_HASHES: usize = 4_096;
 /// Most transactions one `get_mempool_txs` may ask for.
@@ -240,6 +261,21 @@ mod tests {
             }
         ));
         assert!(parsed.is_expensive());
+        let parsed: LightRequest = serde_json::from_str(
+            r#"{"method":"get_scan_data","params":{"start_height":9,"count":2000}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed,
+            LightRequest::GetScanData {
+                start_height: 9,
+                count: 2000
+            }
+        ));
+        assert!(parsed.is_expensive());
+        let parsed: LightRequest = serde_json::from_str(r#"{"method":"get_nodes"}"#).unwrap();
+        assert!(matches!(parsed, LightRequest::GetNodes));
+        assert!(!parsed.is_expensive());
         let parsed: LightRequest =
             serde_json::from_str(r#"{"method":"get_utxos","params":{}}"#).unwrap();
         assert!(matches!(

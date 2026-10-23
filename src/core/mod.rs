@@ -13,6 +13,7 @@ pub mod mss;
 pub mod mw;
 pub mod recovery;
 pub mod relay;
+pub mod scan;
 pub mod simd_mining;
 pub mod snapshot;
 pub mod state;
