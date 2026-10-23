@@ -51,7 +51,7 @@ a { color: inherit; text-decoration: none; }
 .app { padding-bottom: calc(56px + env(safe-area-inset-bottom)); }
 .content { max-width: 560px; margin: 0 auto; padding: 0 20px; }
 .sidebar { display: none; }
-.app.bare { min-height: 100vh; display: flex; align-items: center; padding: 32px 16px; }
+.app.bare { min-height: 100vh; display: flex; align-items: center; padding: 32px 16px;justify-content: center; }
 .app.bare .content { width: 100%; padding: 0; }
 
 .topbar {
