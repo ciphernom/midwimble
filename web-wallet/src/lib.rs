@@ -169,6 +169,40 @@ pub fn header_ids(headers_hex: &str) -> Result<String, JsError> {
     Ok(json(&ids))
 }
 
+/// Scan data for consecutive blocks, as `get_scan_data` answers: what
+/// `Wallet.scan_compact` reads instead of the blocks. Free it when done.
+#[wasm_bindgen]
+pub struct ScanData(wallet::ScanChunk);
+
+#[wasm_bindgen]
+impl ScanData {
+    /// The scan data of the blocks from `start` (`scan_hex`, one hex bincode
+    /// `Vec<ScanBlock>`).
+    #[wasm_bindgen(constructor)]
+    pub fn new(start: f64, scan_hex: &str) -> Result<ScanData, JsError> {
+        Ok(ScanData(
+            wallet::ScanChunk::from_hex(whole(start, "a height")?, scan_hex).map_err(err)?,
+        ))
+    }
+
+    pub fn start(&self) -> f64 {
+        self.0.start() as f64
+    }
+
+    /// The height after the last block it covers.
+    pub fn end(&self) -> f64 {
+        self.0.end() as f64
+    }
+
+    /// The id (hex) of block `height`, if it covers it.
+    pub fn id(&self, height: f64) -> Result<Option<String>, JsError> {
+        Ok(self
+            .0
+            .get(whole(height, "a height")?)
+            .map(|b| hex::encode(b.id)))
+    }
+}
+
 // ── The wallet ──────────────────────────────────────────────────────────────
 
 #[wasm_bindgen]
@@ -307,6 +341,39 @@ impl Wallet {
             "confirmed": total.confirmed,
             "failed": total.failed,
         })))
+    }
+
+    /// Applies blocks of `data`, from the next one to scan, while their scan
+    /// data shows they neither pay this wallet nor spend its coins. Returns
+    /// JSON {scanned, need, reorg}: `need` is the height of the block after
+    /// them if the wallet needs it whole (fetch it and `scan_full` it), and
+    /// `reorg` says it does not build on the last block scanned.
+    pub fn scan_compact(&mut self, data: &mut ScanData) -> Result<String, JsError> {
+        Ok(json(&self.0.scan_compact(&mut data.0).map_err(err)?))
+    }
+
+    /// JSON list of the heights in `data` whose blocks this wallet needs
+    /// whole as it stands: to fetch ahead of `scan_compact`.
+    pub fn wanted(&self, data: &mut ScanData) -> String {
+        json(&self.0.wanted(&mut data.0))
+    }
+
+    /// Applies block `height` of `data`, fetched whole (hex bincode, as
+    /// `get_block` sends it), after checking it is the block the scan data
+    /// describes. Returns JSON {received, spent, confirmed, failed}; throws
+    /// "the block does not match its scan data…" if it is not.
+    pub fn scan_full(
+        &mut self,
+        data: &ScanData,
+        height: f64,
+        block_hex: &str,
+    ) -> Result<String, JsError> {
+        let batch = wallet::block_from_hex(block_hex).map_err(err)?;
+        let report = self
+            .0
+            .scan_full(&data.0, whole(height, "a height")?, &batch)
+            .map_err(err)?;
+        Ok(json(&report))
     }
 
     /// Rebuilds from unspent outputs (JSON [{output_hex, height, coinbase}],

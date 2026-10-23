@@ -1,12 +1,17 @@
 //! The wallet, free of JavaScript types so that it can be tested natively.
 //!
 //! It is `src/wallet`'s wallet (keys from a BIP39 mnemonic, view-key
-//! scanning of whole blocks, largest-first coin selection, payments to
-//! stealth addresses) minus the file and the RPC client: the browser feeds
-//! it blocks fetched over the light protocol and stores [`WalletCore::seal`]ed
-//! bytes. Those bytes are the CLI's wallet file format, `MWWALLET1`
-//! (Argon2id, XChaCha20-Poly1305, the same JSON), so a wallet moves between
-//! the browser and `midwimble wallet` as a file.
+//! scanning, largest-first coin selection, payments to stealth addresses)
+//! minus the file and the RPC client: the browser feeds it what it fetches
+//! over the light protocol and stores [`WalletCore::seal`]ed bytes. Those
+//! bytes are the CLI's wallet file format, `MWWALLET1` (Argon2id,
+//! XChaCha20-Poly1305, the same JSON), so a wallet moves between the browser
+//! and `midwimble wallet` as a file.
+//!
+//! It scans a block either whole ([`WalletCore::scan_block`]) or by its scan
+//! data (`core/scan.rs`, [`WalletCore::scan_compact`]), which is enough to
+//! pass over every block that neither pays this wallet nor spends its coins;
+//! the few others it asks for whole.
 //!
 //! Both wallets keep `birth_height` and `sent` (its own payments, for its
 //! history and for broadcasting them again). The CLI also records block 0
@@ -23,6 +28,7 @@ use midwimble::core::mw::{
     build_transaction, Output, Payment, Spendable, StealthAddress, Transaction, ViewKey, WalletKeys,
 };
 use midwimble::core::recovery;
+use midwimble::core::scan::{input_prefix, ScanBlock, ScanRun, INPUT_PREFIX};
 use midwimble::core::types::{
     COINBASE_MATURITY, INPUT_WEIGHT, KERNEL_WEIGHT, MIN_FEE_PER_WEIGHT, OUTPUT_WEIGHT,
 };
@@ -40,6 +46,9 @@ const REORG_WINDOW: usize = 200;
 /// What `scan_block` fails with when a block does not extend the chain this
 /// wallet scanned: the caller rolls back and scans again.
 pub const REORG: &str = "reorg detected";
+/// What [`WalletCore::scan_full`] fails with when a block is not the one its
+/// scan data describes: one of the nodes has another chain, or lied.
+pub const MISMATCH: &str = "the block does not match its scan data";
 
 // ── Stored data ─────────────────────────────────────────────────────────────
 
@@ -194,6 +203,67 @@ pub struct PendingTx {
     pub tx_hash: String,
     pub tx_hex: String,
     pub created_at: u64,
+}
+
+/// What [`WalletCore::scan_compact`] did.
+#[derive(Debug, Default, Serialize, PartialEq, Eq)]
+pub struct CompactScan {
+    /// Blocks applied by their scan data alone.
+    pub scanned: u64,
+    /// The height of the block after them if this wallet needs it whole:
+    /// fetch it and apply it with [`WalletCore::scan_full`].
+    pub need: Option<u64>,
+    /// The block after them does not build on the last block scanned.
+    pub reorg: bool,
+}
+
+// ── Scan data ───────────────────────────────────────────────────────────────
+
+/// Scan data for consecutive blocks (`get_scan_data`), and what a wallet has
+/// worked out from it so far.
+pub struct ScanChunk {
+    start: u64,
+    run: ScanRun,
+    /// Per block, once worked out (a scalar multiplication per output):
+    /// whether one of its outputs carries the wallet's view tag.
+    tagged: Vec<Option<bool>>,
+}
+
+impl ScanChunk {
+    /// The scan data of blocks from `start` on, as `get_scan_data` sends
+    /// it: one hex [`ScanRun`].
+    pub fn from_hex(start: u64, hex_str: &str) -> Result<Self> {
+        let bytes =
+            hex::decode(hex_str.trim()).map_err(|e| anyhow!("scan data is not hex: {e}"))?;
+        Ok(Self::new(start, ScanRun::decode(&bytes)?))
+    }
+
+    pub fn new(start: u64, run: ScanRun) -> Self {
+        Self {
+            start,
+            tagged: vec![None; run.blocks.len()],
+            run,
+        }
+    }
+
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+
+    /// The height after the last block it covers.
+    pub fn end(&self) -> u64 {
+        self.start + self.run.blocks.len() as u64
+    }
+
+    /// Block `height`'s scan data, if this covers it.
+    pub fn get(&self, height: u64) -> Option<&ScanBlock> {
+        self.run.blocks.get(self.index(height)?)
+    }
+
+    fn index(&self, height: u64) -> Option<usize> {
+        let i = usize::try_from(height.checked_sub(self.start)?).ok()?;
+        (i < self.run.blocks.len()).then_some(i)
+    }
 }
 
 // ── Free functions ──────────────────────────────────────────────────────────
@@ -543,12 +613,8 @@ impl WalletCore {
                 height
             );
         }
-        if height > 0 {
-            if let Some(prev) = self.recorded_hash(height - 1) {
-                if prev != batch.prev_header_hash {
-                    bail!("{REORG} below height {height}");
-                }
-            }
+        if !self.builds_on(height, &batch.prev_header_hash) {
+            bail!("{REORG} below height {height}");
         }
         let mut report = ScanReport::default();
 
@@ -622,6 +688,114 @@ impl WalletCore {
         // Payments in the mempool that this block confirmed are coins now.
         self.incoming
             .retain(|i| !i.outputs.iter().any(|(c, _)| known.contains(c)));
+        self.finish_block(height, batch.extension.final_hash);
+        Ok(report)
+    }
+
+    /// Applies blocks of `chunk`, from the next one to scan, by their scan
+    /// data alone while they neither pay this wallet nor may spend its coins.
+    /// Stops at the first block that may (an output with this wallet's view
+    /// tag, an input with the prefix of one of its coins), which it then
+    /// needs whole, or that does not build on the last block scanned.
+    pub fn scan_compact(&mut self, chunk: &mut ScanChunk) -> Result<CompactScan> {
+        let next = self.data.scanned_height;
+        if next < chunk.start || next > chunk.end() {
+            bail!(
+                "the scan data is for blocks {} to {}, and the next block to scan is {next}",
+                chunk.start,
+                chunk.end().saturating_sub(1)
+            );
+        }
+        let coins = self.coin_prefixes();
+        let mut out = CompactScan::default();
+        for height in next..chunk.end() {
+            let i = (height - chunk.start) as usize;
+            if !self.builds_on(height, &chunk.run.prev_of(i)) {
+                out.reorg = true;
+                break;
+            }
+            if self.needs(&coins, chunk, i) {
+                out.need = Some(height);
+                break;
+            }
+            self.finish_block(height, chunk.run.blocks[i].id);
+            out.scanned += 1;
+        }
+        Ok(out)
+    }
+
+    /// The heights of the blocks in `chunk`, from the next one to scan, that
+    /// this wallet needs whole as it stands: what to fetch ahead of
+    /// [`Self::scan_compact`]. A block that spends a coin an earlier block
+    /// pays is not among them until that coin is found.
+    pub fn wanted(&self, chunk: &mut ScanChunk) -> Vec<u64> {
+        let coins = self.coin_prefixes();
+        (self.data.scanned_height.max(chunk.start)..chunk.end())
+            .filter(|&h| self.needs(&coins, chunk, (h - chunk.start) as usize))
+            .collect()
+    }
+
+    /// Applies block `height` of `chunk`, fetched whole (from any node),
+    /// once it is checked to be the block the scan data describes; fails
+    /// with [`MISMATCH`] if it is not, and applies nothing.
+    pub fn scan_full(
+        &mut self,
+        chunk: &ScanChunk,
+        height: u64,
+        batch: &Batch,
+    ) -> Result<ScanReport> {
+        let i = chunk
+            .index(height)
+            .ok_or_else(|| anyhow!("the scan data does not cover block {height}"))?;
+        if !chunk.run.describes(i, batch) {
+            bail!("{MISMATCH} at height {height}");
+        }
+        self.scan_block(height, batch)
+    }
+
+    /// Whether block `i` of `chunk` may concern this wallet, whose coins'
+    /// prefixes are `coins`.
+    fn needs(&self, coins: &HashSet<[u8; INPUT_PREFIX]>, chunk: &mut ScanChunk, i: usize) -> bool {
+        let block = &chunk.run.blocks[i];
+        if block.inputs.iter().any(|p| coins.contains(p)) {
+            return true;
+        }
+        if let Some(tagged) = chunk.tagged[i] {
+            return tagged;
+        }
+        let tagged = block
+            .outputs
+            .iter()
+            .any(|(r, tag)| self.view.may_own(r, *tag));
+        chunk.tagged[i] = Some(tagged);
+        tagged
+    }
+
+    /// Prefixes of the commitments of this wallet's unspent coins, and of
+    /// the coins its unsettled payments spend.
+    fn coin_prefixes(&self) -> HashSet<[u8; INPUT_PREFIX]> {
+        let unspent = self
+            .data
+            .coins
+            .iter()
+            .filter(|c| c.spent_height.is_none())
+            .map(|c| &c.output.commitment);
+        let paying = self
+            .data
+            .sent
+            .iter()
+            .filter(|s| s.height.is_none() && s.failed_at.is_none())
+            .flat_map(|s| s.inputs.iter());
+        unspent.chain(paying).map(input_prefix).collect()
+    }
+
+    /// Whether block `height`, built on `prev`, follows the blocks scanned.
+    fn builds_on(&self, height: u64, prev: &[u8; 32]) -> bool {
+        height == 0 || self.recorded_hash(height - 1).is_none_or(|h| h == *prev)
+    }
+
+    /// Records block `height`, whose id is `id`, as scanned.
+    fn finish_block(&mut self, height: u64, id: [u8; 32]) {
         // Past the reorg window a payment's block is settled for this
         // wallet: its transaction is no longer needed.
         for s in &mut self.data.sent {
@@ -632,13 +806,11 @@ impl WalletCore {
                 s.tx_hex = None;
             }
         }
-
-        self.data.recent.push((height, batch.extension.final_hash));
+        self.data.recent.push((height, id));
         if self.data.recent.len() > REORG_WINDOW {
             self.data.recent.remove(0);
         }
         self.data.scanned_height = height + 1;
-        Ok(report)
     }
 
     /// Scans transactions waiting in a node's mempool for payments to this

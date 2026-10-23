@@ -1,12 +1,30 @@
-// light_client.js: the browser's line to a midwimble node.
+// light_client.js: the browser's line to midwimble nodes.
 //
 // js-libp2p over WebRTC-direct: no domain, no certificate authority, no
-// HTTPS gateway. The browser authenticates the node by the certificate hash
+// HTTPS gateway. The browser authenticates a node by the certificate hash
 // in its address (/certhash/…) and its libp2p identity (/p2p/…). Ported from
 // midstate's wasm-wallet/light_client.js, with its fixes kept: streams are
 // released as soon as a response is read (else a scan exhausts the
 // 64-streams-per-protocol cap), and the write side is half-closed right
 // after the request.
+//
+// It keeps connections to a few nodes at once (POOL_SIZE), picked at random
+// from the configured ones and from those the nodes it reaches know of
+// (`get_nodes`), and uses a node only once it has checked that the node
+// follows the wallet's genesis block. One of them, picked at random, is the
+// wallet's primary: the wallet follows the chain through it (its state, its
+// scan data, its new-tip pushes). A request that may go anywhere
+// (`{spread: true}`, the whole blocks a wallet fetches) goes to a node
+// picked at random, so that no one node sees all a wallet asks for, and
+// wallets spread their load over the nodes there are rather than all using
+// the first one in the configuration.
+//
+// The nodes it learns of are anyone's, and a light wallet believes the node
+// it follows, so the pool keeps watch on its primary: one configured node
+// stays in the pool while one can be reached; the primary is picked among
+// the nodes near the pool's median height, which one node claiming a great
+// height cannot move; and the nodes vote on a block a little below the tip,
+// and a primary the others contradict is dropped.
 //
 // Wire format (src/network/light_protocol.rs): a JSON request
 // {"method", "params"} and a JSON response {ok, data?, error?}, each behind
@@ -15,7 +33,7 @@
 //
 // `npm run bundle` turns this file into light_client.bundle.js, which the
 // page loads. RTCPeerConnection does not exist in workers, so this runs on
-// the page's main thread and the wallet worker reaches the node through it.
+// the page's main thread and the wallet worker reaches the nodes through it.
 
 import { createLibp2p } from 'libp2p';
 import { webRTCDirect } from '@libp2p/webrtc';
@@ -25,9 +43,26 @@ const LIGHT_PROTOCOL = '/midwimble/light/2.0.0';
 const PUSH_PROTOCOL = '/midwimble/light-push/2.0.0';
 const REQUEST_TIMEOUT_MS = 30_000;
 const DIAL_TIMEOUT_MS = 8_000;
+/** Nodes connected at once. */
+const POOL_SIZE = 3;
+/** Addresses learned from nodes, kept at most (configured ones aside). */
+const MAX_FOUND = 64;
+/** Addresses learned from any one node's answer, at most. */
+const MAX_FOUND_PER_ANSWER = 8;
+/** Failed dials in a row after which a learned address is forgotten. */
+const FORGET_AFTER_FAILURES = 4;
+/** Blocks a node's height may be from the pool's median for it to become
+ *  the primary. */
+const PRIMARY_SLACK = 2;
+/** Blocks the primary may fall behind the pool's median before another
+ *  node takes over. */
+const PRIMARY_LAG = 6;
+/** How far below the primary's tip the pool votes on a block. */
+const VOTE_DEPTH = 6;
 /** The node's own limit on a light message (light_protocol.rs). */
 const MAX_MESSAGE = 4_000_000;
-/** Requests in flight at once: well under the node's 50 streams per peer. */
+/** Requests in flight at once on each connection: well under the node's 50
+ *  streams per peer. */
 const MAX_IN_FLIGHT = 4;
 /**
  * Largest piece of a request written at once. Each becomes one framed
@@ -48,11 +83,16 @@ const ANSWER_FIELD = {
     get_headers: 'headers_hex',
     get_block: 'block_hex',
     get_blocks: 'blocks_hex',
+    get_scan_data: 'scan_hex',
+    get_nodes: 'nodes',
     get_utxos: 'outputs',
     get_mempool: 'count',
     get_mempool_txs: 'txs_hex',
     get_utxo_proof: 'proof',
 };
+/** What a browser can dial: WebRTC-direct, with the certificate hash and the
+ *  node's identity. */
+const DIALABLE = /^\/(ip4|ip6|dns4|dns6|dns)\/[^/]+\/udp\/\d+\/webrtc-direct\/certhash\/[^/]+\/p2p\/[^/]+$/;
 
 function shuffle(list) {
     const a = list.slice();
@@ -62,6 +102,9 @@ function shuffle(list) {
     }
     return a;
 }
+const pick = list => list[Math.floor(Math.random() * list.length)];
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const peerOf = addr => addr.slice(addr.lastIndexOf('/p2p/') + 5);
 
 function concat(chunks, total) {
     const out = new Uint8Array(total);
@@ -72,144 +115,349 @@ function concat(chunks, total) {
 
 const asBytes = d => (d instanceof Uint8Array ? d : d.subarray());
 
+/**
+ * The id of the first header in `get_headers`' answer (hex bincode
+ * `Vec<BatchHeader>`): its extension's final hash, which follows the list's
+ * length (8 bytes), the height (8), two midstates (32 each) and the
+ * extension's nonce (8).
+ */
+function firstHeaderId(hex) {
+    return typeof hex === 'string' && hex.length >= 240 ? hex.slice(176, 240).toLowerCase() : null;
+}
+
 export class LightClient {
     constructor() {
         this.node = null;
-        this.peer = null;        // PeerId of the node we use
-        this.addr = null;        // the address we reached it at
-        this.addrs = [];         // candidates, in the user's order
+        /** addr → {addr, found, failures, retryAt, bad}: where nodes may be. */
+        this.known = new Map();
+        /** peer id → {peer, id, addr, found, height, ready, inFlight, queue}. */
+        this.conns = new Map();
+        this.primary = null;     // peer id of the node the wallet follows
+        this.genesis = null;     // expected genesis block id, if configured
+        this.discover = true;    // learn nodes from the nodes reached
         this.closed = false;
-        this.inFlight = 0;
-        this.queue = [];
         this.seq = 0;            // numbers requests; the node echoes the number
+        this.errors = [];        // the latest dial failures, for the page
         this.onStatus = () => {};
         this.onPush = () => {};
-        this._retry = null;
-        this._attempt = 0;
+        this.onPool = () => {};
+        this._timer = null;
+        this._maintaining = null;
     }
 
-    /** Starts libp2p and connects to one of `addrs` (tried in random order). */
-    async start(addrs) {
-        this.addrs = [...new Set(addrs.map(a => String(a).trim()).filter(Boolean))];
-        if (!this.addrs.length) throw new Error('no node addresses to dial');
+    /**
+     * Starts libp2p and connects to nodes from `addrs` (the configured ones)
+     * and `found` (ones learned before). With `discover`, nodes reached are
+     * asked where other nodes are. With `genesis`, a node must follow that
+     * genesis block to be used.
+     */
+    async start(addrs, { genesis = null, found = [], discover = true } = {}) {
+        this.genesis = genesis ? String(genesis).toLowerCase() : null;
+        this.discover = discover;
+        this._learn(addrs, false);
+        if (discover) this._learn(found, true);
+        if (!this.known.size) throw new Error('no node addresses to dial');
         this.node = await createLibp2p({
             transports: [webRTCDirect()],
             // Allow private and loopback addresses: a wallet may well be
             // pointed at the node on its own machine or LAN.
             connectionGater: { denyDialMultiaddr: async () => false },
         });
-        await this.node.handle(PUSH_PROTOCOL, (stream) => this._readPush(stream));
+        await this.node.handle(PUSH_PROTOCOL, (stream, connection) => this._readPush(stream, connection));
         await this.node.start();
-        this.node.addEventListener('peer:disconnect', (evt) => {
-            if (this.peer && evt.detail.toString() === this.peer.toString()) {
-                this.peer = null;
-                this.onStatus('disconnected', this.addr);
-                this._scheduleReconnect();
-            }
-        });
-        await this._connectAny();
-    }
-
-    async _connectAny() {
+        this.node.addEventListener('peer:disconnect', (evt) => this._lost(evt.detail.toString()));
         this.onStatus('connecting', null);
-        const errors = [];
-        for (const a of shuffle(this.addrs)) {
-            if (this.closed) return;
-            try {
-                const ma = multiaddr(a);
-                const conn = await this.node.dial(ma, { signal: AbortSignal.timeout(DIAL_TIMEOUT_MS) });
-                this.peer = conn.remotePeer;
-                this.addr = a;
-                this._attempt = 0;
-                this.onStatus('connected', a);
-                return;
-            } catch (e) {
-                errors.push(`${a.slice(0, 48)}…: ${e.message || e}`);
-            }
-        }
-        this.onStatus('failed', errors.join('; '));
-        this._scheduleReconnect();
-    }
-
-    _scheduleReconnect() {
-        if (this.closed || this._retry) return;
-        // 3 s, 6 s, … capped at 30 s; a wallet left open keeps trying.
-        const delay = Math.min(30_000, 3_000 * ++this._attempt);
-        this._retry = setTimeout(async () => {
-            this._retry = null;
-            if (!this.closed && !this.peer) await this._connectAny();
-        }, delay);
+        await this._maintain();
     }
 
     get connected() {
-        return !!this.peer;
+        return !!this.primary;
     }
 
-    /** Replaces the candidate list and reconnects. */
-    async reconnect(addrs) {
-        this.addrs = [...new Set(addrs.map(a => String(a).trim()).filter(Boolean))];
-        const old = this.peer;
-        this.peer = null;
-        if (old) { try { await this.node.hangUp(old); } catch (_) {} }
-        await this._connectAny();
+    /** The nodes connected (that passed their checks), primary first. */
+    nodes() {
+        return [...this.conns.values()].filter(c => c.ready)
+            .map(c => ({ addr: c.addr, height: c.height, primary: c.id === this.primary }))
+            .sort((a, b) => b.primary - a.primary);
+    }
+
+    /** The learned addresses worth keeping for next time. */
+    found() {
+        return [...this.known.values()].filter(k => k.found && !k.bad).map(k => k.addr);
+    }
+
+    /** Stops using the primary for ten minutes (its answers did not hold
+     *  up), and follows another node. */
+    dropPrimary(why = 'its scan data did not match its blocks') {
+        const c = this.conns.get(this.primary);
+        if (!c) return;
+        const k = this.known.get(c.addr);
+        if (k) {
+            k.failures++;
+            k.retryAt = Date.now() + 600_000;
+        }
+        this.errors.push(`${c.addr.slice(0, 40)}…: ${why}`);
+        this.node.hangUp(c.peer).catch(() => {});
+        this._lost(c.id);
     }
 
     async stop() {
         this.closed = true;
-        clearTimeout(this._retry);
+        clearTimeout(this._timer);
         if (this.node) { try { await this.node.stop(); } catch (_) {} }
         this.node = null;
-        this.peer = null;
+        this.conns.clear();
+        this.primary = null;
     }
 
-    async _readPush(stream) {
-        // Handler signature differs across libp2p versions: ({stream}) or (stream).
-        const s = stream && stream.stream ? stream.stream : stream;
+    // ── the pool ───────────────────────────────────────────────────────────
+
+    /** Adds addresses to the known ones; returns those that are new. */
+    _learn(addrs, found) {
+        const fresh = [];
+        for (const raw of addrs || []) {
+            const addr = String(raw).trim();
+            if (!DIALABLE.test(addr) || this.known.has(addr)) continue;
+            this.known.set(addr, { addr, found, failures: 0, retryAt: 0, bad: false });
+            fresh.push(addr);
+        }
+        const learned = [...this.known.values()].filter(k => k.found);
+        for (const k of learned.slice(0, Math.max(0, learned.length - MAX_FOUND))) this.known.delete(k.addr);
+        return fresh;
+    }
+
+    /** Fills the pool, then comes back when an address may be tried again. */
+    _maintain() {
+        if (this.closed || this._maintaining) return this._maintaining;
+        clearTimeout(this._timer);
+        this._maintaining = (async () => {
+            try {
+                for (;;) {
+                    const want = POOL_SIZE - this.conns.size;
+                    if (this.closed || want <= 0) break;
+                    const picks = this._candidates(want);
+                    if (!picks.length) break;
+                    await Promise.all(picks.map(k => this._open(k)));
+                }
+            } finally {
+                this._maintaining = null;
+            }
+            if (this.closed) return;
+            if (!this.primary) {
+                this.onStatus('failed', this.errors.slice(-3).join('; ') || 'no node reachable');
+            } else {
+                await this._watchPrimary();
+            }
+            this._report();
+            // Again once an address is due, and every half minute regardless
+            // (to replace a node that has quietly gone).
+            const connected = new Set(this.conns.keys());
+            const due = [...this.known.values()]
+                .filter(k => !k.bad && !connected.has(peerOf(k.addr)))
+                .map(k => k.retryAt);
+            const next = this.conns.size < POOL_SIZE && due.length ? Math.min(...due) - Date.now() : 30_000;
+            this._timer = setTimeout(() => this._maintain(), Math.min(30_000, Math.max(2_000, next)));
+        })();
+        return this._maintaining;
+    }
+
+    /** Up to `n` addresses to dial: due, of nodes not connected, one each;
+     *  a configured one first if the pool has none. */
+    _candidates(n) {
+        const now = Date.now();
+        const peers = new Set(this.conns.keys());
+        const anchored = [...this.conns.values()].some(c => !c.found);
+        const due = shuffle([...this.known.values()]).filter(k => !k.bad && k.retryAt <= now);
+        if (!anchored) due.sort((a, b) => a.found - b.found);
+        const out = [];
+        for (const k of due) {
+            if (out.length >= n) break;
+            const peer = peerOf(k.addr);
+            if (peers.has(peer)) continue;
+            peers.add(peer);
+            out.push(k);
+        }
+        return out;
+    }
+
+    async _open(k) {
+        let conn;
         try {
-            const chunks = [];
-            let total = 0;
-            for await (const chunk of (s.source || s)) {
-                const bytes = asBytes(chunk);
-                chunks.push(bytes);
-                total += bytes.length;
-                if (total > MAX_MESSAGE) throw new Error('push too large');
-                if (total >= 4) {
-                    const buf = concat(chunks, total);
-                    const len = new DataView(buf.buffer, buf.byteOffset).getUint32(0, true);
-                    if (len > MAX_MESSAGE) throw new Error('push too large');
-                    if (total >= 4 + len) {
-                        const msg = JSON.parse(new TextDecoder().decode(buf.subarray(4, 4 + len)));
-                        this.onPush(msg);
-                        break;
-                    }
+            conn = await this.node.dial(multiaddr(k.addr), { signal: AbortSignal.timeout(DIAL_TIMEOUT_MS) });
+        } catch (e) {
+            this._failed(k, e);
+            return;
+        }
+        const id = conn.remotePeer.toString();
+        if (this.conns.has(id)) return;
+        const c = { peer: conn.remotePeer, id, addr: k.addr, found: k.found, height: 0, ready: false, inFlight: 0, queue: [] };
+        this.conns.set(id, c);
+        try {
+            const st = await this._call(c, 'get_state');
+            c.height = Number(st.height) || 0;
+            if (this.genesis) {
+                const d = await this._call(c, 'get_headers', { start_height: 0, count: 1 });
+                const id0 = firstHeaderId(d.headers_hex);
+                if (id0 !== this.genesis) {
+                    throw Object.assign(new Error(`on another network (genesis ${String(id0).slice(0, 12)}…)`), { bad: true });
                 }
             }
-        } catch (_) {
-            // A malformed push is dropped; the wallet also polls.
-        } finally {
-            try { s.close ? await s.close() : null; } catch (_) {}
+        } catch (e) {
+            this.conns.delete(id);
+            try { await this.node.hangUp(conn.remotePeer); } catch (_) {}
+            this._failed(k, e);
+            return;
+        }
+        if (!this.conns.has(id) || this.closed) return; // gone while checked
+        k.failures = 0;
+        k.retryAt = 0;
+        c.ready = true;
+        if (!this.primary) this._choosePrimary();
+        if (this.discover) this._discover(c);
+        this._report();
+    }
+
+    _failed(k, e) {
+        k.failures++;
+        // 5 s, 10 s, 20 s, … up to five minutes; a node on another network
+        // is not tried again.
+        k.retryAt = Date.now() + Math.min(300_000, 5_000 * 2 ** (k.failures - 1));
+        if (e && e.bad) k.bad = true;
+        if (k.found && (k.bad || k.failures >= FORGET_AFTER_FAILURES)) this.known.delete(k.addr);
+        this.errors.push(`${k.addr.slice(0, 40)}…: ${(e && e.message) || e}`);
+        this.errors = this.errors.slice(-10);
+    }
+
+    /** Asks a node where other nodes are (an older node does not know), and
+     *  keeps a few of its answers: no one node fills the list. */
+    async _discover(c) {
+        let d;
+        try { d = await this._call(c, 'get_nodes'); } catch (_) { return; }
+        const listed = shuffle(Array.isArray(d.nodes) ? d.nodes : []).slice(0, MAX_FOUND_PER_ANSWER);
+        const fresh = this._learn(listed, true);
+        if (fresh.length) {
+            this._report();
+            this._maintain();
         }
     }
 
+    _lost(id) {
+        const c = this.conns.get(id);
+        if (!c) return;
+        this.conns.delete(id);
+        c.queue.splice(0).forEach(wake => wake()); // they find it gone
+        if (this.primary === id) {
+            this.primary = null;
+            this._choosePrimary();
+            if (!this.primary) this.onStatus('disconnected', c.addr);
+        }
+        this._report();
+        this._maintain();
+    }
+
+    /** The median of the ready nodes' heights (the lower middle one). */
+    _median() {
+        const heights = [...this.conns.values()].filter(c => c.ready).map(c => c.height).sort((a, b) => a - b);
+        return heights.length ? heights[Math.floor((heights.length - 1) / 2)] : 0;
+    }
+
+    /** A random node among those near the pool's median height. */
+    _choosePrimary(except) {
+        const ready = [...this.conns.values()].filter(c => c.ready && c.id !== except);
+        if (!ready.length) return;
+        const median = this._median();
+        const near = ready.filter(r => Math.abs(r.height - median) <= PRIMARY_SLACK);
+        const c = pick(near.length ? near : ready);
+        this.primary = c.id;
+        this.onStatus('connected', c.addr);
+    }
+
     /**
-     * One light request: resolves with `data`, rejects with the node's error.
-     * A stream that fails without an answer is tried again twice: WebRTC
-     * data channels are reused quickly, and a new stream occasionally
-     * collides with the reset of the one before it. An error from the node
-     * itself is final. Repeating a submit_transaction is harmless: the node
-     * answers a duplicate with "already in pool".
+     * Another node takes over from a primary whose height has drifted from
+     * the pool's (fallen behind, or claimed past it), or whose block a
+     * little below the pool's tip most of the others contradict. With fewer
+     * than three nodes there is no majority, and the primary stays.
      */
-    async call(method, params) {
+    async _watchPrimary() {
+        const p = this.conns.get(this.primary);
+        if (!p) return;
+        // Heights fresh from each node, not only from the pushes it sent.
+        await Promise.all([...this.conns.values()].filter(c => c.ready)
+            .map(c => this._call(c, 'get_state').catch(() => {})));
+        if (this.primary !== p.id) return;
+        const median = this._median();
+        if (Math.abs(p.height - median) > PRIMARY_LAG) {
+            this._choosePrimary(p.id);
+            return;
+        }
+        const ready = [...this.conns.values()].filter(c => c.ready);
+        const height = Math.min(p.height, median) - 1 - VOTE_DEPTH;
+        if (ready.length < 3 || height < 1) return;
+        const ids = await Promise.all(ready.map(c => this._call(c, 'get_headers', { start_height: height, count: 1 })
+            .then(d => firstHeaderId(d.headers_hex), () => null)));
+        const mine = ids[ready.indexOf(p)];
+        const others = ids.filter((id, i) => id && ready[i] !== p);
+        const against = others.filter(id => id !== mine).length;
+        if (this.primary === p.id && others.length >= 2 && against * 2 > others.length) {
+            this.dropPrimary(`its block ${height} is not the other nodes'`);
+        }
+    }
+
+    _report() {
+        try { this.onPool({ nodes: this.nodes(), found: this.found() }); } catch (_) {}
+    }
+
+    // ── requests ───────────────────────────────────────────────────────────
+
+    /**
+     * One light request: resolves with `data`, rejects with the node's
+     * error. It goes to the primary, or with `spread` to a node picked at
+     * random, and on to another if that one fails or cannot answer (a node
+     * that is behind, or has pruned the block).
+     */
+    async call(method, params, { spread = false } = {}) {
+        const tried = new Set();
+        let last;
+        for (let attempt = 0; attempt < 4; attempt++) {
+            let c;
+            if (spread) {
+                const ready = [...this.conns.values()].filter(r => r.ready && !tried.has(r.id));
+                c = ready.length ? pick(ready) : null;
+            } else {
+                if (attempt) await sleep(250 * attempt);
+                c = this.conns.get(this.primary);
+            }
+            if (!c) break;
+            try {
+                return await this._call(c, method, params);
+            } catch (e) {
+                last = e;
+                tried.add(c.id);
+                // The primary's answer stands, unless it was too busy to give one.
+                if (!spread && e.nodeError && !/busy|rate limit/.test(e.message)) throw e;
+            }
+        }
+        throw last || new Error('not connected to a node');
+    }
+
+    /**
+     * A request to one node. A stream that fails without an answer is tried
+     * again twice: WebRTC data channels are reused quickly, and a new stream
+     * occasionally collides with the reset of the one before it. An error
+     * from the node itself is final. Repeating a submit_transaction is
+     * harmless: the node answers a duplicate with "already in pool".
+     */
+    async _call(c, method, params) {
         const req = params === undefined ? { method } : { method, params };
         let last;
         for (let attempt = 0; attempt < 3; attempt++) {
-            if (attempt) await new Promise(r => setTimeout(r, 150 * attempt));
+            if (attempt) await sleep(150 * attempt);
             let resp;
             try {
-                resp = await this._queued(() => this._request(req));
+                resp = await this._queued(c, () => this._request(c, req));
             } catch (e) {
                 last = e;
-                if (!this.peer) break;
+                if (!this.conns.has(c.id)) break;
                 continue;
             }
             if (!resp || resp.ok !== true) {
@@ -223,29 +471,29 @@ export class LightClient {
                 last = new Error(`${method}: the node's answer did not match the request`);
                 continue;
             }
+            if (method === 'get_state' && Number.isSafeInteger(resp.data.height)) c.height = resp.data.height;
             return resp.data;
         }
         throw last;
     }
 
-    async _queued(fn) {
-        while (this.inFlight >= MAX_IN_FLIGHT) {
-            await new Promise(r => this.queue.push(r));
+    async _queued(c, fn) {
+        while (c.inFlight >= MAX_IN_FLIGHT && this.conns.has(c.id)) {
+            await new Promise(r => c.queue.push(r));
         }
-        this.inFlight++;
+        c.inFlight++;
         try {
             return await fn();
         } finally {
-            this.inFlight--;
-            const next = this.queue.shift();
+            c.inFlight--;
+            const next = c.queue.shift();
             if (next) next();
         }
     }
 
-    async _request(req) {
-        if (!this.peer) throw new Error('not connected to a node');
-        const conns = this.node.getConnections(this.peer);
-        if (!conns.length) throw new Error('not connected to a node');
+    async _request(c, req) {
+        const conns = this.conns.has(c.id) ? this.node.getConnections(c.peer) : [];
+        if (!conns.length) throw new Error('not connected to the node');
         const stream = await conns[0].newStream([LIGHT_PROTOCOL], { signal: AbortSignal.timeout(DIAL_TIMEOUT_MS) });
         const id = ++this.seq;
         try {
@@ -317,6 +565,45 @@ export class LightClient {
         } finally {
             // Frees the stream slot now rather than after the FIN handshake.
             try { stream.abort(new Error('done')); } catch (_) {}
+        }
+    }
+
+    // ── pushes ─────────────────────────────────────────────────────────────
+
+    /** A new tip, pushed by a node: the primary's is passed on; the others'
+     *  keep their heights current, for choosing a primary. */
+    async _readPush(stream, connection) {
+        // Handler signature differs across libp2p versions: ({stream,
+        // connection}) or (stream, connection).
+        const s = stream && stream.stream ? stream.stream : stream;
+        const conn = (stream && stream.connection) || connection;
+        const from = conn && conn.remotePeer ? conn.remotePeer.toString() : null;
+        try {
+            const chunks = [];
+            let total = 0;
+            for await (const chunk of (s.source || s)) {
+                const bytes = asBytes(chunk);
+                chunks.push(bytes);
+                total += bytes.length;
+                if (total > MAX_MESSAGE) throw new Error('push too large');
+                if (total >= 4) {
+                    const buf = concat(chunks, total);
+                    const len = new DataView(buf.buffer, buf.byteOffset).getUint32(0, true);
+                    if (len > MAX_MESSAGE) throw new Error('push too large');
+                    if (total >= 4 + len) {
+                        const msg = JSON.parse(new TextDecoder().decode(buf.subarray(4, 4 + len)));
+                        const c = from && this.conns.get(from);
+                        const height = msg && msg.payload && msg.payload.height;
+                        if (c && Number.isSafeInteger(height)) c.height = Math.max(c.height, height + 1);
+                        if (!from || from === this.primary) this.onPush(msg);
+                        break;
+                    }
+                }
+            }
+        } catch (_) {
+            // A malformed push is dropped; the wallet also polls.
+        } finally {
+            try { s.close ? await s.close() : null; } catch (_) {}
         }
     }
 }

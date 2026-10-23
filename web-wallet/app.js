@@ -1,12 +1,15 @@
 // app.js: the page. Draws the wallet in the explorer's style, owns the
-// WebRTC connection to a node (light_client.bundle.js), and relays the
-// wallet worker's requests to it. Everything from the chain or the user is
+// WebRTC connections to nodes (light_client.bundle.js), and relays the
+// wallet worker's requests to them. Everything from the chain or the user is
 // rendered as text, never as HTML.
 
 import { qrSvg } from './qr.js';
 
 const COIN = 100_000_000;
 const NODES_KEY = 'midwimble.nodes';
+/** Nodes learned from other nodes (`get_nodes`), per network. */
+const FOUND_KEY = 'midwimble.found';
+const WHOLE_BLOCKS_KEY = 'midwimble.wholeBlocks';
 const $view = document.getElementById('view');
 const $nav = document.getElementById('nav');
 const $net = document.getElementById('net');
@@ -20,6 +23,7 @@ const app = {
     network: '',
     state: null,
     net: { status: 'idle', addr: null, detail: '' },
+    pool: [], // the nodes connected: [{addr, height, primary}]
     keygen: { done: 0, total: 0 },
     flow: null,
     fatal: null,
@@ -194,6 +198,9 @@ worker.onmessage = (e) => {
         case 'rpc':
             relay(m);
             return;
+        case 'bad-node':
+            if (lc && lc.connected) lc.dropPrimary();
+            return;
     }
 };
 
@@ -212,9 +219,28 @@ function nodeList() {
 }
 const customNodes = () => { try { return !!localStorage.getItem(NODES_KEY); } catch (_) { return false; } };
 
+const foundKey = () => `${FOUND_KEY}.${app.config.network || app.network || 'default'}`;
+function loadFound() {
+    try {
+        const v = JSON.parse(localStorage.getItem(foundKey()) || '[]');
+        return Array.isArray(v) ? v : [];
+    } catch (_) { return []; }
+}
+function saveFound(list) {
+    try { list.length ? localStorage.setItem(foundKey(), JSON.stringify(list)) : localStorage.removeItem(foundKey()); } catch (_) {}
+}
+function wholeBlocks() {
+    try { return localStorage.getItem(WHOLE_BLOCKS_KEY) === '1'; } catch (_) { return false; }
+}
+function setWholeBlocks(on) {
+    try { on ? localStorage.setItem(WHOLE_BLOCKS_KEY, '1') : localStorage.removeItem(WHOLE_BLOCKS_KEY); } catch (_) {}
+    worker.postMessage({ type: 'settings', settings: { wholeBlocks: on } });
+}
+
 async function connect() {
     const addrs = nodeList();
     if (lc) { const old = lc; lc = null; old.stop(); }
+    app.pool = [];
     if (!addrs.length) { setNet('none', ''); return; }
     try {
         if (!lcModule) lcModule = import('./light_client.bundle.js');
@@ -222,21 +248,35 @@ async function connect() {
         const c = new LightClient();
         lc = c;
         c.onStatus = (status, info) => { if (lc === c) setNet(status, info); };
+        c.onPool = ({ nodes, found }) => {
+            if (lc !== c) return;
+            app.pool = nodes;
+            if (!customNodes()) saveFound(found);
+            tellWorker();
+            update();
+        };
         c.onPush = (msg) => {
             if (lc !== c) return;
             if (msg && msg.payload && typeof msg.payload.height === 'number') chainTip = msg.payload.height + 1;
             worker.postMessage({ type: 'push', msg });
             drawNet();
         };
-        await c.start(addrs);
+        // A list of the user's own is used as it is. The default one grows
+        // by the nodes its nodes know of.
+        const custom = customNodes();
+        await c.start(addrs, { genesis: app.config.genesis, found: custom ? [] : loadFound(), discover: !custom });
     } catch (e) {
         setNet('failed', errOf(e));
     }
 }
 
+function tellWorker() {
+    worker.postMessage({ type: 'net', status: app.net.status, addr: app.net.addr, nodes: app.pool.length });
+}
+
 function setNet(status, info) {
     app.net = { status, addr: status === 'connected' ? info : null, detail: status === 'failed' ? info : '' };
-    worker.postMessage({ type: 'net', status, addr: app.net.addr });
+    tellWorker();
     if (status === 'connected' && lc) {
         lc.call('get_state').then(s => { chainTip = s.height; update(); }).catch(() => {});
     }
@@ -247,7 +287,7 @@ function relay(m) {
     const c = lc;
     const reply = (r) => worker.postMessage({ type: 'rpc-result', id: m.id, ...r });
     if (!c || !c.connected) return reply({ ok: false, error: 'not connected to a node' });
-    c.call(m.method, m.params).then(
+    c.call(m.method, m.params, { spread: !!m.spread }).then(
         data => reply({ ok: true, data }),
         e => reply({ ok: false, error: errOf(e), unanswered: !!e.unanswered }));
 }
@@ -396,25 +436,28 @@ function nodeSection(onboarding) {
     const draw = () => {
         const n = app.net;
         const st = app.state && app.state.chain;
+        const others = app.pool.filter(p => !p.primary);
         status.replaceChildren(dl([
-            ['status', n.status === 'connected' ? tag('ok', 'connected') : n.status === 'failed' ? tag('bad', 'unreachable') : n.status === 'none' ? tag('bad', 'none set') : tag('warn', n.status)],
-            n.addr && ['node', h('span', { class: 'hash' }, n.addr)],
+            ['status', n.status === 'connected' ? tag('ok', app.pool.length > 1 ? `${app.pool.length} nodes` : 'connected') : n.status === 'failed' ? tag('bad', 'unreachable') : n.status === 'none' ? tag('bad', 'none set') : tag('warn', n.status)],
+            n.addr && ['following', h('span', { class: 'hash' }, n.addr)],
+            others.length > 0 && ['also asking', h('div', { class: 'stack' }, others.map(p => h('span', { class: 'hash' }, p.addr)))],
             n.detail && ['last error', h('span', { class: 'dim' }, n.detail)],
             ['chain', (app.state ? app.state.tip : chainTip) ? `${num((app.state ? app.state.tip : chainTip) - 1)} blocks` : '—'],
             st && ['network', st.networkOk === true ? (app.config.genesis ? tag('ok', 'genesis checked') : tag('plain', 'not checked')) : st.networkOk === false ? tag('bad', 'different network') : '—'],
         ]));
     };
     box.append(
-        h('h2', null, 'Node', h('span', { class: 'aside' }, customNodes() ? 'your list' : 'default list')),
+        h('h2', null, 'Nodes', h('span', { class: 'aside' }, customNodes() ? 'your list' : 'default list')),
         status,
         h('div', { class: 'pad stack' },
             h('label', null, h('span', null, 'WebRTC addresses, one per line'), ta),
             h('div', { class: 'row' },
                 h('button', { class: 'btn primary', type: 'button', onclick: save }, 'Save and connect'),
                 h('button', { class: 'btn', type: 'button', onclick: reset }, 'Use defaults'))),
-        h('div', { class: 'note' }, 'A node serves browsers when built with ', h('code', null, '--features webrtc'),
+        h('div', { class: 'note' }, 'The wallet keeps three nodes at a time, follows the chain through one of them picked at random, and fetches blocks from all three. With the default list it also uses the nodes those nodes know of; with a list of your own, only yours. ',
+            'A node serves browsers when built with ', h('code', null, '--features webrtc'),
             '; it logs “Browser wallets can connect to …” at start and lists the address under ', h('code', null, 'webrtc_addrs'),
-            ' in its /state. The node never sees your keys; it learns which coins are yours only from payments you send through it.'));
+            ' in its /state. No node sees your keys; they learn which coins are yours only from payments you send through them.'));
     draw();
     return { el: box, update: draw, onboarding };
 }
@@ -1097,6 +1140,22 @@ function settingsView() {
                 } catch (e) { toast(errOf(e), 'bad'); }
             } }, 'Download wallet file'))));
 
+    const whole = h('input', { type: 'checkbox', checked: wholeBlocks(), onchange: (e) => {
+        setWholeBlocks(e.target.checked);
+        toast(e.target.checked ? 'Downloading every block whole from now on.' : 'Reading scan data from now on.');
+    } });
+    const scanning = section('Scanning', null, h('div', { class: 'pad stack' },
+        h('p', { class: 'lede' }, 'The wallet reads a few dozen bytes of each block, its scan data, and fetches a block whole only when it may hold your coins: then with three other blocks, each from a node picked at random, so that no node can tell which block mattered. Downloading every block whole gives the nodes nothing at all to go on, for many times the data.'),
+        h('label', { class: 'check' }, whole, h('span', null, 'Download every block whole'))),
+        h('div', { class: 'note', 'data-scanning': '' }));
+    const drawScanning = () => {
+        const s = app.state && app.state.scan;
+        scanning.querySelector('[data-scanning]').textContent = !s ? ''
+            : s.whole ? 'Every block comes whole.'
+            : !s.scanData ? 'The node this wallet follows serves no scan data, so every block comes whole.'
+            : `This session: ${num(s.fetched)} block${s.fetched === 1 ? '' : 's'} fetched whole, each with three others.`;
+    };
+
     const from = h('input', { inputmode: 'numeric' });
     const rescan = section('Rescan', null, h('form', { class: 'pad stack', onsubmit: async (e) => {
         e.preventDefault();
@@ -1130,9 +1189,10 @@ function settingsView() {
 
     let filled = false;
     return {
-        els: [node.el, backup, rescan, password, browser],
+        els: [node.el, scanning, backup, rescan, password, browser],
         update() {
             node.update();
+            drawScanning();
             if (!filled && app.state) { from.value = String(app.state.birth); filled = true; }
         },
     };
@@ -1170,7 +1230,7 @@ async function start() {
     started = true;
     app.config = await loadConfig();
     try {
-        await ask('init', { config: app.config });
+        await ask('init', { config: app.config, settings: { wholeBlocks: wholeBlocks() } });
     } catch (e) {
         fatal(`The wallet could not start: ${errOf(e)}`);
         return;

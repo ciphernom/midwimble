@@ -1,3 +1,87 @@
+/**
+ * Scan data for consecutive blocks, as `get_scan_data` answers: what
+ * `Wallet.scan_compact` reads instead of the blocks. Free it when done.
+ */
+export class ScanData {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        ScanDataFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_scandata_free(ptr, 0);
+    }
+    /**
+     * The height after the last block it covers.
+     * @returns {number}
+     */
+    end() {
+        const ret = wasm.scandata_end(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * The id (hex) of block `height`, if it covers it.
+     * @param {number} height
+     * @returns {string | undefined}
+     */
+    id(height) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.scandata_id(retptr, this.__wbg_ptr, height);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            if (r3) {
+                throw takeObject(r2);
+            }
+            let v1;
+            if (r0 !== 0) {
+                v1 = getStringFromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * The scan data of the blocks from `start` (`scan_hex`, one hex bincode
+     * `Vec<ScanBlock>`).
+     * @param {number} start
+     * @param {string} scan_hex
+     */
+    constructor(start, scan_hex) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(scan_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.scandata_new(retptr, start, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            this.__wbg_ptr = r0 >>> 0;
+            ScanDataFinalization.register(this, this.__wbg_ptr, this);
+            return this;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * @returns {number}
+     */
+    start() {
+        const ret = wasm.scandata_start(this.__wbg_ptr);
+        return ret;
+    }
+}
+if (Symbol.dispose) ScanData.prototype[Symbol.dispose] = ScanData.prototype.free;
+
 export class Wallet {
     static __wrap(ptr) {
         ptr = ptr >>> 0;
@@ -484,6 +568,77 @@ export class Wallet {
         }
     }
     /**
+     * Applies blocks of `data`, from the next one to scan, while their scan
+     * data shows they neither pay this wallet nor spend its coins. Returns
+     * JSON {scanned, need, reorg}: `need` is the height of the block after
+     * them if the wallet needs it whole (fetch it and `scan_full` it), and
+     * `reorg` says it does not build on the last block scanned.
+     * @param {ScanData} data
+     * @returns {string}
+     */
+    scan_compact(data) {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            _assertClass(data, ScanData);
+            wasm.wallet_scan_compact(retptr, this.__wbg_ptr, data.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr1 = r0;
+            var len1 = r1;
+            if (r3) {
+                ptr1 = 0; len1 = 0;
+                throw takeObject(r2);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * Applies block `height` of `data`, fetched whole (hex bincode, as
+     * `get_block` sends it), after checking it is the block the scan data
+     * describes. Returns JSON {received, spent, confirmed, failed}; throws
+     * "the block does not match its scan data…" if it is not.
+     * @param {ScanData} data
+     * @param {number} height
+     * @param {string} block_hex
+     * @returns {string}
+     */
+    scan_full(data, height, block_hex) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            _assertClass(data, ScanData);
+            const ptr0 = passStringToWasm0(block_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.wallet_scan_full(retptr, this.__wbg_ptr, data.__wbg_ptr, height, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
      * Scans mempool transactions (one hex bincode `Vec<Transaction>`, as
      * `get_mempool_txs` sends them; empty for none) for payments to this
      * wallet. `live_json` lists every hash `get_mempool` returned: payments
@@ -601,6 +756,29 @@ export class Wallet {
         try {
             const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
             wasm.wallet_view_key(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            deferred1_0 = r0;
+            deferred1_1 = r1;
+            return getStringFromWasm0(r0, r1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * JSON list of the heights in `data` whose blocks this wallet needs
+     * whole as it stands: to fetch ahead of `scan_compact`.
+     * @param {ScanData} data
+     * @returns {string}
+     */
+    wanted(data) {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            _assertClass(data, ScanData);
+            wasm.wallet_wanted(retptr, this.__wbg_ptr, data.__wbg_ptr);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
             var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
             deferred1_0 = r0;
@@ -1111,6 +1289,9 @@ function __wbg_get_imports() {
     };
 }
 
+const ScanDataFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_scandata_free(ptr >>> 0, 1));
 const WalletFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_wallet_free(ptr >>> 0, 1));
@@ -1122,6 +1303,12 @@ function addHeapObject(obj) {
 
     heap[idx] = obj;
     return idx;
+}
+
+function _assertClass(instance, klass) {
+    if (!(instance instanceof klass)) {
+        throw new Error(`expected instance of ${klass.name}`);
+    }
 }
 
 function dropObject(idx) {

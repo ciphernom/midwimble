@@ -3,14 +3,36 @@
 // Holds the WebAssembly wallet (src/wallet.rs), keeps it in IndexedDB as a
 // sealed wallet file (the CLI's encrypted format: the password never leaves
 // this worker and the plaintext never touches storage), and follows the
-// chain through the page, which owns the WebRTC connection (RTCPeerConnection
+// chain through the page, which owns the WebRTC connections (RTCPeerConnection
 // does not exist in workers): {type: 'rpc'} out, {type: 'rpc-result'} back.
+//
+// It reads the chain as scan data (core/scan.rs), not whole blocks: enough to
+// pass over every block that neither pays this wallet nor spends its coins.
+// The few others it fetches whole, each together with DECOYS other blocks,
+// and each of those from a node picked at random, so that no node learns
+// which blocks are this wallet's. A user who would rather give nothing away
+// downloads every block whole instead (the "whole blocks" setting).
 
 import init, * as mw from './pkg/midwimble_web_wallet.js';
 
 const WASM_URL = new URL('./pkg/midwimble_web_wallet_bg.wasm', import.meta.url);
 /** Blocks asked for per get_blocks (the node caps it, and by size). */
 const BLOCKS_PER_REQUEST = 100;
+/** Blocks' scan data asked for per get_scan_data (the node caps it). */
+const SCAN_BLOCKS_PER_REQUEST = 2000;
+/** Other blocks fetched with each block the wallet needs whole. */
+const DECOYS = 3;
+/** Decoys come from the blocks around the one needed, this many at most. */
+const DECOY_WINDOW = 1000;
+/** Blocks fetched ahead of the scan, at most. */
+const FETCH_AHEAD = 8;
+/** When more than this share of the blocks in a request's scan data are the
+ *  wallet's business, they are downloaded in bulk instead (get_blocks): as
+ *  cheap, and it gives nothing away. */
+const BULK_SHARE = 1 / 8;
+/** Blocks in a row that do not match their scan data, from the node that
+ *  sent it, after which the wallet stops trusting that node. */
+const MISMATCHES_TO_DROP = 3;
 const UTXO_PAGE = 500;
 /** Seconds before a payment still waiting for a block is broadcast again. */
 const REBROADCAST_SECS = 120;
@@ -31,11 +53,15 @@ let fileKey = null;
 let fileSalt = null;
 
 const chain = {
-    connected: false, addr: null, tip: 0, timestamp: 0, prunedBelow: 0,
+    connected: false, addr: null, nodes: 0, tip: 0, timestamp: 0, prunedBelow: 0,
     nodeSyncing: false, networkOk: null, behind: false,
 };
-const scan = { active: false, mode: 'blocks', from: 0, to: 0, outputs: 0 };
+const scan = { active: false, mode: 'blocks', from: 0, to: 0, outputs: 0, fetched: 0 };
 let supportsGetBlocks = true;
+let supportsScanData = true;
+/** The user's choice: every block whole, as before scan data. */
+let wholeBlocks = false;
+let mismatches = 0;
 let syncError = null;
 let dirty = false;
 let lastSave = 0;
@@ -48,6 +74,14 @@ let reorged = null;
 const post = (msg, transfer) => self.postMessage(msg, transfer || []);
 const toast = (text, kind = 'info') => post({ type: 'toast', text, kind });
 const errText = e => (e && e.message) || String(e);
+function shuffle(list) {
+    const a = list.slice();
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+}
 
 // ── storage ─────────────────────────────────────────────────────────────────
 
@@ -95,12 +129,14 @@ function changed() {
 
 let rpcSeq = 0;
 const rpcPending = new Map();
-function rpc(method, params) {
+/** A light request, to the node the wallet follows, or with `spread` to
+ *  any of the nodes connected, picked at random. */
+function rpc(method, params, { spread = false } = {}) {
     if (!chain.connected) return Promise.reject(new Error('not connected to a node'));
     return new Promise((resolve, reject) => {
         const id = ++rpcSeq;
         rpcPending.set(id, { resolve, reject });
-        post({ type: 'rpc', id, method, params });
+        post({ type: 'rpc', id, method, params, spread });
     });
 }
 function rpcResult({ id, ok, data, error, unanswered }) {
@@ -226,7 +262,7 @@ function snapshot() {
         recoveryHeight: wallet.recovery_height(),
         tip,
         chain: { ...chain },
-        scan: { ...scan },
+        scan: { ...scan, whole: wholeBlocks, scanData: supportsScanData },
         syncError,
     };
 }
@@ -296,6 +332,28 @@ function rollBack() {
     changed();
 }
 
+/** The id of the node's block at `height`, from its scan data (or the block,
+ *  from a node without scan data); null if the node has pruned it. */
+async function blockId(height) {
+    if (supportsScanData && !wholeBlocks) {
+        try {
+            const d = await rpc('get_scan_data', { start_height: height, count: 1 });
+            if (!d.count) return null;
+            const data = new mw.ScanData(height, d.scan_hex);
+            try { return data.id(height); } finally { data.free(); }
+        } catch (e) {
+            if (!e.unanswered) throw e;
+            supportsScanData = false; // an older node
+        }
+    }
+    try {
+        return mw.block_id((await rpc('get_block', { height })).block_hex);
+    } catch (e) {
+        if (/no block/.test(errText(e))) return null;
+        throw e;
+    }
+}
+
 /** Rolls back while the last block scanned is no longer the node's. */
 async function checkLastBlock() {
     for (let guard = 0; guard < 64; guard++) {
@@ -304,14 +362,8 @@ async function checkLastBlock() {
         const recorded = wallet.recorded_hash(h - 1);
         if (!recorded) return;
         if (h - 1 >= chain.tip) return; // the node is behind us: wait for it
-        let id;
-        try {
-            id = mw.block_id((await rpc('get_block', { height: h - 1 })).block_hex);
-        } catch (e) {
-            if (/no block/.test(errText(e))) return; // pruned: final anyway
-            throw e;
-        }
-        if (id === recorded) return;
+        const id = await blockId(h - 1);
+        if (id === null || id === recorded) return; // pruned: final anyway
         rollBack();
     }
 }
@@ -346,39 +398,165 @@ async function scanBlocks() {
     scan.active = true; scan.mode = 'blocks';
     scan.from = wallet.scanned_height(); scan.to = chain.tip;
     while (wallet && chain.connected && wallet.scanned_height() < chain.tip) {
-        const start = wallet.scanned_height();
-        const count = Math.min(chain.tip - start, BLOCKS_PER_REQUEST);
-        let r;
-        if (supportsGetBlocks) {
-            try {
-                const d = await rpc('get_blocks', { start_height: start, count });
-                if (!d.count) break;
-                r = JSON.parse(wallet.scan_blocks(start, d.blocks_hex));
-            } catch (e) {
-                if (e.unanswered) { supportsGetBlocks = false; continue; } // an older node
-                throw e;
-            }
-        } else {
-            const d = await rpc('get_block', { height: start });
-            try {
-                r = JSON.parse(wallet.scan_block(start, d.block_hex));
-                r.scanned = 1;
-            } catch (e) {
-                if (!/^reorg/.test(errText(e))) throw e;
-                r = { reorg: true, scanned: 0, received: [], spent: [], confirmed: [], failed: [] };
-            }
-        }
-        if (r.reorg) {
-            rollBack();
-            continue;
-        }
-        changed();
-        announce(r);
+        let more = null;
+        if (supportsScanData && !wholeBlocks) more = await scanByScanData();
+        if (more === null) more = await scanWhole(chain.tip);
+        if (!more) break;
         scan.to = chain.tip;
         postState();
         if (Date.now() - lastSave > SAVE_EVERY_MS) await save();
     }
     if (dirty) await save();
+}
+
+/** One request's worth of blocks, whole, up to `end`. False if the node had
+ *  none to give. */
+async function scanWhole(end) {
+    const start = wallet.scanned_height();
+    const count = Math.min(end - start, BLOCKS_PER_REQUEST);
+    let r;
+    if (supportsGetBlocks) {
+        try {
+            const d = await rpc('get_blocks', { start_height: start, count });
+            if (!d.count) return false;
+            r = JSON.parse(wallet.scan_blocks(start, d.blocks_hex));
+        } catch (e) {
+            if (e.unanswered) { supportsGetBlocks = false; return true; } // an older node
+            throw e;
+        }
+    } else {
+        const d = await rpc('get_block', { height: start });
+        try {
+            r = JSON.parse(wallet.scan_block(start, d.block_hex));
+            r.scanned = 1;
+        } catch (e) {
+            if (!/^reorg/.test(errText(e))) throw e;
+            r = { reorg: true, scanned: 0, received: [], spent: [], confirmed: [], failed: [] };
+        }
+    }
+    if (r.reorg) {
+        rollBack();
+        return true;
+    }
+    changed();
+    announce(r);
+    return true;
+}
+
+/**
+ * One request's worth of scan data: the blocks that are not this wallet's
+ * business are applied by it, the others fetched whole (fetchWhole). False
+ * if the node had none to give; null if it serves no scan data.
+ */
+async function scanByScanData() {
+    const start = wallet.scanned_height();
+    let d;
+    try {
+        d = await rpc('get_scan_data', { start_height: start, count: Math.min(chain.tip - start, SCAN_BLOCKS_PER_REQUEST) });
+    } catch (e) {
+        if (e.unanswered) { supportsScanData = false; return null; } // an older node
+        throw e;
+    }
+    if (!d.count) return false;
+    if (d.start_height !== start) throw new Error('The node sent scan data for other blocks than asked.');
+    const data = new mw.ScanData(start, d.scan_hex);
+    try {
+        const ahead = JSON.parse(wallet.wanted(data));
+        if (ahead.length > Math.max(DECOYS + 1, (data.end() - start) * BULK_SHARE)) {
+            // Most of these blocks are this wallet's: all of them, in bulk.
+            while (wallet.scanned_height() < data.end()) {
+                if (!(await scanWhole(data.end()))) break;
+            }
+            return true;
+        }
+        const fetches = new Map();
+        const fetch = (h) => {
+            let p = fetches.get(h);
+            if (!p) {
+                p = fetchWhole(h, data);
+                p.catch(() => {});
+                fetches.set(h, p);
+            }
+            return p;
+        };
+        const topUp = () => {
+            for (const h of fetches.keys()) if (h < wallet.scanned_height()) fetches.delete(h);
+            while (ahead.length && fetches.size < FETCH_AHEAD) {
+                const h = ahead.shift();
+                if (h >= wallet.scanned_height()) fetch(h);
+            }
+        };
+        for (;;) {
+            topUp();
+            const r = JSON.parse(wallet.scan_compact(data));
+            if (r.scanned) changed();
+            if (r.reorg) { rollBack(); return true; }
+            if (r.need == null) return true;
+            const report = await scanFetched(data, r.need, await fetch(r.need));
+            if (!report) return true; // the node's chain moved: fresh scan data
+            changed();
+            announce(report);
+            scan.to = chain.tip;
+            postState();
+        }
+    } finally {
+        data.free();
+    }
+}
+
+/**
+ * Block `height`, whole, from a node picked at random, with DECOYS other
+ * blocks from around it, each from a node picked at random too: no node can
+ * tell which block the wallet needed. Resolves with the block's hex.
+ */
+function fetchWhole(height, data) {
+    // From the blocks around it that a wallet at this point could need:
+    // none past its scan data, none below where it started, or the decoys
+    // would give themselves away.
+    const birth = wallet.birth_height();
+    const hi = Math.min(data.end(), Math.max(birth, height - DECOY_WINDOW / 2) + DECOY_WINDOW);
+    const lo = Math.max(birth, Math.min(height - DECOY_WINDOW / 2, hi - DECOY_WINDOW));
+    const heights = new Set([height]);
+    for (let tries = 0; heights.size < Math.min(DECOYS + 1, hi - lo) && tries < 64; tries++) {
+        heights.add(lo + Math.floor(Math.random() * (hi - lo)));
+    }
+    let wanted;
+    for (const h of shuffle([...heights])) {
+        const p = rpc('get_block', { height: h }, { spread: true });
+        if (h === height) wanted = p;
+        else p.catch(() => {}); // a decoy: its answer does not matter
+    }
+    scan.fetched++;
+    return wanted.then(d => d.block_hex);
+}
+
+/**
+ * Applies block `height`, fetched whole, once it is checked against the scan
+ * data. A block from another node that does not match is asked of the node
+ * that sent the scan data; if its own does not match either, its chain has
+ * moved since (or it lies): resolves null, and the caller starts over.
+ */
+async function scanFetched(data, height, hex) {
+    const apply = (blockHex) => {
+        try {
+            return JSON.parse(wallet.scan_full(data, height, blockHex));
+        } catch (e) {
+            if (/does not match its scan data/.test(errText(e))) return null;
+            throw e;
+        }
+    };
+    let report = apply(hex);
+    if (!report) report = apply((await rpc('get_block', { height })).block_hex);
+    if (report) {
+        mismatches = 0;
+        return report;
+    }
+    if (++mismatches >= MISMATCHES_TO_DROP) {
+        mismatches = 0;
+        post({ type: 'bad-node', addr: chain.addr });
+        throw new Error('The node\'s scan data does not match its own blocks; trying another node.');
+    }
+    return null;
 }
 
 function announce(r) {
@@ -399,7 +577,8 @@ async function rebroadcast() {
         if (now - last < REBROADCAST_SECS) continue;
         lastBroadcast.set(p.tx_hash, now);
         // A duplicate or a conflict is expected here; scanning settles it.
-        try { await rpc('submit_transaction', { tx_hex: p.tx_hex }); } catch (_) {}
+        // Each time to a node picked at random, in case one dropped it.
+        try { await rpc('submit_transaction', { tx_hex: p.tx_hex }, { spread: true }); } catch (_) {}
     }
 }
 
@@ -530,25 +709,31 @@ function newPasswordOk(p) {
 // ── messages from the page ──────────────────────────────────────────────────
 
 const handlers = {
-    async init({ config }) {
+    async init({ config, settings }) {
         wasmModule = await WebAssembly.compileStreaming(fetch(WASM_URL)).catch(async () =>
             WebAssembly.compile(await (await fetch(WASM_URL)).arrayBuffer()));
         await init({ module_or_path: wasmModule });
         C = JSON.parse(mw.chain_constants());
         network = (config && config.network) || C.network;
         genesis = (config && config.genesis) || null;
+        wholeBlocks = !!(settings && settings.wholeBlocks);
         const file = await loadFile().catch(() => null);
         post({ type: 'boot', hasWallet: !!file, constants: C, network });
         return {};
     },
 
-    net({ status, addr }) {
-        const was = chain.connected;
+    net({ status, addr, nodes }) {
+        const was = chain.connected ? chain.addr : false;
         chain.connected = status === 'connected';
-        chain.addr = addr || null;
-        if (chain.connected && !was) {
+        chain.addr = chain.connected ? (addr || null) : null;
+        chain.nodes = chain.connected ? (nodes || 1) : 0;
+        if (chain.connected && was !== chain.addr) {
+            // Another node to follow: what was learned of the last one's
+            // support and mempool does not carry over.
             chain.networkOk = null;
             supportsGetBlocks = true;
+            supportsScanData = true;
+            mismatches = 0;
             forgetMempool();
             requestSync();
         }
@@ -557,6 +742,14 @@ const handlers = {
             rpcPending.clear();
         }
         postState(true);
+    },
+
+    settings({ settings }) {
+        const whole = !!(settings && settings.wholeBlocks);
+        if (whole === wholeBlocks) return;
+        wholeBlocks = whole;
+        postState(true);
+        requestSync();
     },
 
     push({ msg }) {

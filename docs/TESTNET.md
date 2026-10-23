@@ -189,9 +189,17 @@ that address at start:
 Browser wallets can connect to /ip4/…/udp/9435/webrtc-direct/certhash/uEi…/p2p/12D3Koo…
 ```
 
-The public form is also under `webrtc_addrs` in `/state`. Add it to
-`web-wallet/config.json`'s `nodes` for the wallet to use by default; anyone
-can also paste it into the wallet's node setting.
+The public form is also under `webrtc_addrs` in `/state`. Wallets find such
+a node by themselves once it is connected to one they know: a node tells
+browsers the WebRTC addresses of the nodes connected to it, and each wallet
+spreads its requests over three nodes, so every node opened to browsers
+takes a share of them. `web-wallet/config.json`'s `nodes` needs only a seed
+or two to start from; anyone can also paste an address into the wallet's node
+setting, to use only that.
+
+Wallets read scan data (`get_scan_data`) rather than whole blocks, from nodes
+with this release. A node from before it still serves them, with whole
+blocks, as before.
 
 ## The explorer
 

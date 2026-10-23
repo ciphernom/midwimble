@@ -210,7 +210,11 @@ Midstate anchors serve as the horizon instead.
 - **Bans end:** an hour at first, twice as long for each further ban of the
   same peer, up to a day. `/state` lists the peers banned now, and why.
 - **Light clients:** a light-client protocol with a reputation-based rate
-  limiter.
+  limiter. Wallets read each block's scan data (`src/core/scan.rs`: its
+  outputs' ephemeral keys and view tags and its inputs' prefixes, about 100
+  bytes) rather than the block, fetch the few blocks that concern them from
+  any node, checked against it, and learn from a node the WebRTC addresses of
+  the nodes connected to it.
 - **Dandelion++:** expired stem transactions are aggregated before fluffing.
 - **Sync:**
   - headers first, with SIMD proof-of-work checks, comparing chains by the
@@ -304,8 +308,9 @@ midwimble anchor-verify --depth 6
 **Browser wallet.** `web-wallet/` is the wallet compiled to WebAssembly, with
 a page in the explorer's style: create, restore or open a `.mww` file, send,
 receive, history. It reaches nodes built with `--features webrtc` through the
-light protocol, and shares the CLI's phrases, addresses and wallet file
-format. See `web-wallet/README.md` and `docs/TESTNET.md`.
+light protocol, three at a time, follows the chain by its scan data, and
+shares the CLI's phrases, addresses and wallet file format. See
+`web-wallet/README.md` and `docs/TESTNET.md`.
 
 **RPC.** The node serves these endpoints on loopback, with no authentication:
 

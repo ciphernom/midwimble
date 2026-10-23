@@ -1,11 +1,14 @@
 //! The browser wallet against real (fast-mining) chains and the CLI wallet.
 
 use midwimble::core::mw::{Context, StealthAddress, Transaction, WalletKeys};
+use midwimble::core::scan::{ScanBlock, ScanRun};
 use midwimble::core::state::apply_batch;
 use midwimble::core::template::build_template;
 use midwimble::core::types::{block_reward, COINBASE_MATURITY};
 use midwimble::core::{Batch, State};
-use midwimble_web_wallet::wallet::{self, BuiltSend, IncomingView, WalletCore, REORG};
+use midwimble_web_wallet::wallet::{
+    self, BuiltSend, IncomingView, ScanChunk, WalletCore, MISMATCH, REORG,
+};
 use std::collections::HashSet;
 
 const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
@@ -63,6 +66,64 @@ impl Chain {
                 .unwrap();
         }
     }
+
+    /// What `get_scan_data` sends for blocks `start..end`.
+    fn scan_data(&self, start: u64, end: u64) -> ScanChunk {
+        let (start, end) = (start as usize, end as usize);
+        let run = ScanRun::of(
+            self.blocks[start].prev_header_hash,
+            &self.blocks[start..end],
+        );
+        ScanChunk::from_hex(start as u64, &hex::encode(run.encode())).unwrap()
+    }
+
+    /// Feeds the wallet as a browser wallet reading scan data does: the scan
+    /// data of `per_request` blocks at a time, and the blocks it asks for
+    /// whole, whose heights this returns.
+    fn sync_compact(&self, w: &mut WalletCore, per_request: u64) -> Vec<u64> {
+        let mut fetched = Vec::new();
+        while w.scanned_height() < self.blocks.len() as u64 {
+            let start = w.scanned_height();
+            let end = (start + per_request).min(self.blocks.len() as u64);
+            let mut data = self.scan_data(start, end);
+            loop {
+                let r = w.scan_compact(&mut data).unwrap();
+                assert!(!r.reorg);
+                let Some(h) = r.need else {
+                    assert_eq!(w.scanned_height(), end);
+                    break;
+                };
+                fetched.push(h);
+                let hex = hex::encode(bincode::serialize(&self.blocks[h as usize]).unwrap());
+                w.scan_full(&data, h, &wallet::block_from_hex(&hex).unwrap())
+                    .unwrap();
+            }
+        }
+        fetched
+    }
+}
+
+/// A copy of `w`, as its wallet file would give.
+fn copy_of(w: &WalletCore) -> WalletCore {
+    let (key, salt) = ([7u8; 32], [1u8; wallet::SALT_LEN]);
+    WalletCore::open(&w.seal(&key, &salt).unwrap(), &key).unwrap()
+}
+
+fn json<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_string(v).unwrap()
+}
+
+/// Two wallets that show the same: coins, balance, history, payments.
+fn assert_same(a: &WalletCore, b: &WalletCore, tip: u64) {
+    assert_eq!(a.scanned_height(), b.scanned_height());
+    assert_eq!(a.balance(tip), b.balance(tip));
+    assert_eq!(a.history(tip), b.history(tip));
+    assert_eq!(json(&a.coins(tip)), json(&b.coins(tip)));
+    assert_eq!(json(&a.pending_txs()), json(&b.pending_txs()));
+    assert_eq!(
+        a.recorded_hash(a.scanned_height() - 1),
+        b.recorded_hash(b.scanned_height() - 1)
+    );
 }
 
 const OTHER: &str = "legal winner thank year wave sausage worth useful legal winner thank year \
@@ -715,4 +776,192 @@ fn coins_found_again_after_a_deep_rollback_stay_reserved() {
     assert_eq!((b.spendable, b.immature, b.pending), (0, 0, funds));
     assert_eq!(w.pending_txs().len(), 1);
     assert!(w.quote(1, other.tip()).is_err());
+}
+
+/// Whether one of `block`'s outputs carries `view`'s view tag.
+fn tagged(view: &midwimble::core::mw::ViewKey, block: &Batch) -> bool {
+    ScanBlock::of(block)
+        .outputs
+        .iter()
+        .any(|(r, tag)| view.may_own(r, *tag))
+}
+
+/// A wallet reading scan data ends up where one reading every block whole
+/// does, and downloads only the blocks that pay it or spend its coins (and
+/// the odd one with a foreign output that shares its view tag).
+#[test]
+fn scan_data_finds_what_whole_blocks_do() {
+    let mut chain = Chain::new();
+    let mut compact = web_wallet(PHRASE, 1, 0);
+    let mut whole = web_wallet(PHRASE, 1, 0);
+    let mut alice = web_wallet(OTHER, 1, 0);
+    let view = midwimble::core::mw::ViewKey::decode(&compact.view_key()).unwrap();
+    let me = compact.address();
+    let stranger = WalletKeys::random().address();
+    // Fetched whole: the blocks that are this wallet's business, and maybe
+    // a few that only look it.
+    let check = |fetched: &[u64], mine: &[u64], chain: &Chain| {
+        for h in mine {
+            assert!(fetched.contains(h), "block {h} not fetched: {fetched:?}");
+        }
+        for h in fetched {
+            assert!(
+                mine.contains(h) || tagged(&view, &chain.blocks[*h as usize]),
+                "block {h} fetched for nothing"
+            );
+        }
+    };
+
+    // Rewards to me at blocks 1 and 5, three to Alice, among strangers'.
+    chain.mine(&me, &[]);
+    for _ in 0..3 {
+        chain.mine(&alice.address(), &[]);
+    }
+    chain.mine(&me, &[]);
+    chain.mine_to_stranger(COINBASE_MATURITY as usize + 2);
+    chain.sync(&mut whole);
+    chain.sync(&mut alice);
+    let fetched = chain.sync_compact(&mut compact, 4);
+    check(&fetched, &[1, 5], &chain);
+    assert!(fetched.len() < chain.blocks.len() / 2, "{fetched:?}");
+    assert_same(&whole, &compact, chain.tip());
+
+    // In one block: Alice pays me, and I pay Bob, with change back.
+    let bob = WalletKeys::random().address().encode();
+    let incoming = alice
+        .build_send(
+            &me.encode(),
+            block_reward(2) + block_reward(3),
+            None,
+            chain.tip(),
+            0,
+        )
+        .unwrap();
+    let paid = compact
+        .build_send(&bob, 1_000, None, chain.tip(), 1)
+        .unwrap();
+    whole = copy_of(&compact);
+    let both = chain.tip();
+    chain.mine(&stranger, &[tx_of(&incoming), tx_of(&paid)]);
+    chain.mine_to_stranger(2);
+    chain.sync(&mut whole);
+    let fetched = chain.sync_compact(&mut compact, 4);
+    check(&fetched, &[both], &chain);
+    assert_same(&whole, &compact, chain.tip());
+    assert!(compact.pending_txs().is_empty(), "my payment confirmed");
+
+    // Another copy of this wallet spends every coin, without change: only
+    // the inputs show that the block concerns this one.
+    let mut elsewhere = web_wallet(PHRASE, 1, 0);
+    chain.sync(&mut elsewhere);
+    let all = elsewhere.max_sendable(chain.tip());
+    let gone = elsewhere
+        .build_send(&bob, all, None, chain.tip(), 2)
+        .unwrap();
+    assert_eq!(gone.change, 0);
+    let spent_at = chain.tip();
+    chain.mine(&stranger, &[tx_of(&gone)]);
+    chain.mine_to_stranger(2);
+    chain.sync(&mut whole);
+    let fetched = chain.sync_compact(&mut compact, 4);
+    check(&fetched, &[spent_at], &chain);
+    assert_same(&whole, &compact, chain.tip());
+    assert_eq!(compact.balance(chain.tip()).spendable, 0);
+
+    // Alice pays me again, and the other copy spends that coin two blocks
+    // on. One request's scan data covers both blocks; the second shows as
+    // spending a coin of mine only once the first has been scanned.
+    chain.sync(&mut alice);
+    let again = alice
+        .build_send(&me.encode(), 5_000, None, chain.tip(), 3)
+        .unwrap();
+    let paid_at = chain.tip();
+    chain.mine(&stranger, &[tx_of(&again)]);
+    chain.mine_to_stranger(1);
+    chain.sync(&mut elsewhere);
+    let all = elsewhere.max_sendable(chain.tip());
+    let respent = elsewhere
+        .build_send(&bob, all, None, chain.tip(), 4)
+        .unwrap();
+    let respent_at = chain.tip();
+    chain.mine(&stranger, &[tx_of(&respent)]);
+    chain.sync(&mut whole);
+
+    let mut data = chain.scan_data(compact.scanned_height(), chain.tip());
+    let ahead = compact.wanted(&mut data);
+    assert!(ahead.contains(&paid_at), "{ahead:?}");
+    assert_eq!(
+        ahead.contains(&respent_at),
+        tagged(&view, &chain.blocks[respent_at as usize])
+    );
+    let mut fetched = Vec::new();
+    loop {
+        let r = compact.scan_compact(&mut data).unwrap();
+        assert!(!r.reorg);
+        let Some(h) = r.need else { break };
+        fetched.push(h);
+        compact
+            .scan_full(&data, h, &chain.blocks[h as usize])
+            .unwrap();
+    }
+    check(&fetched, &[paid_at, respent_at], &chain);
+    assert_same(&whole, &compact, chain.tip());
+}
+
+/// Scan data that does not build on the blocks scanned is a reorganisation,
+/// and a block that is not the one the scan data describes (another chain's,
+/// or one altered on its way) is refused.
+#[test]
+fn scan_data_notices_reorgs_and_blocks_that_do_not_match_it() {
+    let mut chain = Chain::new();
+    let mut w = web_wallet(PHRASE, 1, 0);
+    chain.mine(&w.address(), &[]);
+    chain.mine_to_stranger(2);
+    chain.sync_compact(&mut w, 10);
+    assert_eq!(w.scanned_height(), 4);
+
+    // Another chain from genesis: its block 4 does not build on our 3.
+    let mut other = Chain::new();
+    other.mine_to_stranger(5);
+    let mut data = other.scan_data(4, 6);
+    let r = w.scan_compact(&mut data).unwrap();
+    assert_eq!((r.scanned, r.need, r.reorg), (0, None, true));
+    assert_eq!(w.scanned_height(), 4, "nothing applied");
+
+    // Block 4 pays this wallet, so it is needed whole; only the block the
+    // scan data describes will do.
+    chain.mine(&w.address(), &[]);
+    let mut data = chain.scan_data(4, 5);
+    let r = w.scan_compact(&mut data).unwrap();
+    assert_eq!((r.scanned, r.need), (0, Some(4)));
+    let err = w
+        .scan_full(&data, 4, &other.blocks[4])
+        .unwrap_err()
+        .to_string();
+    assert!(err.starts_with(MISMATCH), "{err}");
+    let mut altered = chain.blocks[4].clone();
+    altered.coinbase.as_mut().unwrap().outputs.outputs[0].payload[0] ^= 1;
+    let err = w.scan_full(&data, 4, &altered).unwrap_err().to_string();
+    assert!(err.starts_with(MISMATCH), "{err}");
+    assert_eq!(w.scanned_height(), 4, "nothing applied");
+    w.scan_full(&data, 4, &chain.blocks[4]).unwrap();
+    assert_eq!(w.scanned_height(), 5);
+    let b = w.balance(chain.tip());
+    assert_eq!(
+        (b.spendable, b.immature),
+        (block_reward(1), block_reward(4))
+    );
+
+    // Scan data must reach the next block to scan: no gaps, no going back.
+    let mut behind = chain.scan_data(0, 2);
+    assert!(w.scan_compact(&mut behind).is_err());
+    chain.mine_to_stranger(3);
+    let mut past = chain.scan_data(6, 8);
+    assert!(w.scan_compact(&mut past).is_err());
+    let mut next = chain.scan_data(5, 8);
+    let r = w.scan_compact(&mut next).unwrap();
+    assert_eq!((r.scanned, r.need, r.reorg), (3, None, false));
+    // Up to date, the same scan data is nothing more to do.
+    assert_eq!(w.scan_compact(&mut next).unwrap(), Default::default());
+    assert!(w.wanted(&mut next).is_empty());
 }
