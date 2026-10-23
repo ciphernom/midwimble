@@ -271,7 +271,45 @@ impl ScanChunk {
 /// Minimal fee for a transaction of the usual shape (n inputs, 2 outputs):
 /// `src/wallet`'s `suggested_fee`.
 pub fn suggested_fee(inputs: u64) -> u64 {
-    (inputs * INPUT_WEIGHT + 2 * OUTPUT_WEIGHT + KERNEL_WEIGHT) * MIN_FEE_PER_WEIGHT
+    fee_at(MIN_FEE_PER_WEIGHT, inputs)
+}
+
+/// The fee for a transaction of the usual shape at `rate` base units per
+/// unit of weight.
+pub fn fee_at(rate: u64, inputs: u64) -> u64 {
+    (inputs * INPUT_WEIGHT + 2 * OUTPUT_WEIGHT + KERNEL_WEIGHT).saturating_mul(rate)
+}
+
+/// How a payment is put together, for those who choose: the fee rate, and
+/// the coins it spends.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SendOptions {
+    /// Base units of fee per unit of weight, at least the relay minimum
+    /// ([`MIN_FEE_PER_WEIGHT`], the default).
+    #[serde(default)]
+    pub fee_rate: Option<u64>,
+    /// The commitments (hex) of the coins to spend: these, and no others.
+    #[serde(default)]
+    pub coins: Option<Vec<String>>,
+}
+
+impl SendOptions {
+    /// Options as JSON: `{fee_rate?, coins?}`; empty for the defaults.
+    pub fn from_json(json: &str) -> Result<Self> {
+        if json.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        serde_json::from_str(json).map_err(|e| anyhow!("not payment options: {e}"))
+    }
+
+    fn rate(&self) -> Result<u64> {
+        let rate = self.fee_rate.unwrap_or(MIN_FEE_PER_WEIGHT);
+        if rate < MIN_FEE_PER_WEIGHT {
+            bail!("a fee rate of {rate} is below the relay minimum of {MIN_FEE_PER_WEIGHT} per weight");
+        }
+        Ok(rate)
+    }
 }
 
 /// A fresh 24-word mnemonic, as `midwimble wallet create` makes.
@@ -1041,10 +1079,89 @@ impl WalletCore {
         fee: Option<u64>,
         tip_height: u64,
     ) -> Result<(Vec<&WalletCoin>, u64)> {
+        self.select_by(
+            amount,
+            |n| fee.unwrap_or_else(|| suggested_fee(n.max(1) as u64)),
+            tip_height,
+        )
+    }
+
+    /// [`Self::select`] with `options`: its fee rate, and its coins if it
+    /// names them (then all of those, and only those).
+    fn select_with(
+        &self,
+        amount: u64,
+        options: &SendOptions,
+        tip_height: u64,
+    ) -> Result<(Vec<&WalletCoin>, u64)> {
+        let rate = options.rate()?;
+        let Some(chosen) = self.chosen_coins(options, tip_height)? else {
+            return self.select_by(amount, |n| fee_at(rate, n.max(1) as u64), tip_height);
+        };
         if amount == 0 {
             bail!("amount must be positive");
         }
-        let fee_for = |n: usize| fee.unwrap_or_else(|| suggested_fee(n.max(1) as u64));
+        let total: u64 = chosen.iter().map(|c| c.value).sum();
+        let fee = fee_at(rate, chosen.len() as u64);
+        let need = amount
+            .checked_add(fee)
+            .ok_or_else(|| anyhow!("amount overflow"))?;
+        if total < need {
+            bail!(
+                "the chosen coins hold {}, and this payment needs {} (amount plus a {} fee)",
+                midwimble::core::types::format_amount(total),
+                midwimble::core::types::format_amount(need),
+                midwimble::core::types::format_amount(fee)
+            );
+        }
+        Ok((chosen, fee))
+    }
+
+    /// The coins `options` names, if it names any: each must be spendable.
+    fn chosen_coins(
+        &self,
+        options: &SendOptions,
+        tip_height: u64,
+    ) -> Result<Option<Vec<&WalletCoin>>> {
+        let Some(list) = &options.coins else {
+            return Ok(None);
+        };
+        let mut wanted = HashSet::new();
+        for c in list {
+            let bytes: Point32 = hex::decode(c.trim())
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| anyhow!("not a coin's commitment: {c}"))?;
+            wanted.insert(bytes);
+        }
+        if wanted.is_empty() {
+            bail!("no coins chosen");
+        }
+        let chosen: Vec<&WalletCoin> = self
+            .candidates(tip_height)
+            .into_iter()
+            .filter(|c| wanted.contains(&c.output.commitment))
+            .collect();
+        if chosen.len() != wanted.len() {
+            bail!(
+                "{} of the chosen coins cannot be spent now: spent, held by a payment waiting for a block, or not yet mature",
+                wanted.len() - chosen.len()
+            );
+        }
+        Ok(Some(chosen))
+    }
+
+    /// Largest coins first until they cover `amount` plus `fee_for` that
+    /// many coins.
+    fn select_by(
+        &self,
+        amount: u64,
+        fee_for: impl Fn(usize) -> u64,
+        tip_height: u64,
+    ) -> Result<(Vec<&WalletCoin>, u64)> {
+        if amount == 0 {
+            bail!("amount must be positive");
+        }
         let mut chosen = Vec::new();
         let mut total = 0u64;
         for c in self.candidates(tip_height) {
@@ -1084,15 +1201,44 @@ impl WalletCore {
         })
     }
 
+    /// [`Self::quote`] with `options`.
+    pub fn quote_with(&self, amount: u64, options: &SendOptions, tip_height: u64) -> Result<Quote> {
+        let (chosen, fee) = self.select_with(amount, options, tip_height)?;
+        let total: u64 = chosen.iter().map(|c| c.value).sum();
+        Ok(Quote {
+            amount,
+            fee,
+            inputs: chosen.len(),
+            change: total - amount - fee,
+        })
+    }
+
     /// The most one payment can send (everything worth more than its fee).
     pub fn max_sendable(&self, tip_height: u64) -> u64 {
-        let mut best = 0u64;
-        let mut total = 0u64;
-        for (i, c) in self.candidates(tip_height).iter().enumerate() {
-            total += c.value;
-            best = best.max(total.saturating_sub(suggested_fee(i as u64 + 1)));
+        self.max_sendable_with(&SendOptions::default(), tip_height)
+    }
+
+    /// [`Self::max_sendable`] with `options`: at its fee rate, from its
+    /// coins if it names them. Zero if the options are no good.
+    pub fn max_sendable_with(&self, options: &SendOptions, tip_height: u64) -> u64 {
+        let Ok(rate) = options.rate() else { return 0 };
+        match self.chosen_coins(options, tip_height) {
+            Ok(Some(chosen)) => chosen
+                .iter()
+                .map(|c| c.value)
+                .sum::<u64>()
+                .saturating_sub(fee_at(rate, chosen.len() as u64)),
+            Ok(None) => {
+                let mut best = 0u64;
+                let mut total = 0u64;
+                for (i, c) in self.candidates(tip_height).iter().enumerate() {
+                    total += c.value;
+                    best = best.max(total.saturating_sub(fee_at(rate, i as u64 + 1)));
+                }
+                best
+            }
+            Err(_) => 0,
         }
-        best
     }
 
     /// Builds a payment and reserves its coins until a block confirms it or
@@ -1107,18 +1253,57 @@ impl WalletCore {
         now: u64,
     ) -> Result<BuiltSend> {
         let address = check_address(to)?;
-        let (chosen, fee) = self.select(amount, fee, tip_height)?;
-        let mut spend = Vec::with_capacity(chosen.len());
-        for c in &chosen {
-            let owned = scan_output(&self.keys, &c.output)
-                .ok_or_else(|| anyhow!("a stored coin no longer opens"))?;
-            spend.push(Spendable {
-                commitment: c.output.commitment,
-                value: owned.value,
-                blinding: owned.blinding,
-                owner_secret: owned.owner_secret,
-            });
-        }
+        let (spend, fee) = {
+            let (chosen, fee) = self.select(amount, fee, tip_height)?;
+            (self.spendables(&chosen)?, fee)
+        };
+        self.finish_send(address, amount, spend, fee, tip_height, now)
+    }
+
+    /// [`Self::build_send`] with `options`: its fee rate, and its coins if
+    /// it names them.
+    pub fn build_send_with(
+        &mut self,
+        to: &str,
+        amount: u64,
+        options: &SendOptions,
+        tip_height: u64,
+        now: u64,
+    ) -> Result<BuiltSend> {
+        let address = check_address(to)?;
+        let (spend, fee) = {
+            let (chosen, fee) = self.select_with(amount, options, tip_height)?;
+            (self.spendables(&chosen)?, fee)
+        };
+        self.finish_send(address, amount, spend, fee, tip_height, now)
+    }
+
+    /// What signing for `coins` takes.
+    fn spendables(&self, coins: &[&WalletCoin]) -> Result<Vec<Spendable>> {
+        coins
+            .iter()
+            .map(|c| {
+                let owned = scan_output(&self.keys, &c.output)
+                    .ok_or_else(|| anyhow!("a stored coin no longer opens"))?;
+                Ok(Spendable {
+                    commitment: c.output.commitment,
+                    value: owned.value,
+                    blinding: owned.blinding,
+                    owner_secret: owned.owner_secret,
+                })
+            })
+            .collect()
+    }
+
+    fn finish_send(
+        &mut self,
+        address: StealthAddress,
+        amount: u64,
+        spend: Vec<Spendable>,
+        fee: u64,
+        tip_height: u64,
+        now: u64,
+    ) -> Result<BuiltSend> {
         let built = build_transaction(
             &spend,
             &[Payment {

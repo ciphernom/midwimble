@@ -119,6 +119,8 @@ pub fn chain_constants() -> String {
         "target_block_time": types::TARGET_BLOCK_TIME,
         "recovery_height": midwimble::core::recovery::DEFAULT_RECOVERY_HEIGHT,
         "fast_mining": cfg!(feature = "fast-mining"),
+        // The relay minimum fee rate, in base units per unit of weight.
+        "min_fee_rate": types::MIN_FEE_PER_WEIGHT,
     }))
 }
 
@@ -438,6 +440,59 @@ impl Wallet {
 
     pub fn max_sendable(&self, tip_height: f64) -> Result<f64, JsError> {
         Ok(self.0.max_sendable(whole(tip_height, "a height")?) as f64)
+    }
+
+    /// `quote` with options, JSON {fee_rate?, coins?: [commitment hex]}
+    /// ("" for none): a fee rate in base units per weight (at least
+    /// `min_fee_rate` in `chain_constants`), and the coins to spend, all of
+    /// them and no others.
+    pub fn quote_with(
+        &self,
+        amount: f64,
+        options_json: &str,
+        tip_height: f64,
+    ) -> Result<String, JsError> {
+        let options = wallet::SendOptions::from_json(options_json).map_err(err)?;
+        let q = self
+            .0
+            .quote_with(
+                whole(amount, "the amount")?,
+                &options,
+                whole(tip_height, "a height")?,
+            )
+            .map_err(err)?;
+        Ok(json(&q))
+    }
+
+    /// `max_sendable` with options (as `quote_with` takes them).
+    pub fn max_sendable_with(&self, options_json: &str, tip_height: f64) -> Result<f64, JsError> {
+        let options = wallet::SendOptions::from_json(options_json).map_err(err)?;
+        Ok(self
+            .0
+            .max_sendable_with(&options, whole(tip_height, "a height")?) as f64)
+    }
+
+    /// `build_send` with options (as `quote_with` takes them).
+    pub fn build_send_with(
+        &mut self,
+        to: &str,
+        amount: f64,
+        options_json: &str,
+        tip_height: f64,
+        now: f64,
+    ) -> Result<String, JsError> {
+        let options = wallet::SendOptions::from_json(options_json).map_err(err)?;
+        let built = self
+            .0
+            .build_send_with(
+                to,
+                whole(amount, "the amount")?,
+                &options,
+                whole(tip_height, "a height")?,
+                whole(now.floor(), "the time")?,
+            )
+            .map_err(err)?;
+        Ok(json(&built))
     }
 
     /// Builds a payment and reserves its coins. Returns JSON

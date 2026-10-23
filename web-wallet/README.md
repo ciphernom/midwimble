@@ -2,8 +2,8 @@
 
 A midwimble wallet that runs in the browser. It is the CLI wallet's logic
 (`src/wallet`: keys from a BIP39 phrase, view-key scanning, largest-first coin
-selection, stealth payments) compiled to WebAssembly, with a page in the
-explorer's style. It talks to midwimble nodes over WebRTC-direct, using the
+selection, stealth payments) compiled to WebAssembly, with a simple page
+(below). It talks to midwimble nodes over WebRTC-direct, using the
 light protocol (`src/network/light_protocol.rs`): no server of its own, no
 HTTPS gateway, no certificate authority.
 
@@ -12,11 +12,12 @@ HTTPS gateway, no certificate authority.
   the wallet is stored in the CLI's own encrypted file format (`MWWALLET1`:
   Argon2id, XChaCha20-Poly1305), so a `.mww` file moves between
   `midwimble wallet` and the browser in both directions.
-- **Receive** to one reusable address (QR included); **send** with the relay's
-  minimum fee, to an address typed, pasted, or scanned from its QR code with
-  the camera or from a photo; **history** with change folded into the payment
-  that made it; coins, with a warning for any whose recovery commitment a
-  sender got wrong.
+- **Receive** to one reusable address (QR included, with an amount if asked
+  for); **send** at the relay's minimum fee or a higher rate, from the coins
+  the wallet picks or those chosen, to an address typed, pasted, or scanned
+  from its QR code with the camera or from a photo; **activity** with change
+  folded into the payment that made it; coins, with a warning for any whose
+  recovery commitment a sender got wrong.
 - **Follows the chain by its scan data**, not its blocks (`get_scan_data`,
   `src/core/scan.rs`): for each block, its id and header hash, each output's
   ephemeral key and view tag, and a prefix of each input's commitment, about
@@ -30,8 +31,8 @@ HTTPS gateway, no certificate authority.
   foreign outputs shares its view tag, so a few more than its own payments)
   comes with three other blocks from around it, each from a node picked at
   random, and must match the header hash in the scan data, so any node can
-  serve it. No node sees which block mattered. "Download every block whole"
-  in the settings gives the nodes nothing to go on at all, for ten times the
+  serve it. No node sees which block mattered. Settings → Privacy → Download
+  Every Block gives the nodes nothing to go on at all, for ten times the
   data; so does a node from before scan data, which the wallet reads whole.
 - **Uses several nodes.** It keeps three connected, picked at random from
   `config.json`'s and from those the nodes it reaches list (`get_nodes`), and
@@ -51,6 +52,35 @@ HTTPS gateway, no certificate authority.
 - Keys never leave the page's wallet worker. The nodes learn which coins are
   the wallet's only from the payments sent through them, and from which
   blocks it fetches whole (above).
+
+## The page
+
+Up front it is as simple as a wallet gets: the balance, with what is
+arriving, being sent and maturing; Send; Receive; and what happened. The bar
+along the top shows how many nodes it has, and holds Lock and Settings. It
+locks itself after 15 minutes without use. Everything else is under
+Settings, kept in this browser:
+
+| Settings | |
+|---|---|
+| Backup | the recovery phrase (after the password); the wallet file to download |
+| Security | auto-lock after a minute to four hours, or never; the password before each payment; changing the password |
+| Network | the nodes connected, each with its height, response time, requests, failures and data; how many at once (1 to 5); finding more through them; cross-checking the one followed; a node to always follow; a node list of your own |
+| Privacy | downloading every block whole; how many decoy blocks come with each one fetched (0 to 8) and from how many around it; spreading block requests over the nodes |
+| Sending | the fee: the relay minimum, twice it, five times it, or a rate of your own; choosing the coins each payment spends |
+| Advanced | block numbers, hashes and commitments, and all eight decimal places; scan data per request and blocks fetched ahead; watching the mempool and how often, and how often payments are sent again; the coins; the view key; rescanning; diagnostics, to copy as JSON; resetting every setting |
+
+On a wide screen the sections are listed down the side, and the balance
+and its buttons, or the QR code and the address, sit side by side. Its
+pages are addresses (`#/settings/network`, say), so the browser's back
+button works and a page can be bookmarked.
+
+It is also an app (a PWA, `manifest.webmanifest`): the browser offers to
+install it, and Settings does where the browser lets it. Its service worker
+(`sw.js`) keeps a copy of the wallet's files as they load, so it opens,
+unlocks and shows what it knew without a network; online, the files always
+come fresh from the server, so the page, worker and WebAssembly never come
+from different releases.
 
 ## Use it
 
@@ -76,7 +106,8 @@ private ones too). A node list pasted into the wallet's settings replaces the
 configured one and turns that off.
 
 `config.json` also names the network and its genesis block id: the wallet
-checks each node's block 0 against it before using the node.
+checks each node's block 0 against it before using the node. Once the coin
+has a ticker, `unit` there names it, and amounts show it.
 
 ## Build
 
@@ -110,6 +141,8 @@ cargo test        # real fast-mining chains, and wallet files to and from the CL
 | `qr.js` | a QR encoder, so the page loads nothing from anywhere else |
 | `qr_scan.js` | reads QR codes for the send form, from the camera or a photo; loaded when someone scans |
 | `qr_reader.js` | decodes them on a worker with jsQR (bundled into `qr_reader.bundle.js`); browsers with a `BarcodeDetector` (Chrome on Android and macOS) use that instead |
+| `manifest.webmanifest`, `icons/` | what installing it as an app needs |
+| `sw.js` | the service worker that lets it open offline |
 
 ## Notes
 
@@ -132,9 +165,9 @@ cargo test        # real fast-mining chains, and wallet files to and from the CL
   blocks (nodes accept up to 1,000, never below a finalized checkpoint) makes
   it rescan from its birth height. While its node is syncing or behind it,
   it waits rather than roll back.
-- Scanning asks for the camera only when "scan" is pressed, and turns it off
+- Scanning asks for the camera only when Scan is pressed, and turns it off
   as soon as a code is read, the scanner closes, or the tab is hidden. Where
-  there is no camera, or it is refused, "Choose a photo" reads a photo or a
+  there is no camera, or it is refused, Choose Photo reads a photo or a
   screenshot of the code instead. A scanned code may be an address or a
   `midwimble:<address>?amount=<coins>` URI.
 - The recovery phrase restores everything that matters. The wallet file also

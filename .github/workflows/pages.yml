@@ -38,7 +38,8 @@ jobs:
           cp -r docs/. _site/
           cd web-wallet
           cp -r index.html app.js worker.js keygen.js qr.js qr_scan.js wallet.css logo.svg \
-                config.json light_client.bundle.js qr_reader.bundle.js pkg ../_site/wallet/
+                config.json light_client.bundle.js qr_reader.bundle.js pkg \
+                sw.js manifest.webmanifest icons ../_site/wallet/
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:

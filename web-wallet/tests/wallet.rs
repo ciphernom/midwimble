@@ -4,10 +4,10 @@ use midwimble::core::mw::{Context, StealthAddress, Transaction, WalletKeys};
 use midwimble::core::scan::{ScanBlock, ScanRun};
 use midwimble::core::state::apply_batch;
 use midwimble::core::template::build_template;
-use midwimble::core::types::{block_reward, COINBASE_MATURITY};
+use midwimble::core::types::{block_reward, COINBASE_MATURITY, MIN_FEE_PER_WEIGHT};
 use midwimble::core::{Batch, State};
 use midwimble_web_wallet::wallet::{
-    self, BuiltSend, IncomingView, ScanChunk, WalletCore, MISMATCH, REORG,
+    self, BuiltSend, IncomingView, ScanChunk, SendOptions, WalletCore, MISMATCH, REORG,
 };
 use std::collections::HashSet;
 
@@ -964,4 +964,70 @@ fn scan_data_notices_reorgs_and_blocks_that_do_not_match_it() {
     // Up to date, the same scan data is nothing more to do.
     assert_eq!(w.scan_compact(&mut next).unwrap(), Default::default());
     assert!(w.wanted(&mut next).is_empty());
+}
+
+/// A payment at a fee rate of the user's choosing, from coins of the user's
+/// choosing: those coins and no others, each one spendable.
+#[test]
+fn fee_rates_and_chosen_coins() {
+    let mut chain = Chain::new();
+    let mut w = web_wallet(PHRASE, 1, 0);
+    let me = w.address();
+    for _ in 0..3 {
+        chain.mine(&me, &[]);
+    }
+    chain.mine_to_stranger(COINBASE_MATURITY as usize);
+    chain.sync(&mut w);
+    let tip = chain.tip();
+    let to = WalletKeys::random().address().encode();
+    let rate = |r| SendOptions {
+        fee_rate: Some(r),
+        coins: None,
+    };
+
+    // Twice the rate, twice the fee; below the relay minimum, refused.
+    let plain = w.quote_with(1_000, &SendOptions::default(), tip).unwrap();
+    assert_eq!(plain.fee, wallet::suggested_fee(1));
+    let double = w
+        .quote_with(1_000, &rate(2 * MIN_FEE_PER_WEIGHT), tip)
+        .unwrap();
+    assert_eq!(double.fee, 2 * plain.fee);
+    assert!(w
+        .quote_with(1_000, &rate(MIN_FEE_PER_WEIGHT - 1), tip)
+        .is_err());
+    assert_eq!(
+        w.max_sendable_with(&rate(2 * MIN_FEE_PER_WEIGHT), tip),
+        w.balance(tip).spendable - wallet::fee_at(2 * MIN_FEE_PER_WEIGHT, 3)
+    );
+
+    // Two coins chosen: both are spent, and only they.
+    let coins = w.coins(tip);
+    let two: Vec<String> = coins.iter().take(2).map(|c| c.commitment.clone()).collect();
+    let held: u64 = coins.iter().take(2).map(|c| c.value).sum();
+    let chosen = SendOptions {
+        fee_rate: None,
+        coins: Some(two.clone()),
+    };
+    let q = w.quote_with(1_000, &chosen, tip).unwrap();
+    assert_eq!((q.inputs, q.fee), (2, wallet::suggested_fee(2)));
+    let max = w.max_sendable_with(&chosen, tip);
+    assert_eq!(max, held - wallet::suggested_fee(2));
+    assert!(w.quote_with(max + 1, &chosen, tip).is_err());
+    let sent = w.build_send_with(&to, max, &chosen, tip, 0).unwrap();
+    assert_eq!(sent.change, 0);
+    let spent: HashSet<String> = tx_of(&sent).input_commitments().map(hex::encode).collect();
+    assert_eq!(spent, two.iter().cloned().collect::<HashSet<_>>());
+    tx_of(&sent).validate(Context::Relay).unwrap();
+
+    // Coins a payment holds, or that are not this wallet's, cannot be chosen.
+    let err = w.quote_with(1, &chosen, tip).unwrap_err().to_string();
+    assert!(err.contains("cannot be spent now"), "{err}");
+    let stranger = SendOptions {
+        fee_rate: None,
+        coins: Some(vec!["00".repeat(32)]),
+    };
+    assert!(w.quote_with(1, &stranger, tip).is_err());
+    assert!(SendOptions::from_json(r#"{"fee_rate":"fast"}"#).is_err());
+    assert!(SendOptions::from_json(r#"{"tip":1}"#).is_err());
+    assert_eq!(SendOptions::from_json("").unwrap().fee_rate, None);
 }

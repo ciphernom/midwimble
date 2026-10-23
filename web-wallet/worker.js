@@ -8,24 +8,17 @@
 //
 // It reads the chain as scan data (core/scan.rs), not whole blocks: enough to
 // pass over every block that neither pays this wallet nor spends its coins.
-// The few others it fetches whole, each together with DECOYS other blocks,
-// and each of those from a node picked at random, so that no node learns
-// which blocks are this wallet's. A user who would rather give nothing away
-// downloads every block whole instead (the "whole blocks" setting).
+// The few others it fetches whole, each together with a few other blocks
+// (three, unless set otherwise), and each of those from a node picked at
+// random, so that no node learns which blocks are this wallet's. A user who
+// would rather give nothing away downloads every block whole instead. The
+// page's settings tune all of it (`settings`, below).
 
 import init, * as mw from './pkg/midwimble_web_wallet.js';
 
 const WASM_URL = new URL('./pkg/midwimble_web_wallet_bg.wasm', import.meta.url);
 /** Blocks asked for per get_blocks (the node caps it, and by size). */
 const BLOCKS_PER_REQUEST = 100;
-/** Blocks' scan data asked for per get_scan_data (the node caps it). */
-const SCAN_BLOCKS_PER_REQUEST = 2000;
-/** Other blocks fetched with each block the wallet needs whole. */
-const DECOYS = 3;
-/** Decoys come from the blocks around the one needed, this many at most. */
-const DECOY_WINDOW = 1000;
-/** Blocks fetched ahead of the scan, at most. */
-const FETCH_AHEAD = 8;
 /** When more than this share of the blocks in a request's scan data are the
  *  wallet's business, they are downloaded in bulk instead (get_blocks): as
  *  cheap, and it gives nothing away. */
@@ -34,11 +27,31 @@ const BULK_SHARE = 1 / 8;
  *  sent it, after which the wallet stops trusting that node. */
 const MISMATCHES_TO_DROP = 3;
 const UTXO_PAGE = 500;
-/** Seconds before a payment still waiting for a block is broadcast again. */
-const REBROADCAST_SECS = 120;
-/** Seconds between looks at the node's mempool for payments to this wallet
- *  (a list of hashes; only new transactions are downloaded). */
-const MEMPOOL_SECS = 5;
+
+/** What the page's settings can change (app.js keeps them, per browser). */
+const settings = {
+    /** Every block whole, as before scan data. */
+    wholeBlocks: false,
+    /** Other blocks fetched with each block the wallet needs whole. */
+    decoys: 3,
+    /** Decoys come from the blocks around the one needed, this many. */
+    decoyWindow: 1000,
+    /** Blocks' scan data asked for per get_scan_data (the node caps it). */
+    scanPerRequest: 2000,
+    /** Blocks fetched ahead of the scan, at most. */
+    fetchAhead: 8,
+    /** Look in the node's mempool for payments to this wallet. */
+    watchMempool: true,
+    /** Seconds between those looks (a list of hashes; only new
+     *  transactions are downloaded). */
+    mempoolSecs: 5,
+    /** Seconds before a payment still waiting for a block is broadcast
+     *  again. */
+    rebroadcastSecs: 120,
+    /** Fee rate for payments, in base units per weight (0: the minimum). */
+    feeRate: 0,
+};
+const clampInt = (v, lo, hi, dflt) => (Number.isInteger(v) ? Math.min(hi, Math.max(lo, v)) : dflt);
 /** Transactions asked for per get_mempool_txs (the node's limit). */
 const MEMPOOL_TXS_PER_REQUEST = 64;
 const SAVE_EVERY_MS = 8_000;
@@ -59,9 +72,8 @@ const chain = {
 const scan = { active: false, mode: 'blocks', from: 0, to: 0, outputs: 0, fetched: 0 };
 let supportsGetBlocks = true;
 let supportsScanData = true;
-/** The user's choice: every block whole, as before scan data. */
-let wholeBlocks = false;
 let mismatches = 0;
+let lastSync = 0; // when a sync last ended without an error
 let syncError = null;
 let dirty = false;
 let lastSave = 0;
@@ -248,21 +260,27 @@ function dropKeygen() {
 
 // ── state for the page ──────────────────────────────────────────────────────
 
+/** The chain's height as far as is known: what a node said, or, before any
+ *  has (offline, say), how far this wallet has scanned. Without it, every
+ *  mined coin would look immature until a node answered. */
+const knownTip = () => Math.max(chain.tip, wallet ? wallet.scanned_height() : 0);
+
 function snapshot() {
     if (!wallet) return null;
-    const tip = chain.tip;
+    const tip = knownTip();
     return {
         address: wallet.address(),
         balance: JSON.parse(wallet.balance(tip)),
         history: JSON.parse(wallet.history(tip)),
         pending: JSON.parse(wallet.pending_txs()).map(p => ({ tx_hash: p.tx_hash, created_at: p.created_at })),
-        max: wallet.max_sendable(tip),
+        max: wallet.max_sendable_with(sendOptions(), tip),
         scanned: wallet.scanned_height(),
         birth: wallet.birth_height(),
         recoveryHeight: wallet.recovery_height(),
         tip,
         chain: { ...chain },
-        scan: { ...scan, whole: wholeBlocks, scanData: supportsScanData },
+        scan: { ...scan, whole: settings.wholeBlocks, scanData: supportsScanData },
+        diag: { supportsGetBlocks, supportsScanData, mismatches, lastSync, settings: { ...settings } },
         syncError,
     };
 }
@@ -335,7 +353,7 @@ function rollBack() {
 /** The id of the node's block at `height`, from its scan data (or the block,
  *  from a node without scan data); null if the node has pruned it. */
 async function blockId(height) {
-    if (supportsScanData && !wholeBlocks) {
+    if (supportsScanData && !settings.wholeBlocks) {
         try {
             const d = await rpc('get_scan_data', { start_height: height, count: 1 });
             if (!d.count) return null;
@@ -399,7 +417,7 @@ async function scanBlocks() {
     scan.from = wallet.scanned_height(); scan.to = chain.tip;
     while (wallet && chain.connected && wallet.scanned_height() < chain.tip) {
         let more = null;
-        if (supportsScanData && !wholeBlocks) more = await scanByScanData();
+        if (supportsScanData && !settings.wholeBlocks) more = await scanByScanData();
         if (more === null) more = await scanWhole(chain.tip);
         if (!more) break;
         scan.to = chain.tip;
@@ -452,7 +470,7 @@ async function scanByScanData() {
     const start = wallet.scanned_height();
     let d;
     try {
-        d = await rpc('get_scan_data', { start_height: start, count: Math.min(chain.tip - start, SCAN_BLOCKS_PER_REQUEST) });
+        d = await rpc('get_scan_data', { start_height: start, count: Math.min(chain.tip - start, settings.scanPerRequest) });
     } catch (e) {
         if (e.unanswered) { supportsScanData = false; return null; } // an older node
         throw e;
@@ -462,7 +480,7 @@ async function scanByScanData() {
     const data = new mw.ScanData(start, d.scan_hex);
     try {
         const ahead = JSON.parse(wallet.wanted(data));
-        if (ahead.length > Math.max(DECOYS + 1, (data.end() - start) * BULK_SHARE)) {
+        if (ahead.length > Math.max(settings.decoys + 1, (data.end() - start) * BULK_SHARE)) {
             // Most of these blocks are this wallet's: all of them, in bulk.
             while (wallet.scanned_height() < data.end()) {
                 if (!(await scanWhole(data.end()))) break;
@@ -481,7 +499,7 @@ async function scanByScanData() {
         };
         const topUp = () => {
             for (const h of fetches.keys()) if (h < wallet.scanned_height()) fetches.delete(h);
-            while (ahead.length && fetches.size < FETCH_AHEAD) {
+            while (ahead.length && fetches.size < settings.fetchAhead) {
                 const h = ahead.shift();
                 if (h >= wallet.scanned_height()) fetch(h);
             }
@@ -505,19 +523,21 @@ async function scanByScanData() {
 }
 
 /**
- * Block `height`, whole, from a node picked at random, with DECOYS other
- * blocks from around it, each from a node picked at random too: no node can
- * tell which block the wallet needed. Resolves with the block's hex.
+ * Block `height`, whole, from a node picked at random, with
+ * `settings.decoys` other blocks from around it, each from a node picked at
+ * random too: no node can tell which block the wallet needed. Resolves with
+ * the block's hex.
  */
 function fetchWhole(height, data) {
     // From the blocks around it that a wallet at this point could need:
     // none past its scan data, none below where it started, or the decoys
     // would give themselves away.
     const birth = wallet.birth_height();
-    const hi = Math.min(data.end(), Math.max(birth, height - DECOY_WINDOW / 2) + DECOY_WINDOW);
-    const lo = Math.max(birth, Math.min(height - DECOY_WINDOW / 2, hi - DECOY_WINDOW));
+    const window = settings.decoyWindow;
+    const hi = Math.min(data.end(), Math.max(birth, height - window / 2) + window);
+    const lo = Math.max(birth, Math.min(height - window / 2, hi - window));
     const heights = new Set([height]);
-    for (let tries = 0; heights.size < Math.min(DECOYS + 1, hi - lo) && tries < 64; tries++) {
+    for (let tries = 0; heights.size < Math.min(settings.decoys + 1, hi - lo) && tries < 64; tries++) {
         heights.add(lo + Math.floor(Math.random() * (hi - lo)));
     }
     let wanted;
@@ -561,20 +581,19 @@ async function scanFetched(data, height, hex) {
 
 function announce(r) {
     const value = r.received.reduce((s, [, v, coinbase]) => s + (coinbase ? 0 : v), 0);
-    const mined = r.received.filter(([, , coinbase]) => coinbase).length;
     if (r.confirmed && r.confirmed.length) toast(r.confirmed.length === 1 ? 'Payment confirmed.' : `${r.confirmed.length} payments confirmed.`, 'ok');
     if (r.failed && r.failed.length) toast('A payment failed: its coins were spent by another copy of this wallet.', 'bad');
     // During a long rescan, receipts are part of the history, not news.
     if (scan.to - scan.from > 20) return;
     if (value > 0) toast(`Received ${mw.format_amount(value)}.`, 'ok');
-    if (mined) toast(mined === 1 ? 'Mined a block.' : `Mined ${mined} blocks.`, 'ok');
+    // Blocks mined show in the activity; a miner's would be a stream of news.
 }
 
 async function rebroadcast() {
     const now = Date.now() / 1000;
     for (const p of JSON.parse(wallet.pending_txs())) {
         const last = lastBroadcast.get(p.tx_hash) || p.created_at;
-        if (now - last < REBROADCAST_SECS) continue;
+        if (now - last < settings.rebroadcastSecs) continue;
         lastBroadcast.set(p.tx_hash, now);
         // A duplicate or a conflict is expected here; scanning settles it.
         // Each time to a node picked at random, in case one dropped it.
@@ -595,6 +614,7 @@ async function runSync() {
         await scanBlocks();
         await rebroadcast();
         await scanMempool();
+        lastSync = Date.now();
     } catch (e) {
         syncError = errText(e);
     } finally {
@@ -614,7 +634,7 @@ async function runSync() {
  *  transactions are downloaded; the wallet scans their outputs with its
  *  view key, as it scans blocks, so the node learns nothing from it. */
 async function scanMempool() {
-    if (!wallet || !chain.connected || !mempool.supported || mempool.running) return;
+    if (!wallet || !chain.connected || !mempool.supported || mempool.running || !settings.watchMempool) return;
     if (chain.networkOk !== true || chain.nodeSyncing || chain.behind) return;
     if (wallet.scanned_height() < chain.tip) return; // catch up first: unscanned coins would look like income
     mempool.running = true;
@@ -665,7 +685,37 @@ async function scannedTo(height, ms) {
 // Poll in case a push notification is lost.
 setInterval(() => { if (wallet && chain.connected) requestSync(); }, 30_000);
 // New payments arrive without a block; nothing announces them.
-setInterval(() => { if (wallet && chain.connected) scanMempool(); }, MEMPOOL_SECS * 1000);
+let mempoolTimer = null;
+function watchMempool() {
+    clearInterval(mempoolTimer);
+    mempoolTimer = setInterval(() => { if (wallet && chain.connected) scanMempool(); }, settings.mempoolSecs * 1000);
+}
+watchMempool();
+
+/** The page's choices for a payment, as the wallet takes them: its fee
+ *  rate, and the coins it spends if the user chose them. */
+function sendOptions(coins) {
+    const o = {};
+    if (settings.feeRate > 0) o.fee_rate = settings.feeRate;
+    if (Array.isArray(coins) && coins.length) o.coins = coins;
+    return JSON.stringify(o);
+}
+
+function applySettings(next) {
+    if (!next) return;
+    const before = { ...settings };
+    if (typeof next.wholeBlocks === 'boolean') settings.wholeBlocks = next.wholeBlocks;
+    if (typeof next.watchMempool === 'boolean') settings.watchMempool = next.watchMempool;
+    settings.decoys = clampInt(next.decoys, 0, 16, settings.decoys);
+    settings.decoyWindow = clampInt(next.decoyWindow, 10, 100_000, settings.decoyWindow);
+    settings.scanPerRequest = clampInt(next.scanPerRequest, 50, 2000, settings.scanPerRequest);
+    settings.fetchAhead = clampInt(next.fetchAhead, 1, 64, settings.fetchAhead);
+    settings.mempoolSecs = clampInt(next.mempoolSecs, 2, 3600, settings.mempoolSecs);
+    settings.rebroadcastSecs = clampInt(next.rebroadcastSecs, 30, 86_400, settings.rebroadcastSecs);
+    settings.feeRate = clampInt(next.feeRate, 0, 1e12, settings.feeRate);
+    if (settings.mempoolSecs !== before.mempoolSecs) watchMempool();
+    if (settings.wholeBlocks !== before.wholeBlocks) requestSync();
+}
 
 // ── unlocking ───────────────────────────────────────────────────────────────
 
@@ -709,14 +759,14 @@ function newPasswordOk(p) {
 // ── messages from the page ──────────────────────────────────────────────────
 
 const handlers = {
-    async init({ config, settings }) {
+    async init({ config, settings: chosen }) {
         wasmModule = await WebAssembly.compileStreaming(fetch(WASM_URL)).catch(async () =>
             WebAssembly.compile(await (await fetch(WASM_URL)).arrayBuffer()));
         await init({ module_or_path: wasmModule });
         C = JSON.parse(mw.chain_constants());
         network = (config && config.network) || C.network;
         genesis = (config && config.genesis) || null;
-        wholeBlocks = !!(settings && settings.wholeBlocks);
+        applySettings(chosen);
         const file = await loadFile().catch(() => null);
         post({ type: 'boot', hasWallet: !!file, constants: C, network });
         return {};
@@ -744,12 +794,9 @@ const handlers = {
         postState(true);
     },
 
-    settings({ settings }) {
-        const whole = !!(settings && settings.wholeBlocks);
-        if (whole === wholeBlocks) return;
-        wholeBlocks = whole;
+    settings({ settings: chosen }) {
+        applySettings(chosen);
         postState(true);
-        requestSync();
     },
 
     push({ msg }) {
@@ -833,19 +880,30 @@ const handlers = {
         post({ type: 'boot', hasWallet: false, constants: C, network });
     },
 
-    quote({ amount }) {
+    quote({ amount, coins }) {
         const units = mw.parse_amount(amount);
-        return JSON.parse(wallet.quote(units, chain.tip));
+        return JSON.parse(wallet.quote_with(units, sendOptions(coins), knownTip()));
     },
 
-    async send({ to, amount }) {
+    /** The most one payment can send from `coins` (all of them when none
+     *  are named), at the fee rate set. */
+    max({ coins }) {
+        return { max: wallet.max_sendable_with(sendOptions(coins), knownTip()) };
+    },
+
+    'verify-password'({ password }) {
+        if (!checkPassword(password)) throw new Error('Wrong password.');
+        return {};
+    },
+
+    async send({ to, amount, coins }) {
         if (!chain.connected) throw new Error('Not connected to a node.');
         mw.check_address(to);
         const units = mw.parse_amount(amount);
         await refreshState();
         // Pick coins knowing everything up to the tip.
         if (!(await scannedTo(chain.tip, 20_000))) throw new Error('Still catching up with the chain; try again when the scan is done.');
-        const built = JSON.parse(wallet.build_send(to.trim(), units, chain.tip, Date.now() / 1000));
+        const built = JSON.parse(wallet.build_send_with(to.trim(), units, sendOptions(coins), chain.tip, Date.now() / 1000));
         await save();
         postState(true);
         try {
@@ -879,7 +937,7 @@ const handlers = {
     },
 
     coins() {
-        return JSON.parse(wallet.coins(chain.tip));
+        return JSON.parse(wallet.coins(knownTip()));
     },
 
     reveal({ password }) {

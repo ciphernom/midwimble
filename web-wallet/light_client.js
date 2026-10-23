@@ -43,7 +43,7 @@ const LIGHT_PROTOCOL = '/midwimble/light/2.0.0';
 const PUSH_PROTOCOL = '/midwimble/light-push/2.0.0';
 const REQUEST_TIMEOUT_MS = 30_000;
 const DIAL_TIMEOUT_MS = 8_000;
-/** Nodes connected at once. */
+/** Nodes connected at once, unless the wallet asks for another number. */
 const POOL_SIZE = 3;
 /** Addresses learned from nodes, kept at most (configured ones aside). */
 const MAX_FOUND = 64;
@@ -135,6 +135,10 @@ export class LightClient {
         this.primary = null;     // peer id of the node the wallet follows
         this.genesis = null;     // expected genesis block id, if configured
         this.discover = true;    // learn nodes from the nodes reached
+        this.poolSize = POOL_SIZE;
+        this.spread = true;      // `spread` requests may go to any node
+        this.vote = true;        // check the primary against the others
+        this.follow = '';        // an address to follow when it is connected
         this.closed = false;
         this.seq = 0;            // numbers requests; the node echoes the number
         this.errors = [];        // the latest dial failures, for the page
@@ -151,9 +155,10 @@ export class LightClient {
      * asked where other nodes are. With `genesis`, a node must follow that
      * genesis block to be used.
      */
-    async start(addrs, { genesis = null, found = [], discover = true } = {}) {
+    async start(addrs, { genesis = null, found = [], discover = true, ...options } = {}) {
         this.genesis = genesis ? String(genesis).toLowerCase() : null;
         this.discover = discover;
+        this.setOptions(options);
         this._learn(addrs, false);
         if (discover) this._learn(found, true);
         if (!this.known.size) throw new Error('no node addresses to dial');
@@ -174,10 +179,52 @@ export class LightClient {
         return !!this.primary;
     }
 
-    /** The nodes connected (that passed their checks), primary first. */
+    /**
+     * What can change while connected: `poolSize` (nodes at once), `spread`
+     * (whether a `spread` request may go to any node, or only the primary),
+     * `vote` (whether the pool checks its primary) and `follow` (an address
+     * to follow whenever it is connected; '' for none).
+     */
+    setOptions({ poolSize, spread, vote, follow } = {}) {
+        if (Number.isInteger(poolSize) && poolSize >= 1 && poolSize <= 8) this.poolSize = poolSize;
+        if (typeof spread === 'boolean') this.spread = spread;
+        if (typeof vote === 'boolean') this.vote = vote;
+        if (typeof follow === 'string') {
+            this.follow = follow.trim();
+            if (this.follow) this._learn([this.follow], false);
+        }
+        if (!this.node) return;
+        // Too many nodes: the newest that are not followed go.
+        const extra = [...this.conns.values()].filter(c => c.id !== this.primary).reverse()
+            .slice(0, Math.max(0, this.conns.size - this.poolSize));
+        for (const c of extra) {
+            this.node.hangUp(c.peer).catch(() => {});
+            this._lost(c.id);
+        }
+        const wanted = this.follow && [...this.conns.values()].find(c => c.ready && c.addr === this.follow);
+        if (wanted && wanted.id !== this.primary) {
+            this.primary = wanted.id;
+            this.onStatus('connected', wanted.addr);
+        }
+        this._report();
+        this._maintain();
+    }
+
+    /** The nodes connected (that passed their checks), primary first, with
+     *  what the wallet has asked of each. */
     nodes() {
         return [...this.conns.values()].filter(c => c.ready)
-            .map(c => ({ addr: c.addr, height: c.height, primary: c.id === this.primary }))
+            .map(c => ({
+                addr: c.addr,
+                height: c.height,
+                primary: c.id === this.primary,
+                followed: !!this.follow && c.addr === this.follow,
+                found: c.found,
+                requests: c.requests,
+                failures: c.failures,
+                bytes: c.bytes,
+                ms: c.ms,
+            }))
             .sort((a, b) => b.primary - a.primary);
     }
 
@@ -233,7 +280,7 @@ export class LightClient {
         this._maintaining = (async () => {
             try {
                 for (;;) {
-                    const want = POOL_SIZE - this.conns.size;
+                    const want = this.poolSize - this.conns.size;
                     if (this.closed || want <= 0) break;
                     const picks = this._candidates(want);
                     if (!picks.length) break;
@@ -255,20 +302,21 @@ export class LightClient {
             const due = [...this.known.values()]
                 .filter(k => !k.bad && !connected.has(peerOf(k.addr)))
                 .map(k => k.retryAt);
-            const next = this.conns.size < POOL_SIZE && due.length ? Math.min(...due) - Date.now() : 30_000;
+            const next = this.conns.size < this.poolSize && due.length ? Math.min(...due) - Date.now() : 30_000;
             this._timer = setTimeout(() => this._maintain(), Math.min(30_000, Math.max(2_000, next)));
         })();
         return this._maintaining;
     }
 
     /** Up to `n` addresses to dial: due, of nodes not connected, one each;
-     *  a configured one first if the pool has none. */
+     *  the followed node first, then a configured one if the pool has none. */
     _candidates(n) {
         const now = Date.now();
         const peers = new Set(this.conns.keys());
         const anchored = [...this.conns.values()].some(c => !c.found);
         const due = shuffle([...this.known.values()]).filter(k => !k.bad && k.retryAt <= now);
         if (!anchored) due.sort((a, b) => a.found - b.found);
+        due.sort((a, b) => (b.addr === this.follow) - (a.addr === this.follow));
         const out = [];
         for (const k of due) {
             if (out.length >= n) break;
@@ -290,7 +338,10 @@ export class LightClient {
         }
         const id = conn.remotePeer.toString();
         if (this.conns.has(id)) return;
-        const c = { peer: conn.remotePeer, id, addr: k.addr, found: k.found, height: 0, ready: false, inFlight: 0, queue: [] };
+        const c = {
+            peer: conn.remotePeer, id, addr: k.addr, found: k.found, height: 0, ready: false, inFlight: 0, queue: [],
+            requests: 0, failures: 0, bytes: 0, ms: null,
+        };
         this.conns.set(id, c);
         try {
             const st = await this._call(c, 'get_state');
@@ -312,7 +363,7 @@ export class LightClient {
         k.failures = 0;
         k.retryAt = 0;
         c.ready = true;
-        if (!this.primary) this._choosePrimary();
+        if (!this.primary || (this.follow && c.addr === this.follow)) this._choosePrimary();
         if (this.discover) this._discover(c);
         this._report();
     }
@@ -361,10 +412,17 @@ export class LightClient {
         return heights.length ? heights[Math.floor((heights.length - 1) / 2)] : 0;
     }
 
-    /** A random node among those near the pool's median height. */
+    /** The followed node if connected, else a random node among those near
+     *  the pool's median height. */
     _choosePrimary(except) {
         const ready = [...this.conns.values()].filter(c => c.ready && c.id !== except);
         if (!ready.length) return;
+        const followed = this.follow && ready.find(c => c.addr === this.follow);
+        if (followed) {
+            this.primary = followed.id;
+            this.onStatus('connected', followed.addr);
+            return;
+        }
         const median = this._median();
         const near = ready.filter(r => Math.abs(r.height - median) <= PRIMARY_SLACK);
         const c = pick(near.length ? near : ready);
@@ -380,7 +438,8 @@ export class LightClient {
      */
     async _watchPrimary() {
         const p = this.conns.get(this.primary);
-        if (!p) return;
+        // A node the user chose is followed as it is.
+        if (!p || !this.vote || (this.follow && p.addr === this.follow)) return;
         // Heights fresh from each node, not only from the pushes it sent.
         await Promise.all([...this.conns.values()].filter(c => c.ready)
             .map(c => this._call(c, 'get_state').catch(() => {})));
@@ -420,7 +479,7 @@ export class LightClient {
         let last;
         for (let attempt = 0; attempt < 4; attempt++) {
             let c;
-            if (spread) {
+            if (spread && this.spread) {
                 const ready = [...this.conns.values()].filter(r => r.ready && !tried.has(r.id));
                 c = ready.length ? pick(ready) : null;
             } else {
@@ -453,9 +512,13 @@ export class LightClient {
         for (let attempt = 0; attempt < 3; attempt++) {
             if (attempt) await sleep(150 * attempt);
             let resp;
+            const t0 = Date.now();
             try {
+                c.requests++;
                 resp = await this._queued(c, () => this._request(c, req));
+                c.ms = c.ms == null ? Date.now() - t0 : Math.round(c.ms * 0.8 + (Date.now() - t0) * 0.2);
             } catch (e) {
+                c.failures++;
                 last = e;
                 if (!this.conns.has(c.id)) break;
                 continue;
@@ -517,6 +580,7 @@ export class LightClient {
                     }
                     if (expected !== null && total >= 4 + expected) {
                         done();
+                        c.bytes += total;
                         resolve(concat(chunks, total).subarray(4, 4 + expected));
                     }
                 };
