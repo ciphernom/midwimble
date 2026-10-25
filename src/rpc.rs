@@ -70,6 +70,7 @@ pub fn router_with(node: NodeHandle, options: &RpcOptions, index: SharedIndex) -
         .route("/", get(explorer))
         .route("/logo.svg", get(logo))
         .route("/state", get(state))
+        .route("/link", get(link_page))
         .route("/blocks/{start}/{count}", get(blocks))
         .route("/bonds", get(bonds))
         .route("/relay", get(relay))
@@ -114,6 +115,7 @@ pub fn explorer_router(node: NodeHandle, index: SharedIndex) -> Router {
         .route("/", get(explorer))
         .route("/logo.svg", get(logo))
         .route("/state", get(state))
+        .route("/link", get(link_page))
         .route("/explorer/blocks", get(crate::explorer::blocks))
         .route("/explorer/block/{id}", get(crate::explorer::block))
         .route(
@@ -341,6 +343,95 @@ async fn logo() -> impl axum::response::IntoResponse {
 
 async fn explorer() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("explorer.html"))
+}
+
+/// A page that shows a QR a phone/web wallet scans to pair with this node.
+/// The address the wallet should dial is built from the `Host` header — the
+/// very address the operator opened this page at — so viewing it over the LAN
+/// (e.g. `http://192.168.1.5:9434/link`) yields a LAN-dialable QR with no
+/// configuration.
+async fn link_page(
+    AxState(node): AxState<NodeHandle>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Html<String> {
+    use axum::response::Html;
+    let info = node.info();
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::link::host_from_header)
+        .unwrap_or_else(|| "localhost".to_string());
+    let templates = if info.webrtc_listen.is_empty() {
+        &info.webrtc_addrs
+    } else {
+        &info.webrtc_listen
+    };
+    let addrs: Vec<String> = templates
+        .iter()
+        .filter_map(|a| crate::link::rehost(a, &host))
+        .collect();
+    if addrs.is_empty() {
+        return Html(link_html_message(
+            "This node has no WebRTC address yet. Build it with <code>--features webrtc</code> \
+             and give it a moment to start listening, then reload.",
+        ));
+    }
+    let uri = crate::link::node_link_uri(&addrs, true);
+    let svg = match qrcode::QrCode::new(uri.as_bytes()) {
+        Ok(code) => code
+            .render::<qrcode::render::svg::Color>()
+            .min_dimensions(300, 300)
+            .quiet_zone(true)
+            .build(),
+        Err(_) => return Html(link_html_message("Could not render the QR code.")),
+    };
+    Html(link_html(&svg, &uri, &addrs))
+}
+
+fn link_page_shell(body: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>Link a wallet · midwimble</title><style>\
+         :root{{color-scheme:light dark}}\
+         body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;\
+         background:#0b0d10;color:#e7e9ee;font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}}\
+         .card{{max-width:420px;margin:24px;padding:28px;background:#14181d;border:1px solid #232a32;\
+         border-radius:16px;text-align:center;box-shadow:0 8px 40px rgba(0,0,0,.4)}}\
+         h1{{font-size:20px;margin:0 0 4px}} p{{margin:8px 0;color:#aab2bd}}\
+         .qr{{width:300px;max-width:100%;margin:16px auto;background:#fff;border-radius:12px;padding:12px}}\
+         .qr svg{{width:100%;height:auto;display:block}}\
+         code,.addr{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;word-break:break-all}}\
+         .addr{{display:block;margin-top:12px;padding:10px;background:#0b0d10;border:1px solid #232a32;\
+         border-radius:8px;color:#8b94a0}}</style></head><body><div class=\"card\">{body}</div></body></html>"
+    )
+}
+
+fn link_html(svg: &str, uri: &str, addrs: &[String]) -> String {
+    let addr_list = addrs
+        .iter()
+        .map(|a| format!("<span class=\"addr\">{}</span>", html_escape(a)))
+        .collect::<String>();
+    link_page_shell(&format!(
+        "<h1>Link a wallet</h1>\
+         <p>Scan this with the midwimble wallet:<br>Network → Node list → Scan node QR.</p>\
+         <div class=\"qr\">{svg}</div>\
+         <p>Or add this address by hand:</p>{addr_list}\
+         <p style=\"margin-top:16px\"><code>{}</code></p>",
+        html_escape(uri)
+    ))
+}
+
+fn link_html_message(msg: &str) -> String {
+    link_page_shell(&format!("<h1>Link a wallet</h1><p>{msg}</p>"))
+}
+
+/// Minimal HTML-escaping for text embedded in the link page.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 async fn state(AxState(node): AxState<NodeHandle>) -> Json<Value> {

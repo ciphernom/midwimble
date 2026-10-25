@@ -953,24 +953,6 @@ fn json_str_array(v: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Rewrites a multiaddr's host — its leading `/ip4|ip6|dns4|dns6|dns/<value>`
-/// — to `host`, choosing `ip4`/`ip6`/`dns4` by what `host` parses as and
-/// keeping the rest (`/udp/<port>/webrtc-direct/certhash/…/p2p/…`).
-fn rehost(addr: &str, host: &str) -> Option<String> {
-    let mut parts = addr.strip_prefix('/')?.splitn(3, '/');
-    let _proto = parts.next()?;
-    let _value = parts.next()?;
-    let rest = parts.next()?;
-    let proto = if host.parse::<std::net::Ipv4Addr>().is_ok() {
-        "ip4"
-    } else if host.parse::<std::net::Ipv6Addr>().is_ok() {
-        "ip6"
-    } else {
-        "dns4"
-    };
-    Some(format!("/{proto}/{host}/{rest}"))
-}
-
 /// Prints a QR code (and the raw link URI) that points a phone or web wallet
 /// at this node. The node tells us its WebRTC listen address — which carries
 /// the certificate hash and peer id a browser needs — and we rehost it to an
@@ -989,7 +971,7 @@ fn link_qr(rpc: &str, host: Option<&str>, follow: bool) -> Result<()> {
                      `--features webrtc` and listening?"
                 );
             }
-            templates.iter().filter_map(|a| rehost(a, h)).collect()
+            templates.iter().filter_map(|a| midwimble::link::rehost(a, h)).collect()
         }
         None => {
             if public.is_empty() {
@@ -1006,11 +988,7 @@ fn link_qr(rpc: &str, host: Option<&str>, follow: bool) -> Result<()> {
         bail!("could not build a dialable address; re-run with --host <ip-or-dns>");
     }
 
-    let mut query: Vec<String> = addrs.iter().map(|a| format!("a={a}")).collect();
-    if follow {
-        query.push("follow=1".to_string());
-    }
-    let uri = format!("midwimble:node?{}", query.join("&"));
+    let uri = midwimble::link::node_link_uri(&addrs, follow);
 
     let code = qrcode::QrCode::new(uri.as_bytes()).map_err(|e| anyhow!("could not encode QR: {e}"))?;
     let image = code

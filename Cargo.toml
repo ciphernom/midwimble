@@ -62,8 +62,8 @@ async-trait = { version = "0.1", optional = true }
 redb = { version = "2", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 clap = { version = "4", optional = true, features = ["derive"] }
-# Terminal QR for `midwimble link` (no image/svg features needed).
-qrcode = { version = "0.14", optional = true, default-features = false }
+# QR for `midwimble link` (terminal, unicode) and the /link page (SVG).
+qrcode = { version = "0.14", optional = true, default-features = false, features = ["svg"] }
 axum = { version = "0.8", optional = true, default-features = false, features = ["json", "tokio", "http1", "query"] }
 # Stratum over TLS (pool and pool miner). ring, as libp2p already uses it.
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12", "logging"] }

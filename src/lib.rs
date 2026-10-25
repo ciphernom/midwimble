@@ -14,6 +14,8 @@ pub mod explorer;
 #[cfg(feature = "node")]
 pub mod finality;
 #[cfg(feature = "node")]
+pub mod link;
+#[cfg(feature = "node")]
 pub mod mempool;
 #[cfg(feature = "node")]
 pub mod merge_mine;
