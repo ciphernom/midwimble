@@ -1243,9 +1243,17 @@ impl Network {
                     .map(|a| a.to_string());
                 let mut listening = Vec::new();
                 let mut webrtc = Vec::new();
+                // The peer's own public IP, learned from the routable
+                // (TCP/QUIC) addresses it announces: used below to make its
+                // WebRTC address dialable.
+                let mut peer_ip: Option<IpAddr> = None;
                 for addr in &info.listen_addrs {
                     if addr.to_string().contains("webrtc-direct") {
                         // For browsers (`get_nodes`); nodes do not dial it.
+                        // The IP is kept as announced for now (usually the
+                        // unspecified 0.0.0.0, since the peer listens on it and
+                        // no node dials WebRTC to teach AutoNAT a public one)
+                        // and is fixed up after the loop.
                         if browser_dialable(addr) && webrtc.len() < MAX_WEBRTC_ADDRS_PER_PEER {
                             webrtc.push(addr.clone());
                         }
@@ -1257,6 +1265,9 @@ impl Network {
                         .add_address(&peer_id, addr.clone());
                     let addr = with_id(addr);
                     if is_routable(&addr) {
+                        if peer_ip.is_none() {
+                            peer_ip = extract_ip(&addr);
+                        }
                         listening.push(addr.to_string());
                     }
                 }
@@ -1266,6 +1277,23 @@ impl Network {
                     .add_server(peer_id, Some(info.observed_addr.clone()));
                 listening.sort();
                 listening.dedup();
+                // Failing a routable address the peer announced, fall back to
+                // the address we reach it on (its public IP when we dialled it,
+                // or the source address of its connection to us): a reachable
+                // peer that does not advertise a routable listen address is
+                // still worth handing on.
+                if peer_ip.is_none() {
+                    if let Some(entry) = self.connected.get(&peer_id) {
+                        let remote = entry.get_remote_address();
+                        if is_routable(remote) {
+                            peer_ip = extract_ip(remote);
+                        }
+                    }
+                }
+                // Give the peer's WebRTC addresses its public IP, so browser
+                // wallets learn a dialable address through `get_nodes` and
+                // spread past the one node in their configuration.
+                let webrtc = dialable_webrtc(webrtc, peer_ip);
                 if webrtc.is_empty() {
                     self.webrtc_peers.remove(&peer_id);
                 } else {
@@ -1685,6 +1713,30 @@ fn replace_ip(addr: &Multiaddr, new_ip: IpAddr) -> Multiaddr {
         .collect()
 }
 
+/// Makes a peer's advertised WebRTC-direct addresses dialable by a browser.
+///
+/// A node listens for WebRTC on the port it binds (`0.0.0.0`, or a LAN IP),
+/// and no node ever dials WebRTC, so AutoNAT never confirms a public WebRTC
+/// address and the one a peer announces in identify is not routable. Left as
+/// is, `webrtc_nodes` drops it before any browser wallet sees it, and wallets
+/// can never spread past the single node in their configuration. Here the
+/// peer's own public IP (learned from the routable TCP/QUIC addresses it
+/// announces) is put back, keeping the certhash and UDP port the peer sent, so
+/// the address becomes dialable. An address that is already routable is left
+/// untouched; one whose peer has no routable address of its own (LAN-only, or
+/// unreachable) is left as sent, so a wallet on that same private network is
+/// still handed it.
+fn dialable_webrtc(mut addrs: Vec<Multiaddr>, peer_ip: Option<IpAddr>) -> Vec<Multiaddr> {
+    if let Some(ip) = peer_ip {
+        for addr in &mut addrs {
+            if !is_routable(addr) {
+                *addr = replace_ip(addr, ip);
+            }
+        }
+    }
+    addrs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1722,6 +1774,25 @@ mod tests {
         let b: Multiaddr = "/ip4/203.0.113.99/tcp/1".parse().unwrap();
         assert_eq!(extract_subnet(&a), extract_subnet(&b));
         assert!(extract_subnet(&"/ip4/127.0.0.1/tcp/1".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn webrtc_addr_takes_peers_public_ip() {
+        let public: Option<IpAddr> = Some("203.0.113.7".parse().unwrap());
+        // A 0.0.0.0 listen address (what a peer usually announces) is rewritten
+        // to the peer's public IP, keeping the UDP port.
+        let bound: Multiaddr = "/ip4/0.0.0.0/udp/9437/webrtc-direct".parse().unwrap();
+        assert_eq!(
+            dialable_webrtc(vec![bound], public)[0].to_string(),
+            "/ip4/203.0.113.7/udp/9437/webrtc-direct"
+        );
+        // An address that is already public is left untouched.
+        let already: Multiaddr = "/ip4/198.51.100.9/udp/9437/webrtc-direct".parse().unwrap();
+        assert_eq!(dialable_webrtc(vec![already.clone()], public)[0], already);
+        // With no routable IP known for the peer (LAN-only), the address is
+        // left as sent, so a wallet on the same network is still handed it.
+        let lan: Multiaddr = "/ip4/192.168.1.5/udp/9437/webrtc-direct".parse().unwrap();
+        assert_eq!(dialable_webrtc(vec![lan.clone()], None)[0], lan);
     }
 
     #[test]
