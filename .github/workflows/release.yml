@@ -27,18 +27,21 @@ on:
   workflow_dispatch:
     inputs:
       name:
-        description: Release name / tag (the first candidate is "safeword")
+        description: Version / tag (the first candidate is v1.0-SAFEWORD-RC)
         type: string
-        default: safeword
+        default: v1.0-SAFEWORD-RC
       prerelease:
-        description: Mark as a pre-release
-        type: boolean
-        default: true
+        description: Pre-release? "auto" marks it one when the version contains RC
+        type: choice
+        options:
+          - auto
+          - 'true'
+          - 'false'
+        default: auto
   push:
     tags:
-      - safeword
+      # Versioned tags, e.g. v1.0-SAFEWORD-RC, v1.0, v1.1-RC.
       - 'v*'
-      - 'rc-*'
 
 permissions:
   contents: write # create the tag and release, and upload the binaries
@@ -118,10 +121,19 @@ jobs:
       - name: Package and publish
         env:
           GH_TOKEN: ${{ github.token }}
-          PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prerelease || 'true' }}
+          PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prerelease || 'auto' }}
         run: |
           set -euo pipefail
           TAG="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.name || github.ref_name }}"
+
+          # A release candidate (a version containing "RC") is a pre-release; a
+          # final version (v1.0) is a full release. A manual run can force it
+          # either way; a tag push always decides from the version.
+          case "$PRERELEASE" in
+            true)  pre=1 ;;
+            false) pre=0 ;;
+            *)     shopt -s nocasematch; [[ "$TAG" == *rc* ]] && pre=1 || pre=0; shopt -u nocasematch ;;
+          esac
 
           # One tarball (Unix) or zip (Windows) per target, each holding the
           # binary, the licence (GPL-3.0 requires conveying it with binaries)
@@ -146,8 +158,7 @@ jobs:
           done
           (cd out && sha256sum ./* | tee SHA256SUMS.txt)
 
-          {
-            echo "Release candidate **${TAG}** of midwimble."
+          { [ "$pre" = 1 ] && echo "Release candidate **${TAG}** of midwimble." || echo "Release **${TAG}** of midwimble."
             echo
             echo "Built \`--release --features webrtc,gpu\` from commit \`${GITHUB_SHA}\`. Each archive holds one \`midwimble\` binary — node, wallet, pool, merged miner and anchoring — with LICENSE and README."
             echo
@@ -163,8 +174,7 @@ jobs:
             echo "Verify with \`sha256sum -c SHA256SUMS.txt\` (checksums attached)."
           } > notes.md
 
-          flag=""
-          if [ "$PRERELEASE" = "true" ]; then flag="--prerelease"; fi
+          flag=""; [ "$pre" = 1 ] && flag="--prerelease"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" out/* --clobber
           else
