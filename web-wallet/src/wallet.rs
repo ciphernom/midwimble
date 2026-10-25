@@ -93,7 +93,12 @@ struct Sent {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct WalletData {
     version: u32,
+    /// The BIP39 mnemonic of a full wallet; empty for a watch-only one.
     mnemonic: String,
+    /// Set for a watch-only wallet: the bech32 `mwview1…` view key it scans
+    /// with. Absent on a full wallet (its view key comes from the mnemonic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    view_key: Option<String>,
     /// MSS master public key for post-quantum recovery (`core/recovery.rs`).
     recovery_key: [u8; 32],
     recovery_height: u32,
@@ -456,7 +461,9 @@ pub fn check_address(s: &str) -> Result<StealthAddress> {
 
 pub struct WalletCore {
     data: WalletData,
-    keys: WalletKeys,
+    /// `None` for a watch-only wallet (built from a view key): it detects and
+    /// values its payments but cannot spend.
+    keys: Option<WalletKeys>,
     view: ViewKey,
     /// Payments to this wallet still waiting in a node's mempool. Not
     /// stored: the mempool is asked again after a reload.
@@ -496,6 +503,7 @@ impl WalletCore {
         Self::from_data(WalletData {
             version: 1,
             mnemonic: normalize_mnemonic(mnemonic)?,
+            view_key: None,
             recovery_key,
             recovery_height,
             scanned_height: birth_height,
@@ -506,11 +514,36 @@ impl WalletCore {
         })
     }
 
+    /// A watch-only wallet over `view_key` (bech32 `mwview1…`), scanning from
+    /// `birth_height`. It finds and values payments to the address but holds
+    /// no spending keys.
+    pub fn watch(view_key: &str, birth_height: u64) -> Result<Self> {
+        let view = ViewKey::decode(view_key)?;
+        Self::from_data(WalletData {
+            version: 1,
+            mnemonic: String::new(),
+            view_key: Some(view.encode()),
+            recovery_key: view.address().recovery,
+            recovery_height: 0,
+            scanned_height: birth_height,
+            recent: Vec::new(),
+            coins: Vec::new(),
+            birth_height,
+            sent: Vec::new(),
+        })
+    }
+
     fn from_data(data: WalletData) -> Result<Self> {
-        let mut seed = seed_of(&data.mnemonic)?;
-        let keys = WalletKeys::from_seed(&seed, data.recovery_key);
-        seed.zeroize();
-        let view = keys.view_only();
+        let (keys, view) = if let Some(encoded) = &data.view_key {
+            // Watch-only: no spend keys, scanning driven by the view key alone.
+            (None, ViewKey::decode(encoded)?)
+        } else {
+            let mut seed = seed_of(&data.mnemonic)?;
+            let keys = WalletKeys::from_seed(&seed, data.recovery_key);
+            seed.zeroize();
+            let view = keys.view_only();
+            (Some(keys), view)
+        };
         Ok(Self {
             data,
             keys,
@@ -558,7 +591,22 @@ impl WalletCore {
     }
 
     pub fn address(&self) -> StealthAddress {
-        self.keys.address()
+        self.view.address()
+    }
+
+    /// Whether this is a watch-only wallet (no spending keys).
+    pub fn is_watch_only(&self) -> bool {
+        self.keys.is_none()
+    }
+
+    /// A payment the view key detected is kept only if it is really spendable
+    /// by this wallet — unless the wallet is watch-only, where the view key's
+    /// detection is all there is and the coin is kept, unspendable.
+    fn confirm_detected(&self, output: &Output) -> bool {
+        match &self.keys {
+            Some(keys) => scan_output(keys, output).is_some(),
+            None => true,
+        }
     }
 
     pub fn view_key(&self) -> String {
@@ -703,7 +751,7 @@ impl WalletCore {
             let Some((value, _)) = self.view.scan(output) else {
                 continue;
             };
-            if scan_output(&self.keys, output).is_none() {
+            if !self.confirm_detected(output) {
                 continue;
             }
             known.insert(output.commitment);
@@ -892,7 +940,7 @@ impl WalletCore {
                 let Some((value, _)) = self.view.scan(output) else {
                     continue;
                 };
-                if scan_output(&self.keys, output).is_none() {
+                if !self.confirm_detected(output) {
                     continue;
                 }
                 outputs.push((output.commitment, value));
@@ -937,7 +985,7 @@ impl WalletCore {
             let Some((value, _)) = self.view.scan(output) else {
                 continue;
             };
-            if scan_output(&self.keys, output).is_none() {
+            if !self.confirm_detected(output) {
                 continue;
             }
             known.insert(output.commitment);
@@ -1280,10 +1328,14 @@ impl WalletCore {
 
     /// What signing for `coins` takes.
     fn spendables(&self, coins: &[&WalletCoin]) -> Result<Vec<Spendable>> {
+        let keys = self
+            .keys
+            .as_ref()
+            .ok_or_else(|| anyhow!("this is a watch-only wallet and cannot spend"))?;
         coins
             .iter()
             .map(|c| {
-                let owned = scan_output(&self.keys, &c.output)
+                let owned = scan_output(keys, &c.output)
                     .ok_or_else(|| anyhow!("a stored coin no longer opens"))?;
                 Ok(Spendable {
                     commitment: c.output.commitment,

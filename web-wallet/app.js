@@ -572,7 +572,8 @@ $app.append($top, h('div', { class: 'shell' }, $side, $content));
 const SECTIONS = [['', 'Wallet', 'wallet'], ['activity', 'Activity', 'clock'], ['send', 'Send', 'up'], ['receive', 'Receive', 'down'], ['settings', 'Settings', null]];
 function drawSide(path) {
     const top = path.split('/')[0];
-    fill($side, ...SECTIONS.map(([p, label, ic]) =>
+    const watchOnly = app.state && app.state.watchOnly;
+    fill($side, ...SECTIONS.filter(([p]) => !(p === 'send' && watchOnly)).map(([p, label, ic]) =>
         h('a', { class: 'side-link', href: '#/' + p, 'aria-current': top === p ? 'page' : null }, ic ? icon(ic) : gearIcon(), label)));
 }
 
@@ -656,6 +657,7 @@ function screenFor(path) {
         if (app.phase === 'welcome') {
             if (path === 'create' || path.startsWith('create/')) return createScreen(path);
             if (path === 'restore') return restoreScreen();
+            if (path === 'watch') return watchScreen();
             if (path === 'open') return openScreen();
             return welcomeScreen();
         }
@@ -715,7 +717,8 @@ function welcomeScreen() {
             h('div', { class: 'stack-buttons' },
                 h('a', { class: 'btn primary', href: '#/create' }, 'Create new wallet'),
                 h('a', { class: 'btn secondary', href: '#/restore' }, 'Restore with recovery phrase'),
-                h('a', { class: 'btn secondary', href: '#/open' }, 'Open wallet file')),
+                h('a', { class: 'btn secondary', href: '#/open' }, 'Open wallet file'),
+                h('a', { class: 'btn secondary', href: '#/watch' }, 'Watch an address (view key)')),
             h('div', { class: 'quiet-links' }, h('a', { class: 'quiet', href: '#/network' }, `Network: ${networkName()}`)))],
     };
 }
@@ -911,6 +914,51 @@ function restoreScreen() {
     return { title: 'Restore', left: cancelButton(), els: [form], focus: () => phrase.focus() };
 }
 
+function watchScreen() {
+    const view = textArea({ rows: 3, placeholder: 'mwview1…  (or scan the QR)', 'aria-label': 'View key' });
+    const birth = h('input', { inputmode: 'numeric', placeholder: 'Optional', 'aria-label': 'Start scanning at block' });
+    const pw = passwordRows();
+    const err = note();
+    err.classList.add('bad');
+    let node = null; // a node address, if a scanned link carried one
+    const go = h('button', { class: 'btn primary', type: 'submit' }, 'Watch address');
+    const scan = h('button', { class: 'btn secondary', type: 'button', onclick: async () => {
+        const link = await scanWatchLink();
+        if (!link) return;
+        view.value = link.viewKey;
+        if (view.fit) view.fit();
+        node = link.node;
+    } }, 'Scan QR');
+    const form = h('form', { onsubmit: async (e) => {
+        e.preventDefault();
+        err.textContent = '';
+        let password;
+        try { password = pw.value(); } catch (x) { err.textContent = errOf(x); return; }
+        const from = birth.value.trim() ? Number(birth.value.trim().replace(/,/g, '')) : 0;
+        if (!Number.isInteger(from) || from < 0) { err.textContent = 'The block to start at is a whole number.'; return; }
+        const key = view.value.trim();
+        if (!/^mwview1[0-9a-z]+$/i.test(key)) { err.textContent = 'That doesn’t look like a view key (mwview1…).'; return; }
+        go.disabled = true;
+        fill(go, spinner(), 'Setting up…');
+        try {
+            if (node) { try { localStorage.setItem(KEY.nodes, JSON.stringify([node])); } catch (_) {} }
+            await ask('watch', { viewKey: key, password, birth: from });
+        } catch (x) { err.textContent = errOf(x); go.disabled = false; fill(go, 'Watch address'); }
+    } },
+    group(h('label', { class: 'row stacked' }, h('span', { class: 'label' }, 'View key'), view)),
+    h('div', { class: 'stack-buttons' }, scan),
+    note('A view key (mwview1…) sees payments to its address and their amounts, but cannot spend. Make one in a full wallet under Settings → Advanced → View key.'),
+    title('New password'),
+    group(...pw.rows),
+    note('It unlocks this watch-only wallet in this browser.'),
+    title('Start scanning at'),
+    group(h('label', { class: 'row field' }, h('span', { class: 'label' }, 'Block'), birth)),
+    note('Leave it empty to look through the whole chain.'),
+    err,
+    h('div', { class: 'stack-buttons' }, go));
+    return { title: 'Watch an address', left: cancelButton(), els: [form], focus: () => view.focus() };
+}
+
 function openScreen() {
     const file = h('input', { type: 'file', accept: '.mww,application/octet-stream', hidden: true });
     const name = h('span', { class: 'value' }, 'None');
@@ -1048,7 +1096,9 @@ function homeScreen() {
         wide: true,
         els: [h('div', { class: 'home-top' }, balance.el,
             h('div', { class: 'buttons' },
-                h('a', { class: 'btn primary', href: '#/send' }, icon('up'), 'Send'),
+                app.state && app.state.watchOnly
+                    ? h('span', { class: 'pill' }, 'Watch-only')
+                    : h('a', { class: 'btn primary', href: '#/send' }, icon('up'), 'Send'),
                 h('a', { class: 'btn secondary', href: '#/receive' }, icon('down'), 'Receive'))),
             recent],
         update() {
@@ -1182,7 +1232,27 @@ function nodeLink(text) {
     return { addrs, follow: q.get('follow') === '1' };
 }
 
+/** A watch-only link: a bare `mwview1…` view key, or
+ *  `midwimble:watch?view=<view key>&a=<node addr>` which also names a node
+ *  to use. Returns { viewKey, node } or null. */
+function watchLink(text) {
+    const t = String(text).trim();
+    const viewRe = /^mwview1[0-9a-z]+$/i;
+    const nodeRe = /^\/(ip4|ip6|dns4|dns6|dns)\/.+\/webrtc-direct\/certhash\/.+\/p2p\/.+/;
+    if (viewRe.test(t)) return { viewKey: t, node: null };
+    const m = /^midwimble:watch(?:\?([^#]*))?$/i.exec(t);
+    if (!m) return null;
+    const q = new URLSearchParams(m[1] || '');
+    const viewKey = (q.get('view') || '').trim();
+    if (!viewRe.test(viewKey)) return null;
+    const node = (q.get('a') || '').trim();
+    return { viewKey, node: nodeRe.test(node) ? node : null };
+}
+
 function sendScreen() {
+    if (app.state && app.state.watchOnly) {
+        return { title: 'Send', els: [group(textRow('This is a watch-only wallet: it can see payments to its address but holds no keys to spend them.'))] };
+    }
     const d = app.draft;
     const to = textArea({ placeholder: 'mw1…', 'aria-label': 'Send to' }, d.to);
     const amt = h('input', { inputmode: 'decimal', autocomplete: 'off', placeholder: '0.00', 'aria-label': 'Amount' });
@@ -1385,6 +1455,15 @@ function scanNodeLink() {
     });
 }
 
+/** Scans a watch-only QR (a view key): resolves { viewKey, node }, or null. */
+function scanWatchLink() {
+    return runScanner({
+        prompt: 'Point the camera at the view-key QR code.',
+        reject: 'That QR code isn’t a view key.',
+        recognize: async (text) => watchLink(text),
+    });
+}
+
 async function scanner({ recognize, prompt, reject }) {
     let qr;
     try { qr = await import('./qr_scan.js'); }
@@ -1578,10 +1657,10 @@ function settingsScreen() {
 }
 
 function backupScreen() {
-    return {
-        title: 'Backup',
-        back: ['Settings', '#/settings'],
-        els: [group(h('button', { class: 'row link', type: 'button', onclick: async () => {
+    const watchOnly = app.state && app.state.watchOnly;
+    const els = [];
+    if (!watchOnly) {
+        els.push(group(h('button', { class: 'row link', type: 'button', onclick: async () => {
             const password = await askPassword('Recovery phrase', 'Type your password to see the 24 words.');
             if (!password) return;
             try {
@@ -1589,19 +1668,22 @@ function backupScreen() {
                 app.phrase = phrase;
                 location.hash = '#/settings/backup/phrase';
             } catch (e) { ok('Can’t show', errOf(e)); }
-        } }, tile('green', 'file'), h('span', { class: 'grow' }, 'Show recovery phrase'))),
-        note('The 24 words restore everything that matters, on any device.'),
-        group(h('button', { class: 'row link', type: 'button', onclick: async () => {
-            const password = await askPassword('Wallet file', 'Type your password. The file is locked with it too.');
-            if (!password) return;
-            try {
-                const { bytes } = await ask('exportFile', { password });
-                download(bytes, 'midwimble-wallet.mww');
-                hud('Downloaded');
-            } catch (e) { ok('Can’t save', errOf(e)); }
-        } }, tile('blue', 'download'), h('span', { class: 'grow' }, 'Download wallet file'))),
-        note('The file also keeps your history and where scanning got to. midwimble wallet on the command line opens it too.')],
-    };
+        } }, tile('green', 'file'), h('span', { class: 'grow' }, 'Show recovery phrase'))));
+        els.push(note('The 24 words restore everything that matters, on any device.'));
+    } else {
+        els.push(note('This is a watch-only wallet: it has no recovery phrase. The view key that set it up sees payments but cannot spend.'));
+    }
+    els.push(group(h('button', { class: 'row link', type: 'button', onclick: async () => {
+        const password = await askPassword('Wallet file', 'Type your password. The file is locked with it too.');
+        if (!password) return;
+        try {
+            const { bytes } = await ask('exportFile', { password });
+            download(bytes, 'midwimble-wallet.mww');
+            hud('Downloaded');
+        } catch (e) { ok('Can’t save', errOf(e)); }
+    } }, tile('blue', 'download'), h('span', { class: 'grow' }, 'Download wallet file'))));
+    els.push(note('The file also keeps your history and where scanning got to. midwimble wallet on the command line opens it too.'));
+    return { title: 'Backup', back: ['Settings', '#/settings'], els };
 }
 
 function phraseScreen() {
@@ -1872,8 +1954,15 @@ function viewKeyScreen() {
         h('div', { class: 'stack-buttons' }, h('button', { class: 'btn secondary', type: 'button', onclick: async (e) => {
             try {
                 const { key } = await ask('view-key');
-                e.target.closest('.stack-buttons').replaceWith(group(h('div', { class: 'row stacked' }, h('span', { class: 'label' }, 'View key'), h('span', { class: 'mono' }, key),
-                    h('div', { class: 'inline-buttons' }, mini('Copy', 'copy', () => copyText(key, 'View key'))))));
+                const node = (app.net && app.net.addr) || nodeList()[0] || null;
+                const uri = 'midwimble:watch?view=' + key + (node ? '&a=' + node : '');
+                const card = h('div', { class: 'qr-card' });
+                fill(card, qrSvg(uri, 'M'));
+                e.target.closest('.stack-buttons').replaceWith(
+                    group(h('div', { class: 'qr-col' }, card,
+                        note('Scan this in a new wallet (“Watch an address”) to set up a watch-only wallet' + (node ? ', pointed at the node you use.' : '.')))),
+                    group(h('div', { class: 'row stacked' }, h('span', { class: 'label' }, 'View key'), h('span', { class: 'mono' }, key),
+                        h('div', { class: 'inline-buttons' }, mini('Copy', 'copy', () => copyText(key, 'View key'))))));
             } catch (x) { ok('Can’t show', errOf(x)); }
         } }, 'Show view key')));
     return { title: 'View key', back: ['Advanced', '#/settings/advanced'], els: [body] };

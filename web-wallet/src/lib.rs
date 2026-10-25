@@ -233,6 +233,14 @@ impl Wallet {
         ))
     }
 
+    /// A watch-only wallet over `view_key` (bech32 `mwview1…`), scanning from
+    /// `birth_height`. It finds and values payments but cannot spend.
+    pub fn watch(view_key: &str, birth_height: f64) -> Result<Wallet, JsError> {
+        Ok(Wallet(
+            WalletCore::watch(view_key, whole(birth_height, "the birth height")?).map_err(err)?,
+        ))
+    }
+
     /// Opens a wallet file with the key `derive_file_key` made.
     pub fn open(file: &[u8], key: &[u8]) -> Result<Wallet, JsError> {
         Ok(Wallet(
@@ -260,6 +268,12 @@ impl Wallet {
 
     pub fn view_key(&self) -> String {
         self.0.view_key()
+    }
+
+    /// Whether this is a watch-only wallet (no spending keys): the UI hides
+    /// sending and the recovery phrase.
+    pub fn is_watch_only(&self) -> bool {
+        self.0.is_watch_only()
     }
 
     pub fn recovery_key(&self) -> String {

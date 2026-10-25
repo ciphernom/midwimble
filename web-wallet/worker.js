@@ -270,6 +270,9 @@ function snapshot() {
     const tip = knownTip();
     return {
         address: wallet.address(),
+        // Tolerate a wallet module built before watch-only existed, so this
+        // doesn't break state updates until pkg/ is rebuilt (see build.sh).
+        watchOnly: typeof wallet.is_watch_only === 'function' && wallet.is_watch_only(),
         balance: JSON.parse(wallet.balance(tip)),
         history: JSON.parse(wallet.history(tip)),
         pending: JSON.parse(wallet.pending_txs()).map(p => ({ tx_hash: p.tx_hash, created_at: p.created_at })),
@@ -856,6 +859,16 @@ const handlers = {
         const from = Math.max(0, Math.floor(Number(birth) || 0));
         const rk = await recoveryKey(canonical);
         const w = new mw.Wallet(canonical, rk, C.recovery_height, from);
+        dropKeygen();
+        const salt = mw.new_salt();
+        await becomeUnlocked(w, mw.derive_file_key(password, salt), salt);
+    },
+
+    async watch({ viewKey, password, birth }) {
+        newPasswordOk(password);
+        const from = Math.max(0, Math.floor(Number(birth) || 0));
+        // No recovery key: a watch-only wallet holds no secrets to recover.
+        const w = mw.Wallet.watch(String(viewKey).trim(), from);
         dropKeygen();
         const salt = mw.new_salt();
         await becomeUnlocked(w, mw.derive_file_key(password, salt), salt);
