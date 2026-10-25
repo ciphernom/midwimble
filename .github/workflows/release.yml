@@ -1,11 +1,15 @@
-# Builds a release binary of midwimble — one binary carrying the node, wallet,
-# pool, merged miner and anchoring subcommands — with the webrtc and gpu
-# features, and publishes it as a GitHub release.
+# Builds release binaries of midwimble — one binary carrying the node, wallet,
+# pool, merged miner and anchoring subcommands — for every supported platform,
+# with the webrtc and gpu features, and publishes them as one GitHub release.
 #
 #   --release --features webrtc,gpu
 #     webrtc  enables the `node` feature the binary requires, and browser
 #             wallets over /webrtc-direct
 #     gpu     adds midstate's wgpu miner
+#
+# Every target builds natively on its own runner, so there is no
+# cross-compilation: `ring` (the rustls provider; no aws-lc, no nasm) and wgpu
+# both compile from the committed Cargo.lock with no extra system packages.
 #
 # Trigger it two ways:
 #   * Manually: Actions -> Release -> Run workflow, giving a name (the first
@@ -14,8 +18,9 @@
 #     tag's name.
 #
 # One-time setup: nothing — GITHUB_TOKEN already has the `contents: write`
-# permission requested below, which is enough to create the tag, the release
-# and upload the binary.
+# permission requested below, enough to create the tag, the release and upload
+# the binaries. Native ARM and Windows-on-ARM runners are free for public
+# repositories.
 name: Release
 
 on:
@@ -36,7 +41,7 @@ on:
       - 'rc-*'
 
 permissions:
-  contents: write # create the tag and release, and upload the binary
+  contents: write # create the tag and release, and upload the binaries
 
 # One release per name; a run already going finishes before another starts.
 concurrency:
@@ -45,65 +50,123 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One platform failing (a runner image change, say) must not throw away
+      # the binaries that did build.
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86-64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - label: Linux ARM64 (Raspberry Pi 3/4/5, 64-bit)
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - label: macOS Intel
+            target: x86_64-apple-darwin
+            runner: macos-13
+          - label: macOS Apple Silicon
+            target: aarch64-apple-darwin
+            runner: macos-14
+          - label: Windows x64
+            target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - label: Windows ARM64
+            target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          key: webrtc-gpu
+          key: ${{ matrix.target }}-webrtc-gpu
 
-      # ubuntu-latest already carries the C toolchain, cmake and perl the
-      # dependencies need (ring, wgpu/ash); wgpu loads Vulkan at runtime, so no
-      # GPU libraries are needed to build. Nothing extra to install.
       - name: Build
-        run: cargo build --release --locked --features webrtc,gpu --bin midwimble
+        run: cargo build --release --locked --features webrtc,gpu --bin midwimble --target ${{ matrix.target }}
 
-      - name: Package
-        id: pkg
-        run: |
-          set -euo pipefail
-          TAG="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.name || github.ref_name }}"
-          TARGET=x86_64-unknown-linux-gnu
-          STEM="midwimble-${TAG}-${TARGET}"
-          mkdir -p "dist/${STEM}"
-          cp target/release/midwimble "dist/${STEM}/"
-          cp LICENSE README.md "dist/${STEM}/"
-          tar -C dist -czf "dist/${STEM}.tar.gz" "${STEM}"
-          sha256sum "dist/${STEM}.tar.gz" | tee "dist/${STEM}.tar.gz.sha256"
-          {
-            echo "tag=${TAG}"
-            echo "tarball=dist/${STEM}.tar.gz"
-            echo "sha256file=dist/${STEM}.tar.gz.sha256"
-          } >> "$GITHUB_OUTPUT"
+      # Hand the raw binary to the release job, which packages every platform
+      # the same way on one runner. Artifact downloads do not keep the Unix
+      # executable bit, so it is restored there before archiving.
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: midwimble-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/midwimble${{ contains(matrix.target, 'windows') && '.exe' || '' }}
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Publish release
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7 # for LICENSE and README in each archive
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts # each lands in artifacts/midwimble-<target>/
+
+      - name: Package and publish
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.pkg.outputs.tag }}
-          TARBALL: ${{ steps.pkg.outputs.tarball }}
-          SHA256FILE: ${{ steps.pkg.outputs.sha256file }}
           PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prerelease || 'true' }}
         run: |
           set -euo pipefail
-          sum="$(cut -d' ' -f1 "$SHA256FILE")"
+          TAG="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.name || github.ref_name }}"
+
+          # One tarball (Unix) or zip (Windows) per target, each holding the
+          # binary, the licence (GPL-3.0 requires conveying it with binaries)
+          # and the README.
+          mkdir -p out
+          for dir in artifacts/midwimble-*/; do
+            target="$(basename "$dir" | sed 's/^midwimble-//')"
+            stem="midwimble-${TAG}-${target}"
+            mkdir -p "pkg/${stem}"
+            cp LICENSE README.md "pkg/${stem}/"
+            case "$target" in
+              *windows*)
+                cp "${dir}midwimble.exe" "pkg/${stem}/"
+                (cd pkg && zip -qr "../out/${stem}.zip" "${stem}")
+                ;;
+              *)
+                cp "${dir}midwimble" "pkg/${stem}/"
+                chmod +x "pkg/${stem}/midwimble"
+                tar -C pkg -czf "out/${stem}.tar.gz" "${stem}"
+                ;;
+            esac
+          done
+          (cd out && sha256sum ./* | tee SHA256SUMS.txt)
+
           {
-            echo "Release candidate **$TAG** of midwimble."
+            echo "Release candidate **${TAG}** of midwimble."
             echo
-            echo "- Built \`--release --features webrtc,gpu\` from commit \`$GITHUB_SHA\`"
-            echo "- Target: \`x86_64-unknown-linux-gnu\`"
-            echo "- One \`midwimble\` binary: node, wallet, pool, merged miner, anchoring"
-            echo "- Tarball SHA-256: \`$sum\`"
+            echo "Built \`--release --features webrtc,gpu\` from commit \`${GITHUB_SHA}\`. Each archive holds one \`midwimble\` binary — node, wallet, pool, merged miner and anchoring — with LICENSE and README."
+            echo
+            echo "| Download | Platform |"
+            echo "| --- | --- |"
+            echo "| \`midwimble-${TAG}-x86_64-unknown-linux-gnu.tar.gz\` | Linux x86-64 |"
+            echo "| \`midwimble-${TAG}-aarch64-unknown-linux-gnu.tar.gz\` | Linux ARM64 — Raspberry Pi 3 / 4 / 5 on a 64-bit OS |"
+            echo "| \`midwimble-${TAG}-x86_64-apple-darwin.tar.gz\` | macOS (Intel) |"
+            echo "| \`midwimble-${TAG}-aarch64-apple-darwin.tar.gz\` | macOS (Apple Silicon) |"
+            echo "| \`midwimble-${TAG}-x86_64-pc-windows-msvc.zip\` | Windows x64 |"
+            echo "| \`midwimble-${TAG}-aarch64-pc-windows-msvc.zip\` | Windows on ARM |"
+            echo
+            echo "Verify with \`sha256sum -c SHA256SUMS.txt\` (checksums attached)."
           } > notes.md
+
           flag=""
           if [ "$PRERELEASE" = "true" ]; then flag="--prerelease"; fi
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$TARBALL" "$SHA256FILE" --clobber
+            gh release upload "$TAG" out/* --clobber
           else
-            gh release create "$TAG" "$TARBALL" "$SHA256FILE" \
-              --title "$TAG" --notes-file notes.md --target "$GITHUB_SHA" $flag
+            gh release create "$TAG" out/* --title "$TAG" --notes-file notes.md --target "$GITHUB_SHA" $flag
           fi
