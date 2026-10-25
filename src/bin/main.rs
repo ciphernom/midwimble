@@ -250,6 +250,26 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:9434")]
         rpc: String,
     },
+    /// Show a QR code that links a phone or web wallet to this node.
+    ///
+    /// Scan it in the wallet (Network -> Node list -> Scan node QR) to point
+    /// the wallet at your own node in one step, instead of pasting its
+    /// WebRTC address by hand.
+    Link {
+        /// RPC address of your running node.
+        #[arg(long, default_value = "127.0.0.1:9434")]
+        rpc: String,
+        /// The host (IP or DNS name) the wallet will use to reach this node,
+        /// e.g. your LAN IP for a phone on the same Wi-Fi, or a DNS name /
+        /// VPN address. Defaults to the node's own public address when it has
+        /// one; required otherwise (a node bound to 0.0.0.0 cannot know which
+        /// of its addresses a wallet can reach).
+        #[arg(long)]
+        host: Option<String>,
+        /// Don't ask the wallet to follow this node as its primary.
+        #[arg(long)]
+        no_follow: bool,
+    },
     /// Start or stop mining on a running node.
     Mine {
         #[arg(long)]
@@ -926,6 +946,87 @@ fn print_params() {
 /// Says what a wallet sync changed. `wallet sync` prints all of it; other
 /// commands print only what needs attention, on stderr, before their own
 /// output.
+/// Extracts a JSON array of strings, dropping any non-string entries.
+fn json_str_array(v: &serde_json::Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// Rewrites a multiaddr's host — its leading `/ip4|ip6|dns4|dns6|dns/<value>`
+/// — to `host`, choosing `ip4`/`ip6`/`dns4` by what `host` parses as and
+/// keeping the rest (`/udp/<port>/webrtc-direct/certhash/…/p2p/…`).
+fn rehost(addr: &str, host: &str) -> Option<String> {
+    let mut parts = addr.strip_prefix('/')?.splitn(3, '/');
+    let _proto = parts.next()?;
+    let _value = parts.next()?;
+    let rest = parts.next()?;
+    let proto = if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        "ip4"
+    } else if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        "ip6"
+    } else {
+        "dns4"
+    };
+    Some(format!("/{proto}/{host}/{rest}"))
+}
+
+/// Prints a QR code (and the raw link URI) that points a phone or web wallet
+/// at this node. The node tells us its WebRTC listen address — which carries
+/// the certificate hash and peer id a browser needs — and we rehost it to an
+/// address the wallet can actually reach.
+fn link_qr(rpc: &str, host: Option<&str>, follow: bool) -> Result<()> {
+    let state = RpcClient::new(rpc).get("/state")?;
+    let listen = json_str_array(&state["webrtc_listen"]);
+    let public = json_str_array(&state["webrtc_addrs"]);
+
+    let addrs: Vec<String> = match host {
+        Some(h) => {
+            let templates = if listen.is_empty() { &public } else { &listen };
+            if templates.is_empty() {
+                bail!(
+                    "the node at {rpc} reports no WebRTC address — is it built with \
+                     `--features webrtc` and listening?"
+                );
+            }
+            templates.iter().filter_map(|a| rehost(a, h)).collect()
+        }
+        None => {
+            if public.is_empty() {
+                bail!(
+                    "this node has no public WebRTC address, so the wallet must be told which \
+                     address to use. Re-run with --host <ip-or-dns> the wallet can reach (for a \
+                     phone on the same Wi-Fi, your machine's LAN IP)."
+                );
+            }
+            public
+        }
+    };
+    if addrs.is_empty() {
+        bail!("could not build a dialable address; re-run with --host <ip-or-dns>");
+    }
+
+    let mut query: Vec<String> = addrs.iter().map(|a| format!("a={a}")).collect();
+    if follow {
+        query.push("follow=1".to_string());
+    }
+    let uri = format!("midwimble:node?{}", query.join("&"));
+
+    let code = qrcode::QrCode::new(uri.as_bytes()).map_err(|e| anyhow!("could not encode QR: {e}"))?;
+    let image = code
+        .render::<qrcode::render::unicode::Dense1x2>()
+        .quiet_zone(true)
+        .build();
+    out!("{image}");
+    out!("Scan this in the wallet: Network → Node list → Scan node QR.");
+    out!("Or add the address by hand:");
+    for a in &addrs {
+        out!("  {a}");
+    }
+    out!("\n{uri}");
+    Ok(())
+}
+
 fn report_sync(w: &Wallet, r: &SyncReport, everything: bool) {
     let say = |line: String, attention: bool| {
         if everything {
@@ -1462,6 +1563,11 @@ fn run(cli: Cli) -> Result<()> {
             out!("{}", serde_json::to_string_pretty(&v)?);
             Ok(())
         }
+        Cmd::Link {
+            rpc,
+            host,
+            no_follow,
+        } => link_qr(&rpc, host.as_deref(), !no_follow),
         Cmd::Mine { address, stop, rpc } => {
             let client = RpcClient::new(rpc);
             let body = if stop {

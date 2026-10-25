@@ -1169,6 +1169,19 @@ function paymentCode(text) {
     return { address: address.toLowerCase(), amount };
 }
 
+/** A node-link QR (`midwimble:node?a=<multiaddr>&follow=1`), the kind
+ *  `midwimble link` shows. Returns { addrs, follow } with the dialable
+ *  WebRTC addresses, or null if the text isn't a node link. */
+function nodeLink(text) {
+    const m = /^midwimble:node(?:\?([^#]*))?$/i.exec(String(text).trim());
+    if (!m) return null;
+    const q = new URLSearchParams(m[1] || '');
+    const re = /^\/(ip4|ip6|dns4|dns6|dns)\/.+\/webrtc-direct\/certhash\/.+\/p2p\/.+/;
+    const addrs = q.getAll('a').map(s => s.trim()).filter(a => re.test(a));
+    if (!addrs.length) return null;
+    return { addrs, follow: q.get('follow') === '1' };
+}
+
 function sendScreen() {
     const d = app.draft;
     const to = textArea({ placeholder: 'mw1…', 'aria-label': 'Send to' }, d.to);
@@ -1342,13 +1355,37 @@ function cameraTrouble(e) {
  *  screenshot. Resolves with { address, amount } once a code holds a
  *  midwimble address, or null if closed. The camera is off again by then. */
 let scanning = false;
-async function scanPayment() {
+async function runScanner(opts) {
     if (scanning) return null;
     scanning = true;
-    try { return await scanner(); } finally { scanning = false; }
+    try { return await scanner(opts); } finally { scanning = false; }
 }
 
-async function scanner() {
+/** Scans a payment QR: resolves { address, amount } once a code holds a
+ *  midwimble address, or null if closed. */
+function scanPayment() {
+    return runScanner({
+        prompt: 'Point the camera at the recipient’s QR code.',
+        reject: 'That QR code isn’t a midwimble address.',
+        recognize: async (text) => {
+            const code = paymentCode(text);
+            try { await ask('check-address', { to: code.address }); } catch (_) { return null; }
+            return code;
+        },
+    });
+}
+
+/** Scans a node-link QR (from `midwimble link`): resolves { addrs, follow },
+ *  or null if closed. */
+function scanNodeLink() {
+    return runScanner({
+        prompt: 'Point the camera at your node’s QR code.',
+        reject: 'That QR code isn’t a node link.',
+        recognize: async (text) => nodeLink(text),
+    });
+}
+
+async function scanner({ recognize, prompt, reject }) {
     let qr;
     try { qr = await import('./qr_scan.js'); }
     catch (e) { ok('Can’t scan', `The QR reader didn’t load: ${errOf(e)}`); return null; }
@@ -1378,17 +1415,17 @@ async function scanner() {
     };
     const consider = async (text) => {
         if (text == null || done || text === rejected) return;
-        const code = paymentCode(text);
-        try { await ask('check-address', { to: code.address }); } catch (_) {
+        const result = await recognize(text);
+        if (!result) {
             if (done) return;
             rejected = text;
-            say('That QR code isn’t a midwimble address.');
+            say(reject);
             return;
         }
         if (done) return;
         done = true;
         view.classList.add('found');
-        setTimeout(() => finish(code), 200);
+        setTimeout(() => finish(result), 200);
     };
     const watch = async (me) => {
         while (!done && me === run && camera.live) {
@@ -1418,7 +1455,7 @@ async function scanner() {
         wanted = camera.deviceId();
         view.hidden = false;
         rejected = null;
-        say('Point the camera at the recipient’s QR code.');
+        say(prompt);
         watch(me);
         flip.hidden = (await qr.cameraList()).length < 2;
     };
@@ -1726,6 +1763,15 @@ function nodeListScreen(base) {
         right: h('button', { class: 'btn primary small', type: 'button', onclick: save }, 'Save'),
         els: [group(h('label', { class: 'row stacked' }, h('span', { class: 'label' }, 'WebRTC addresses, one per line'), ta)), err,
             note('A node logs its address at start (“Browser wallets can connect to …”) and lists it under webrtc_addrs in /state.'),
+            group(actionRow('Scan node QR', async () => {
+                const link = await scanNodeLink();
+                if (!link) return;
+                try { localStorage.setItem(KEY.nodes, JSON.stringify(link.addrs)); } catch (_) {}
+                if (link.follow) set('follow', link.addrs[0]); else update();
+                hud('Linked to your node');
+                await connect();
+            })),
+            note('Run “midwimble link” on your node to show a QR, then scan it to use your own node.'),
             group(actionRow('Use default nodes', async () => {
                 try { localStorage.removeItem(KEY.nodes); } catch (_) {}
                 ta.value = (app.config.nodes || []).join('\n');

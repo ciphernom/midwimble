@@ -892,6 +892,33 @@ impl Network {
             .collect()
     }
 
+    /// WebRTC-direct listen addresses (with the certificate hash and this
+    /// node's identity), whatever IP they bind — including the unspecified
+    /// `0.0.0.0` and private/LAN addresses, which [`Self::webrtc_addrs`]
+    /// filters out. These are the template `midwimble link` rehosts to the
+    /// address a wallet on the same network will actually dial, so a node
+    /// behind NAT can still hand a phone a working address.
+    pub fn webrtc_listen_addrs(&self) -> Vec<String> {
+        let local_id = *self.swarm.local_peer_id();
+        let mut out: Vec<String> = self
+            .listen_addrs
+            .iter()
+            .filter(|a| browser_dialable(a))
+            .map(|a| {
+                if extract_peer_id(a).is_some() {
+                    a.to_string()
+                } else {
+                    a.clone()
+                        .with(libp2p::multiaddr::Protocol::P2p(local_id))
+                        .to_string()
+                }
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Where a browser wallet can reach this node and the midwimble nodes
     /// connected to it (`get_nodes`): at most [`MAX_LIGHT_NODES`], chosen at
     /// random when there are more. Public addresses only, unless the browser

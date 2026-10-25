@@ -13,6 +13,7 @@ node = [
     "dep:libp2p", "dep:libp2p-stream", "dep:tokio", "dep:futures", "dep:async-trait",
     "dep:redb", "dep:tracing-subscriber", "dep:clap", "dep:axum",
     "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:sha2",
+    "dep:qrcode",
 ]
 # Browser light clients over /webrtc-direct (pulls in the large webrtc-rs stack).
 webrtc = ["node", "dep:libp2p-webrtc"]
@@ -61,6 +62,8 @@ async-trait = { version = "0.1", optional = true }
 redb = { version = "2", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 clap = { version = "4", optional = true, features = ["derive"] }
+# Terminal QR for `midwimble link` (no image/svg features needed).
+qrcode = { version = "0.14", optional = true, default-features = false }
 axum = { version = "0.8", optional = true, default-features = false, features = ["json", "tokio", "http1", "query"] }
 # Stratum over TLS (pool and pool miner). ring, as libp2p already uses it.
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12", "logging"] }

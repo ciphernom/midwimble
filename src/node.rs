@@ -213,6 +213,9 @@ pub struct NodeInfo {
     pub listen_addrs: Vec<String>,
     /// Addresses browser wallets dial (`Network::webrtc_addrs`).
     pub webrtc_addrs: Vec<String>,
+    /// WebRTC-direct listen addresses whatever IP they bind, for local
+    /// wallet linking (`Network::webrtc_listen_addrs`).
+    pub webrtc_listen: Vec<String>,
     /// Downloading a heavier chain's blocks: the chain is about to change,
     /// so templates are stale. (While a session only fetches and checks a
     /// peer's headers, the node keeps taking blocks and mining.)
@@ -673,6 +676,7 @@ impl Node {
             peers: Vec::new(),
             listen_addrs: Vec::new(),
             webrtc_addrs: Vec::new(),
+            webrtc_listen: Vec::new(),
             syncing: false,
             mempool_count: 0,
             mempool_weight: 0,
@@ -849,6 +853,7 @@ impl Node {
             .map(|a| a.to_string())
             .collect();
         info.webrtc_addrs = self.network.webrtc_addrs();
+        info.webrtc_listen = self.network.webrtc_listen_addrs();
         info.syncing = self.chain_syncing();
         info.mempool_count = self.mempool.len();
         info.mempool_weight = self.mempool.total_weight();

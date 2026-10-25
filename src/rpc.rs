@@ -367,6 +367,7 @@ async fn state(AxState(node): AxState<NodeHandle>) -> Json<Value> {
         "banned": info.banned,
         "listen_addrs": info.listen_addrs,
         "webrtc_addrs": info.webrtc_addrs,
+        "webrtc_listen": info.webrtc_listen,
         "syncing": info.syncing,
         "mempool_count": info.mempool_count,
         "mempool_weight": info.mempool_weight,
