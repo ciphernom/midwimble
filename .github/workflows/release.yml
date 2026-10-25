@@ -67,12 +67,16 @@ jobs:
           - label: Linux ARM64 (Raspberry Pi 3/4/5, 64-bit)
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+          # macos-13 (Intel) was retired 2025-12-04 and macos-14 (Apple
+          # Silicon) is being retired too; macos-15-intel is the current Intel
+          # runner (Intel macOS support ends when macos-15 retires in Fall
+          # 2027), and macos-15 is the current Apple Silicon runner.
           - label: macOS Intel
             target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-15-intel
           - label: macOS Apple Silicon
             target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
           - label: Windows x64
             target: x86_64-pc-windows-msvc
             runner: windows-latest
