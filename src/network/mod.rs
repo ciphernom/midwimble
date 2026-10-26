@@ -132,11 +132,27 @@ impl LightPeerState {
             self.request_count = 0;
             self.expensive_count = 0;
             self.window_start = Instant::now();
+            // Violations fade as the peer behaves, so an honest but chatty
+            // wallet (3-node voting, scans) never creeps to the ban threshold
+            // over a long session.
+            self.violations = self.violations.saturating_sub(1);
         }
     }
 
     fn is_banned(&self) -> bool {
         self.banned_until.map_or(false, |t| Instant::now() < t)
+    }
+
+    /// Once a ban has been served, wipe the violation count: otherwise a peer
+    /// sits at the threshold and its very next stray request re-bans it, which
+    /// for a wallet with nowhere else to go means a permanent outage.
+    fn clear_served_ban(&mut self) {
+        if let Some(until) = self.banned_until {
+            if Instant::now() >= until {
+                self.banned_until = None;
+                self.violations = 0;
+            }
+        }
     }
 
     fn strike(&mut self) -> bool {
@@ -165,6 +181,7 @@ impl LightGuard {
     async fn try_open_stream(&self, peer: PeerId) -> Result<(), &'static str> {
         let mut peers = self.inner.lock().await;
         let state = peers.entry(peer).or_insert_with(LightPeerState::new);
+        state.clear_served_ban();
         if state.is_banned() {
             return Err("banned: peer is temporarily banned");
         }

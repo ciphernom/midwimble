@@ -171,6 +171,21 @@ export class LightClient {
         await this.node.handle(PUSH_PROTOCOL, (stream, connection) => this._readPush(stream, connection));
         await this.node.start();
         this.node.addEventListener('peer:disconnect', (evt) => this._lost(evt.detail.toString()));
+        // Redial straight away when the tab comes back or the network returns,
+        // rather than waiting out the backoff — the pool may have gone idle
+        // against a single flaky node while the tab was hidden.
+        this._wake = () => {
+            if (this.closed) return;
+            const now = Date.now();
+            for (const k of this.known.values()) if (k.retryAt > now) k.retryAt = now;
+            this._maintain();
+        };
+        this._onVisible = () => { if (typeof document === 'undefined' || document.visibilityState === 'visible') this._wake(); };
+        try {
+            addEventListener('online', this._wake);
+            addEventListener('focus', this._wake);
+            if (typeof document !== 'undefined') document.addEventListener('visibilitychange', this._onVisible);
+        } catch (_) {}
         this.onStatus('connecting', null);
         await this._maintain();
     }
@@ -251,6 +266,10 @@ export class LightClient {
     async stop() {
         this.closed = true;
         clearTimeout(this._timer);
+        try {
+            if (this._wake) { removeEventListener('online', this._wake); removeEventListener('focus', this._wake); }
+            if (this._onVisible && typeof document !== 'undefined') document.removeEventListener('visibilitychange', this._onVisible);
+        } catch (_) {}
         if (this.node) { try { await this.node.stop(); } catch (_) {} }
         this.node = null;
         this.conns.clear();
@@ -370,9 +389,11 @@ export class LightClient {
 
     _failed(k, e) {
         k.failures++;
-        // 5 s, 10 s, 20 s, … up to five minutes; a node on another network
-        // is not tried again.
-        k.retryAt = Date.now() + Math.min(300_000, 5_000 * 2 ** (k.failures - 1));
+        // 5 s, 10 s, 20 s, capped at 30 s; with few nodes to fall back on, a
+        // longer backoff would leave the wallet idle for minutes. `_wake`
+        // (tab focus / back online) also redials ahead of this. A node on
+        // another network is not tried again.
+        k.retryAt = Date.now() + Math.min(30_000, 5_000 * 2 ** (k.failures - 1));
         if (e && e.bad) k.bad = true;
         if (k.found && (k.bad || k.failures >= FORGET_AFTER_FAILURES)) this.known.delete(k.addr);
         this.errors.push(`${k.addr.slice(0, 40)}…: ${(e && e.message) || e}`);
