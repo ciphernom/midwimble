@@ -777,7 +777,9 @@ const handlers = {
 
     net({ status, addr, nodes }) {
         const was = chain.connected ? chain.addr : false;
-        chain.connected = status === 'connected';
+        // 'gateway' is the HTTPS fallback: no WebRTC node, but requests still
+        // reach one, so the wallet scans and sends as if connected.
+        chain.connected = status === 'connected' || status === 'gateway';
         chain.addr = chain.connected ? (addr || null) : null;
         chain.nodes = chain.connected ? (nodes || 1) : 0;
         if (chain.connected && was !== chain.addr) {

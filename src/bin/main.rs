@@ -52,6 +52,12 @@ enum Cmd {
         /// page cannot reach the RPC by pointing its own domain at it.
         #[arg(long = "rpc-allow-host")]
         rpc_allow_hosts: Vec<String>,
+        /// Answer browser cross-origin requests with this
+        /// Access-Control-Allow-Origin, so a web wallet can use this node as
+        /// an HTTPS fallback for WebRTC. `*` allows any origin. Off unless
+        /// set; turn it on only on a node you intend as a public gateway.
+        #[arg(long = "rpc-cors")]
+        rpc_cors: Option<String>,
         /// Serve the block explorer alone, read-only, on this address too
         /// (for example 0.0.0.0:9435 to publish it).
         #[arg(long)]
@@ -1162,6 +1168,7 @@ fn run(cli: Cli) -> Result<()> {
             peers,
             rpc,
             rpc_allow_hosts,
+            rpc_cors,
             explorer,
             mine_to,
             mining_bond,
@@ -1284,6 +1291,7 @@ fn run(cli: Cli) -> Result<()> {
                 explorer.as_deref().map(str::parse).transpose()?;
             let rpc_options = rpc::RpcOptions {
                 allowed_hosts: rpc_allow_hosts,
+                cors_origin: rpc_cors,
             };
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async move {

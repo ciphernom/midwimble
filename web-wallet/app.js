@@ -538,15 +538,67 @@ function setNet(status, info) {
     app.net = { status, addr: status === 'connected' ? info : null, detail: status === 'failed' ? info : '' };
     tellWorker();
     update();
+    // WebRTC couldn't connect (or dropped): if a gateway is configured, probe
+    // it so the wallet keeps working over HTTPS. A successful probe flips the
+    // status to 'gateway' (see gatewayCall), which lets the worker scan again.
+    if ((status === 'failed' || status === 'disconnected' || status === 'none') && gateways().length) {
+        gatewayCall('get_state').catch(() => {});
+    }
+}
+
+/** HTTPS gateways (node RPCs with CORS) the wallet falls back to when it
+ *  can't reach a node over WebRTC. Configured in config.json; empty by
+ *  default, so there is no fallback unless one is set. */
+function gateways() {
+    const g = app.config && app.config.gateways;
+    return Array.isArray(g) ? g.filter(u => typeof u === 'string' && /^https?:\/\//i.test(u)) : [];
+}
+
+let gatewayAt = 0;
+/** One light request over HTTPS to a gateway's /light endpoint. The request
+ *  and response are the same shape as the WebRTC light stream, so callers get
+ *  back `data` exactly as from `LightClient.call`. */
+async function gatewayCall(method, params) {
+    const gws = gateways();
+    if (!gws.length) throw new Error('not connected to a node');
+    let last;
+    for (let i = 0; i < gws.length; i++) {
+        const base = gws[(gatewayAt + i) % gws.length].replace(/\/+$/, '');
+        try {
+            const res = await fetch(base + '/light', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify(params === undefined ? { method } : { method, params }),
+                signal: AbortSignal.timeout(30_000),
+            });
+            if (!res.ok) throw new Error(`gateway HTTP ${res.status}`);
+            const answer = await res.json();
+            if (!answer || answer.ok !== true) throw new Error((answer && answer.error) || `${method} failed`);
+            gatewayAt = (gatewayAt + i) % gws.length; // stay with the one that worked
+            if (app.net.status !== 'gateway') { app.net = { status: 'gateway', addr: null, detail: '' }; tellWorker(); update(); }
+            return answer.data;
+        } catch (e) { last = e; }
+    }
+    throw last || new Error('no gateway reachable');
 }
 
 function relay(m) {
     const c = lc;
     const reply = (r) => worker.postMessage({ type: 'rpc-result', id: m.id, ...r });
-    if (!c || !c.connected) return reply({ ok: false, error: 'not connected to a node' });
-    c.call(m.method, m.params, { spread: !!m.spread }).then(
-        data => reply({ ok: true, data }),
-        e => reply({ ok: false, error: errOf(e), unanswered: !!e.unanswered }));
+    if (c && c.connected) {
+        c.call(m.method, m.params, { spread: !!m.spread }).then(
+            data => reply({ ok: true, data }),
+            e => reply({ ok: false, error: errOf(e), unanswered: !!e.unanswered }));
+        return;
+    }
+    // WebRTC isn't up — use an HTTPS gateway if one is configured.
+    if (gateways().length) {
+        gatewayCall(m.method, m.params).then(
+            data => reply({ ok: true, data }),
+            e => reply({ ok: false, error: errOf(e) }));
+        return;
+    }
+    reply({ ok: false, error: 'not connected to a node' });
 }
 
 // ── auto-lock ───────────────────────────────────────────────────────────────
@@ -592,6 +644,8 @@ function netSummary() {
     if (!navigator.onLine) return { cls: 'bad', text: 'Offline' };
     const n = app.pool.length;
     if (n) return { cls: 'ok', text: n === 1 ? '1 node' : `${n} nodes` };
+    // No WebRTC node, but an HTTPS gateway is carrying requests.
+    if (app.net.status === 'gateway') return { cls: 'ok', text: 'HTTPS' };
     if (app.net.status === 'failed' || app.net.status === 'none') return { cls: 'bad', text: 'Offline' };
     return { cls: 'busy', text: 'Connecting' };
 }

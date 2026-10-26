@@ -57,6 +57,11 @@ pub struct RpcOptions {
     /// Host names the RPC answers to besides `localhost` names and IP
     /// addresses (`--rpc-allow-host`); `*` allows any.
     pub allowed_hosts: Vec<String>,
+    /// When set, the RPC answers browser cross-origin requests with this
+    /// `Access-Control-Allow-Origin` (`--rpc-cors`; `*` allows any). This is
+    /// what lets a web wallet use the node as an HTTPS fallback for WebRTC,
+    /// so it is off unless an operator running a public gateway turns it on.
+    pub cors_origin: Option<String>,
 }
 
 /// The RPC with default options and an explorer index of its own.
@@ -71,6 +76,10 @@ pub fn router_with(node: NodeHandle, options: &RpcOptions, index: SharedIndex) -
         .route("/logo.svg", get(logo))
         .route("/state", get(state))
         .route("/link", get(link_page))
+        // The light protocol over HTTP: a browser wallet's fallback when it
+        // cannot reach the node over WebRTC. Same request and response shape
+        // as the WebRTC light stream, so the wallet needs no translation.
+        .route("/light", post(light))
         .route("/blocks/{start}/{count}", get(blocks))
         .route("/bonds", get(bonds))
         .route("/relay", get(relay))
@@ -104,6 +113,11 @@ pub fn router_with(node: NodeHandle, options: &RpcOptions, index: SharedIndex) -
         .layer(axum::middleware::from_fn_with_state(
             std::sync::Arc::new(options.allowed_hosts.clone()),
             check_host,
+        ))
+        // Outermost, so a browser preflight is answered before the host check.
+        .layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::new(options.cors_origin.clone()),
+            cors,
         ))
         .with_state(node)
 }
@@ -465,6 +479,90 @@ async fn state(AxState(node): AxState<NodeHandle>) -> Json<Value> {
         "mining": info.mining,
         "hashes": info.hashes,
     }))
+}
+
+async fn light(AxState(node): AxState<NodeHandle>, Json(mut body): Json<Value>) -> Json<Value> {
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("id");
+    }
+    let req: crate::network::light_protocol::LightRequest = match serde_json::from_value(body) {
+        Ok(r) => r,
+        Err(e) => return Json(json!({ "ok": false, "error": format!("bad light request: {e}") })),
+    };
+    match light_data(&node, req).await {
+        Ok(data) => Json(json!({ "ok": true, "data": data })),
+        Err(e) => Json(json!({ "ok": false, "error": format!("{e:#}") })),
+    }
+}
+
+/// Answers the light methods a wallet needs to sync and send over HTTP,
+/// reusing the same code as the WebRTC light stream so the shapes match.
+async fn light_data(
+    node: &NodeHandle,
+    req: crate::network::light_protocol::LightRequest,
+) -> anyhow::Result<Value> {
+    use crate::network::light_protocol::LightRequest as L;
+    Ok(match req {
+        L::GetState => {
+            let info = node.info();
+            let s = &info.state;
+            json!({
+                "height": s.height,
+                "tip": hex::encode(s.header_hash),
+                "target": hex::encode(s.target),
+                "timestamp": s.timestamp,
+                "state_root": hex::encode(s.state_root()),
+                "supply": s.supply,
+                "utxos": s.utxos.len(),
+                "syncing": info.syncing,
+                "pruned_below": info.finality.pruned_below,
+                "webrtc_addrs": info.webrtc_addrs,
+            })
+        }
+        L::SubmitTransaction { tx_hex } => {
+            let bytes = hex::decode(tx_hex.trim())?;
+            let tx: crate::core::mw::Transaction = bincode::deserialize(&bytes)?;
+            node.submit_transaction(tx).await?;
+            json!({ "accepted": true })
+        }
+        L::GetNodes => json!({ "nodes": node.info().webrtc_addrs }),
+        // Headers, block(s), scan data, utxos, filters — the storage reads a
+        // scan needs, answered exactly as the WebRTC path answers them.
+        other => crate::node::light_from_storage(node.storage(), node.state().height, other)?,
+    })
+}
+
+/// Adds CORS headers (and answers preflight) when the operator turns it on,
+/// so a browser wallet on another origin may use this node as a fallback.
+async fn cors(
+    AxState(origin): AxState<std::sync::Arc<Option<String>>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let allow = match origin.as_ref() {
+        Some(o) => o.clone(),
+        None => return next.run(request).await,
+    };
+    let preflight = request.method() == axum::http::Method::OPTIONS;
+    let mut resp = if preflight {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        next.run(request).await
+    };
+    let headers = resp.headers_mut();
+    let value = axum::http::HeaderValue::from_str(&allow)
+        .unwrap_or(axum::http::HeaderValue::from_static("*"));
+    headers.insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+    headers.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
+        axum::http::HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    headers.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+        axum::http::HeaderValue::from_static("content-type"),
+    );
+    resp
 }
 
 async fn blocks(

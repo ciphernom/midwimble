@@ -3603,7 +3603,7 @@ fn request_reads_storage(request: &LightRequest) -> bool {
 
 /// Answers a light request that [`request_reads_storage`], against a chain
 /// of `tip` blocks.
-fn light_from_storage(
+pub(crate) fn light_from_storage(
     storage: &Storage,
     tip: u64,
     request: LightRequest,
