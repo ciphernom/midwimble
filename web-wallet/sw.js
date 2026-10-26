@@ -12,7 +12,7 @@
 // refetches every file (new WebAssembly included, with `cache: 'reload'` so
 // the browser's HTTP cache is bypassed), drops the old cache and tells the
 // page a new version is live.
-const VERSION = '5';
+const VERSION = '6';
 const CACHE = 'midwimble-wallet-' + VERSION;
 const FILES = [
     './', 'index.html', 'app.js', 'worker.js', 'keygen.js', 'qr.js', 'qr_scan.js', 'wallet.css', 'logo.svg',

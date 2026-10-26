@@ -555,31 +555,46 @@ function gateways() {
 }
 
 let gatewayAt = 0;
+let gwQueue = Promise.resolve(); // serialize gateway calls so a bulk scan can't stampede the limiter
+let gwLast = 0;
+const GW_SPACING = 120;          // ms between gateway calls (~8/s, under a 10 r/s nginx limit)
 /** One light request over HTTPS to a gateway's /light endpoint. The request
  *  and response are the same shape as the WebRTC light stream, so callers get
- *  back `data` exactly as from `LightClient.call`. */
-async function gatewayCall(method, params) {
-    const gws = gateways();
-    if (!gws.length) throw new Error('not connected to a node');
-    let last;
-    for (let i = 0; i < gws.length; i++) {
-        const base = gws[(gatewayAt + i) % gws.length].replace(/\/+$/, '');
-        try {
-            const res = await fetch(base + '/light', {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify(params === undefined ? { method } : { method, params }),
-                signal: AbortSignal.timeout(30_000),
-            });
-            if (!res.ok) throw new Error(`gateway HTTP ${res.status}`);
-            const answer = await res.json();
-            if (!answer || answer.ok !== true) throw new Error((answer && answer.error) || `${method} failed`);
-            gatewayAt = (gatewayAt + i) % gws.length; // stay with the one that worked
-            if (app.net.status !== 'gateway') { app.net = { status: 'gateway', addr: null, detail: '' }; tellWorker(); update(); }
-            return answer.data;
-        } catch (e) { last = e; }
-    }
-    throw last || new Error('no gateway reachable');
+ *  back `data` exactly as from `LightClient.call`. Calls are serialized and
+ *  spaced, and a 429 is retried with backoff, so a full-chain scan paces itself
+ *  under the gateway's rate limit instead of stampeding it into errors. */
+function gatewayCall(method, params) {
+    const run = gwQueue.then(async () => {
+        const gws = gateways();
+        if (!gws.length) throw new Error('not connected to a node');
+        const wait = GW_SPACING - (Date.now() - gwLast);
+        if (wait > 0) await sleep(wait);
+        gwLast = Date.now();
+        let last;
+        for (let i = 0; i < gws.length; i++) {
+            const base = gws[(gatewayAt + i) % gws.length].replace(/\/+$/, '');
+            for (let tries = 0; tries < 4; tries++) {
+                try {
+                    const res = await fetch(base + '/light', {
+                        method: 'POST',
+                        headers: { 'content-type': 'application/json' },
+                        body: JSON.stringify(params === undefined ? { method } : { method, params }),
+                        signal: AbortSignal.timeout(30_000),
+                    });
+                    if (res.status === 429) { await sleep(Math.min(2000, 250 * 2 ** tries)); gwLast = Date.now(); continue; }
+                    if (!res.ok) throw new Error(`gateway HTTP ${res.status}`);
+                    const answer = await res.json();
+                    if (!answer || answer.ok !== true) throw new Error((answer && answer.error) || `${method} failed`);
+                    gatewayAt = (gatewayAt + i) % gws.length; // stay with the one that worked
+                    if (app.net.status !== 'gateway') { app.net = { status: 'gateway', addr: null, detail: '' }; tellWorker(); update(); }
+                    return answer.data;
+                } catch (e) { last = e; break; } // network/other error: move on to the next gateway
+            }
+        }
+        throw last || new Error('no gateway reachable');
+    });
+    gwQueue = run.catch(() => {}); // keep the queue alive after a failure
+    return run;
 }
 
 function relay(m) {
@@ -1051,7 +1066,7 @@ function syncStatus(s) {
     const n = app.net.status;
     if (n === 'none') return { text: 'No nodes set. Add one in Settings.', bad: true };
     if (n === 'failed') return { text: 'Can’t reach a node right now.', bad: true, detail: app.net.detail };
-    if (n !== 'connected') return { text: 'Connecting…', busy: true };
+    if (n !== 'connected' && n !== 'gateway') return { text: 'Connecting…', busy: true };
     if (!s) return { text: 'Connecting…', busy: true };
     const c = s.chain;
     if (c.networkOk === false) return { text: 'The node is on another network.', bad: true, detail: s.syncError };
