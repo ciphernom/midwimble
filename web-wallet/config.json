@@ -4,5 +4,5 @@
   "nodes": [
     "/ip4/134.199.148.215/udp/9435/webrtc-direct/certhash/uEiDIf7zrVJMvWcmjSBcR_4qV8vPllHc_h1IKm8ulT3w5kg/p2p/12D3KooWCvjd2SBokjWMH712NXNFWHKr7kJAeBsUQ447LHk7wrzu"
   ],
-  "gateways": []
+  "gateways": ["https://mw.cypherpunk.gold"]
 }
