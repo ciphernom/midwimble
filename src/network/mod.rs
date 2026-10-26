@@ -596,6 +596,14 @@ impl Network {
         !self.light_peers.is_empty()
     }
 
+    /// Browser light clients connected now, and the most this node accepts
+    /// ([`MAX_LIGHT_PEERS`]). A wallet reads these from `get_state` to spread
+    /// itself off a node that is near its capacity (see the web wallet's
+    /// load-aware placement), instead of every wallet piling onto the seed.
+    pub fn light_load(&self) -> (usize, usize) {
+        (self.light_peers.len(), MAX_LIGHT_PEERS)
+    }
+
     pub fn broadcast_light_push(&mut self, notification: &LightNotification) {
         if self.light_peers.is_empty() {
             return;

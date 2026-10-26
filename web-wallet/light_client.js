@@ -340,7 +340,7 @@ export class LightClient {
         if (this.conns.has(id)) return;
         const c = {
             peer: conn.remotePeer, id, addr: k.addr, found: k.found, height: 0, ready: false, inFlight: 0, queue: [],
-            requests: 0, failures: 0, bytes: 0, ms: null,
+            requests: 0, failures: 0, bytes: 0, ms: null, load: 0,
         };
         this.conns.set(id, c);
         try {
@@ -425,7 +425,13 @@ export class LightClient {
         }
         const median = this._median();
         const near = ready.filter(r => Math.abs(r.height - median) <= PRIMARY_SLACK);
-        const c = pick(near.length ? near : ready);
+        const pool = near.length ? near : ready;
+        // Among the nodes fit to be primary, follow the least loaded (random
+        // among those equally light), so wallets distribute over the nodes
+        // there are instead of all landing on the busiest/seed.
+        const min = Math.min(...pool.map(r => r.load || 0));
+        const lightest = pool.filter(r => (r.load || 0) <= min + 0.001);
+        const c = pick(lightest.length ? lightest : pool);
         this.primary = c.id;
         this.onStatus('connected', c.addr);
     }
@@ -534,7 +540,14 @@ export class LightClient {
                 last = new Error(`${method}: the node's answer did not match the request`);
                 continue;
             }
-            if (method === 'get_state' && Number.isSafeInteger(resp.data.height)) c.height = resp.data.height;
+            if (method === 'get_state') {
+                if (Number.isSafeInteger(resp.data.height)) c.height = resp.data.height;
+                // The node's light-peer load (0..1); 0 for an older node that
+                // does not report it. The pool follows the least-loaded node,
+                // so wallets spread rather than all following the seed.
+                const max = Number(resp.data.max_light_connections);
+                c.load = max > 0 ? Math.min(1, (Number(resp.data.light_connections) || 0) / max) : 0;
+            }
             return resp.data;
         }
         throw last;

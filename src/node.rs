@@ -3454,6 +3454,10 @@ impl Node {
                 "pruned_below": self.storage.finality().map(|f| f.pruned_below).unwrap_or(0),
                 // Where else a browser can reach this node.
                 "webrtc_addrs": self.network.webrtc_addrs(),
+                // Light-client load, so a wallet can spread off a busy node
+                // rather than every wallet piling onto the seed.
+                "light_connections": self.network.light_load().0,
+                "max_light_connections": self.network.light_load().1,
             }),
             LightRequest::GetHeaders { .. }
             | LightRequest::GetBlock { .. }
