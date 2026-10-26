@@ -1047,7 +1047,7 @@ function balanceView() {
         fitAmount();
         const lines = [];
         if (b && b.incoming) lines.push(h('span', null, 'Arriving ', h('b', null, '+' + coins(b.incoming))));
-        if (b && b.pending) lines.push(h('span', null, 'Sending ', h('b', null, coins(b.pending))));
+        if (b && b.pending) lines.push(h('span', null, 'Pending ', h('b', null, coins(b.pending))));
         if (b && b.immature) lines.push(h('span', null, 'Maturing ', h('b', null, coins(b.immature))));
         fill(extra, ...lines);
         extra.hidden = !lines.length;
@@ -2127,7 +2127,38 @@ async function installApp() {
     await p.prompt();
     update();
 }
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+if ('serviceWorker' in navigator) {
+    const sw = navigator.serviceWorker;
+    // Whether a worker was already in control when the page loaded: true on an
+    // update (an old worker is running), false on a first-ever visit. Only an
+    // update should trigger the reload below.
+    const hadController = !!sw.controller;
+    let reloading = false;
+    sw.addEventListener('controllerchange', () => {
+        if (reloading || !hadController) return;
+        reloading = true;
+        location.reload();
+    });
+    sw.addEventListener('message', (e) => {
+        const m = e.data;
+        if (!m || m.type !== 'sw-version' || !m.version) return;
+        try {
+            const seen = localStorage.getItem('mw.swVersion');
+            // A genuine version change (not the first install): celebrate after
+            // the reload that controllerchange triggers.
+            if (seen && seen !== m.version) sessionStorage.setItem('mw.celebrate', m.version);
+            localStorage.setItem('mw.swVersion', m.version);
+        } catch (_) {}
+    });
+    sw.register('sw.js').catch(() => {});
+    try {
+        const v = sessionStorage.getItem('mw.celebrate');
+        if (v) {
+            sessionStorage.removeItem('mw.celebrate');
+            setTimeout(() => hud('Updated to the latest version', 'check', 2600), 600);
+        }
+    } catch (_) {}
+}
 
 render(false);
 holdTab(false);

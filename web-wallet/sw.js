@@ -8,7 +8,12 @@
 // Nothing but the wallet's own files passes through here; nodes are reached
 // over WebRTC, which a service worker never sees.
 
-const CACHE = 'midwimble-wallet-1.1';
+// Bump VERSION on every release: the service worker then reinstalls,
+// refetches every file (new WebAssembly included, with `cache: 'reload'` so
+// the browser's HTTP cache is bypassed), drops the old cache and tells the
+// page a new version is live.
+const VERSION = '2';
+const CACHE = 'midwimble-wallet-' + VERSION;
 const FILES = [
     './', 'index.html', 'app.js', 'worker.js', 'keygen.js', 'qr.js', 'qr_scan.js', 'wallet.css', 'logo.svg',
     'config.json', 'light_client.bundle.js', 'qr_reader.bundle.js', 'manifest.webmanifest',
@@ -27,7 +32,9 @@ self.addEventListener('install', (e) => {
 self.addEventListener('activate', (e) => {
     e.waitUntil(caches.keys()
         .then(keys => Promise.all(keys.filter(k => k.startsWith('midwimble-wallet-') && k !== CACHE).map(k => caches.delete(k))))
-        .then(() => self.clients.claim()));
+        .then(() => self.clients.claim())
+        .then(() => self.clients.matchAll())
+        .then(cs => cs.forEach(c => c.postMessage({ type: 'sw-version', version: VERSION }))));
 });
 
 self.addEventListener('fetch', (e) => {
