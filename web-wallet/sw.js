@@ -8,7 +8,7 @@
 // Nothing but the wallet's own files passes through here; nodes are reached
 // over WebRTC, which a service worker never sees.
 
-const CACHE = 'midwimble-wallet-1';
+const CACHE = 'midwimble-wallet-1.1';
 const FILES = [
     './', 'index.html', 'app.js', 'worker.js', 'keygen.js', 'qr.js', 'qr_scan.js', 'wallet.css', 'logo.svg',
     'config.json', 'light_client.bundle.js', 'qr_reader.bundle.js', 'manifest.webmanifest',

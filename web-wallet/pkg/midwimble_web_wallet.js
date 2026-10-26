@@ -303,6 +303,15 @@ export class Wallet {
         }
     }
     /**
+     * Whether this is a watch-only wallet (no spending keys): the UI hides
+     * sending and the recovery phrase.
+     * @returns {boolean}
+     */
+    is_watch_only() {
+        const ret = wasm.wallet_is_watch_only(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
      * @param {number} tip_height
      * @returns {number}
      */
@@ -883,6 +892,30 @@ export class Wallet {
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
             wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * A watch-only wallet over `view_key` (bech32 `mwview1…`), scanning from
+     * `birth_height`. It finds and values payments but cannot spend.
+     * @param {string} view_key
+     * @param {number} birth_height
+     * @returns {Wallet}
+     */
+    static watch(view_key, birth_height) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(view_key, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.wallet_watch(retptr, ptr0, len0, birth_height);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return Wallet.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
         }
     }
 }
