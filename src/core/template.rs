@@ -395,6 +395,7 @@ pub fn build_template_relayed(
                 let ready = crate::core::bond::precheck_registrations(
                     &state_after_relay.bonds,
                     std::slice::from_ref(registration),
+                    &state.target,
                     timestamp,
                 )
                 .and_then(|()| {
@@ -435,6 +436,7 @@ pub fn build_template_relayed(
                     crate::core::bond::precheck_registrations(
                         &state_after_relay.bonds,
                         std::slice::from_ref(*r),
+                        &state.target,
                         timestamp,
                     )
                     .is_ok()

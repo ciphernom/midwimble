@@ -434,7 +434,15 @@ function bondTable(r) {
           : h("span", { class: "dim" }, "—"),
       ];
     }), [5, 6]),
-    h("div", { class: "note" }, "Fork choice counts a bond's blocks at full weight up to its cap over the last " + num(w.size) + " blocks; past the cap they stay valid but add only 1/1024 of their work. The cap is an equal share among eligible bonds, never below 1/720. No block counts for more than a quarter above the lowest-work block of the week before it." + (w.tapering ? " Past the cap a block also mints less: a bond that signed n of the window keeps cap/n of each block's subsidy, and what is withheld is never minted by anyone." : " From the mainnet switch, an over-cap block will also mint only cap/n of its subsidy, the rest never minted \u2014 mints shows what each bond would keep.")));
+    h("div", { class: "note" }, "Fork choice counts a bond's blocks at full weight up to its cap over the last " + num(w.size) + " blocks; past the cap they stay valid but add only 1/1024 of their work. The cap is an equal share among eligible bonds, never below 1/720. No block counts for more than a quarter above the lowest-work block of the week before it." + (w.tapering ? " Past the cap a block also mints less: a bond that signed n of the window keeps cap/n of each block's subsidy, and what is withheld is never minted by anyone." : " From the mainnet switch, an over-cap block will also mint only cap/n of its subsidy, the rest never minted \u2014 mints shows what each bond would keep.")),
+    h("div", { class: "note" }, w.retargeting
+      ? "A new bond must lock at least " + gmds(w.min_bond) + " at this chain's difficulty"
+        + (w.min_bond > w.min_bond_floor
+            ? " \u2014 up from the launch minimum of " + gmds(w.min_bond_floor) + ", because midwimble's work has risen. "
+            : ", the launch minimum. ")
+        + "The bar doubles with every 16-fold rise in midwimble's work, to a ceiling of " + gmds(w.min_bond_ceiling)
+        + ", and applies only to registrations: a bond already above keeps the price it registered at until its lock ends."
+      : "From " + utc(w.retarget_from) + " a new bond's minimum follows midwimble's own difficulty, doubling with every 16-fold rise in work from " + gmds(w.min_bond_floor) + " up to " + gmds(w.min_bond_ceiling) + ". It will apply to registrations only \u2014 a bond already registered keeps the price it registered at."));
 }
 
 async function bondsPage() {

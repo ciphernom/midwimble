@@ -304,15 +304,28 @@ async fn bonds(AxState(node): AxState<NodeHandle>) -> Json<Value> {
         .collect();
     list.sort_by(|a, b| a["bond_id"].as_str().cmp(&b["bond_id"].as_str()));
     use crate::core::bond::{
-        min_mining_bond, min_remaining_bond_lock, BONDED_MINING_FROM, EARLY_BONDS_UNTIL,
+        min_mining_bond, min_remaining_bond_lock, registration_min_bond,
+        work_doublings_since_genesis, BONDED_MINING_FROM, BOND_RETARGET_FROM, EARLY_BONDS_UNTIL,
+        MAX_MINING_BOND, WORK_DOUBLINGS_PER_BOND_DOUBLING,
     };
     let from = BONDED_MINING_FROM;
     Json(json!({
         "bonds": list,
         "bonded_mining_from": if from == u64::MAX { Value::Null } else { json!(from) },
+        // What `eligible_at` asks of any bond, old or new: the launch
+        // minimum. A bond in the set above is judged by this and nothing
+        // else, which is why the retarget below can never strand one.
         "min_bond_now": min_mining_bond(now),
         "min_remaining_lock_now": min_remaining_bond_lock(now),
         "early_bonds_until": if EARLY_BONDS_UNTIL == 0 { Value::Null } else { json!(EARLY_BONDS_UNTIL) },
+        // What a *new* registration must lock at this chain's difficulty:
+        // the figure to check before locking a coin on midstate.
+        "registration_min_bond": registration_min_bond(&state.target, now),
+        "bond_retarget_from": BOND_RETARGET_FROM,
+        "bond_retarget_active": now >= BOND_RETARGET_FROM,
+        "bond_retarget_ceiling": MAX_MINING_BOND,
+        "work_doublings_per_bond_doubling": WORK_DOUBLINGS_PER_BOND_DOUBLING,
+        "work_doublings_since_genesis": work_doublings_since_genesis(&state.target),
     }))
 }
 

@@ -19,6 +19,15 @@ The rule is in consensus (`EARLY_BONDS_UNTIL` in `src/core/bond.rs`, set by
 the launch parameters) and judged by each block's own timestamp, so every node
 draws the line through the same blocks.
 
+A month later, on **2026-11-30 00:00 UTC**, what a *new* bond must lock starts
+following midwimble's own difficulty, doubling per 16-fold rise in its work
+since genesis, from 128 gMDS up to 512 gMDS and no further
+(`BOND_RETARGET_FROM`, `docs/BONDED_POW.md`). It applies to registrations
+only, so the bond you lock before the switch keeps its price for as long as it
+stays locked; it is a renewal, or a new bond, that pays the new figure. Before
+locking a coin, `midwimble bond register` checks the chain's current figure
+for you, and `/bonds` reports it as `registration_min_bond`.
+
 ## What a joiner risks
 
 Very little. Mining needs a bond, and bonds are real MDS on midstate mainnet,
@@ -71,7 +80,8 @@ python3 scripts/join_testnet.py --mine --full-bond [--mine-days 30]
 ```
 
 That locks 128 gMDS for 30 days plus however long you mean to mine, and asks
-before it does. Registering a bond takes a while (a day of the network's work
+before it does. From 2026-11-30 the chain may ask more of a new bond (above);
+the script takes the figure from the node rather than assuming 128 gMDS. Registering a bond takes a while (a day of the network's work
 must be buried above its proof, an hour or more of midstate blocks), so do it
 well before the switch. After the switch the script locks a mainnet bond
 anyway, and puts aside an early one that can no longer mine, printing the

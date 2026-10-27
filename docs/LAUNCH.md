@@ -157,6 +157,13 @@ them months apart for decades. Late February does not.
   of a block's subsidy, rounded down; fees are always paid in full. What it
   withholds is never minted by anyone, so a producer earns the whole reward
   only by spreading its hashrate over enough bonds.
+- **Bond retarget:** from 2026-11-30 00:00 UTC, a month after the switch, what
+  a **new** bond must lock follows midwimble's own difficulty: one doubling of
+  the bond per four doublings of work since genesis (so 16x the hashrate
+  doubles the bond), from 128 gMDS up to 512 gMDS and no further. It applies
+  at registration only, so a bond already locked is never stranded by it and
+  the stock reprices as locks run out. This does not touch emission; it sets
+  what midstate capital a block's authorisation costs.
 - **Endgame:** the schedule reaches the cap at about block 49.7 million
   (roughly 95 years in); the chain itself lands under it by whatever the taper
   has burned by then. After that a block pays its fees, and a block with no
@@ -177,6 +184,7 @@ actually exist, so the cap does not depend on trusting whoever served it.
 | Halving | every 2,100,000 blocks | Bitcoin's era length |
 | Bonded mining | from block 1, whenever a registered bond could sign | minimum bond 128 gMDS (2^37 units), a launch parameter; while no bond can sign, blocks are unsigned and count for 1/1,024 of their work |
 | Early phase | blocks stamped before 2026-10-31 00:00 UTC | bonds of 2^24 units, locked 2 more days; mainnet's bond and lock from then on |
+| Bond retarget | from 2026-11-30 00:00 UTC | a **new** bond's minimum doubles per 16× rise in midwimble's work since genesis, 128 → 512 gMDS and no further; registrations only, so a bond already locked keeps the price it registered at |
 | Relayed midstate headers | midstate's own difficulty, timestamps at most 30 minutes ahead | a fake branch costs real midstate work, more the further it runs ahead |
 | Bond eligibility | more than 30 days of lock left | judged on midwimble's clock, 7-day margin |
 | Fork choice | 14 full-weight blocks a bond a week (two a day); no block counts above 1.25× the week's lowest | weight, never validity |

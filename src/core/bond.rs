@@ -26,6 +26,15 @@
 //! stamped before it accept a smaller bond with a shorter lock, so it can
 //! start as a testnet anyone can mine and become mainnet in place. From then
 //! on only bonds meeting the full minimums count.
+//!
+//! A month after that ([`BOND_RETARGET_FROM`]) what a *new* bond must lock
+//! starts following midwimble's own difficulty: one doubling of the bond per
+//! [`WORK_DOUBLINGS_PER_BOND_DOUBLING`] doublings of work since genesis, up
+//! to [`MAX_MINING_BOND`] ([`registration_min_bond`]). The retarget is a
+//! gate on registration only — [`eligible`] keeps asking every bond the
+//! launch minimum and nothing more — so a bond already locked is never
+//! stranded by it, and the stock reprices as locks run out rather than all
+//! at once.
 
 use super::anchor::HeaderLink;
 use super::auxpow::midstate_coin_id;
@@ -161,6 +170,103 @@ pub fn min_mining_bond(block_timestamp: u64) -> u64 {
 /// stamped `block_timestamp`.
 pub fn min_remaining_bond_lock(block_timestamp: u64) -> u64 {
     BOND_RULES.min_lock_at(block_timestamp)
+}
+
+// ── Bond-size retarget ──────────────────────────────────────────────────────
+
+/// How long after the early phase ends the bond-size retarget begins (30
+/// days). Until then a registration needs only [`min_mining_bond`], so the
+/// retarget cannot move the bar out from under a network that has only just
+/// opened: every bond registered in the first month is priced at the launch
+/// minimum, and keeps that price for as long as it stays locked.
+pub const BOND_RETARGET_DELAY: u64 = 30 * 24 * 60 * 60;
+
+/// First block timestamp whose registrations are priced by the retarget
+/// ([`registration_min_bond`]): one month after [`EARLY_BONDS_UNTIL`].
+pub const BOND_RETARGET_FROM: u64 = EARLY_BONDS_UNTIL.saturating_add(BOND_RETARGET_DELAY);
+
+/// Doublings of midwimble's work per block that raise the minimum a *new*
+/// bond must lock by one doubling: at four, midwimble's hashrate has to rise
+/// 16-fold to double the bond.
+///
+/// Genesis was targeted at a hundredth of midstate's hashrate, so full
+/// merged-mining adoption is around 100× — six doublings, one step. That
+/// leaves the second step for growth beyond midstate's own hashrate, which
+/// is the point at which midwimble, not midstate, is why the hashrate is
+/// there. A faster setting would spend both steps on adoption alone and
+/// leave the retarget pinned at its ceiling with nothing left to say.
+pub const WORK_DOUBLINGS_PER_BOND_DOUBLING: u32 = 4;
+
+/// How far the retarget may raise the minimum above the launch minimum, in
+/// doublings: 2^37 → 2^39 (128 → 512 gMDS) on mainnet.
+///
+/// The ceiling is what keeps the flywheel from eating its own float. At the
+/// cap's `CAP_K` eligible bonds, a 2^37 minimum locks about 9% of midstate's
+/// terminal supply, 2^38 about 18% and 2^39 about 35%; a third step would
+/// pass 70%, at which point the bonds *are* midstate's supply and there is
+/// no liquid market left to price them. Two steps is the whole usable range.
+pub const MAX_BOND_DOUBLINGS: u32 = 2;
+
+/// The largest minimum the retarget can ask for: the launch minimum shifted
+/// up by [`MAX_BOND_DOUBLINGS`]. Still a power of two, so still a midstate
+/// coin value.
+pub const MAX_MINING_BOND: u64 = MIN_MINING_BOND << MAX_BOND_DOUBLINGS;
+
+/// The ceiling has to fit in the width of a coin value, so that
+/// [`registration_min_bond`] can shift without overflowing.
+const _: () = assert!(MIN_MINING_BOND.leading_zeros() > MAX_BOND_DOUBLINGS);
+/// A retarget that could ask *less* than [`min_mining_bond`] would be inert,
+/// because [`eligible`] still holds every bond to that minimum.
+const _: () = assert!(MAX_MINING_BOND >= MIN_MINING_BOND);
+/// The retarget begins after the early phase, never during it: an early
+/// network is being bootstrapped, not priced.
+const _: () = assert!(BOND_RETARGET_FROM >= EARLY_BONDS_UNTIL);
+
+/// Whole doublings of work per block between `midwimble_target` and the
+/// target midwimble launched at; negative if midwimble is easier than it
+/// launched.
+///
+/// Whole doublings, because a midstate coin's value is a power of two and so
+/// the minimum bond can only move in doublings: there is no point measuring
+/// the input more finely than the output can be set. It also makes the step
+/// coarse — a 16× move in hashrate — which is far larger than anything
+/// ASERT's retarget does block to block, so the figure is stable without
+/// needing to be averaged.
+pub fn work_doublings_since_genesis(midwimble_target: &[u8; 32]) -> i32 {
+    fn bits(target: &[u8; 32]) -> i32 {
+        // `max(1)` only guards `ilog2`: a target of zero is not a valid one.
+        calculate_work(target).max(1).ilog2() as i32
+    }
+    bits(midwimble_target) - bits(&super::types::GENESIS_TARGET)
+}
+
+/// Smallest bond a *registration* carried by a block with this target and
+/// timestamp may lock: [`min_mining_bond`] doubled once per
+/// [`WORK_DOUBLINGS_PER_BOND_DOUBLING`] doublings of midwimble's work since
+/// genesis, up to [`MAX_MINING_BOND`].
+///
+/// This is the retarget, and it is deliberately only a gate on *new* bonds.
+/// A bond already in the set is judged by [`eligible`] alone, which asks the
+/// launch minimum and nothing more, so raising this bar never strands a bond
+/// anyone has already locked. The retarget controls the inflow; the stock
+/// follows it within one unbonding delay, because a bond's eligibility runs
+/// out with its lock ([`MIN_REMAINING_BOND_LOCK`]) and re-locking it is a
+/// fresh registration at whatever the bar is then. Same shape as difficulty
+/// steering hashrate: the lever acts on the margin and the stock converges.
+///
+/// Keeping it out of [`eligible`] is also what preserves the invariant the
+/// bond set is built on — that a bond's eligibility only ever runs down as
+/// time passes ([`BondSet::prune_expired`] forgets a bond for good). A
+/// minimum that could fall would let a forgotten bond qualify again.
+pub fn registration_min_bond(midwimble_target: &[u8; 32], block_timestamp: u64) -> u64 {
+    let floor = min_mining_bond(block_timestamp);
+    if block_timestamp < BOND_RETARGET_FROM {
+        return floor;
+    }
+    let steps = (work_doublings_since_genesis(midwimble_target)
+        / WORK_DOUBLINGS_PER_BOND_DOUBLING as i32)
+        .clamp(0, MAX_BOND_DOUBLINGS as i32) as u32;
+    floor << steps
 }
 
 /// The locking script of a mining bond:
@@ -1422,17 +1528,23 @@ pub fn rebuild_work_floor(
 }
 
 /// The cheap, stateful checks on a block's registrations, run before any
-/// header's proof of work: not already registered, at least the minimum bond
-/// at the block's time, eligible at the block's time (a bond that could
-/// never sign is not worth the space, and one already pruned could otherwise
-/// come back), and locked no further out than `MAX_BOND_HORIZON`.
+/// header's proof of work: not already registered, at least
+/// [`registration_min_bond`] for the block's target and time, eligible at
+/// the block's time (a bond that could never sign is not worth the space,
+/// and one already pruned could otherwise come back), and locked no further
+/// out than `MAX_BOND_HORIZON`.
+///
+/// The bond minimum is the block's own retargeted one, not the launch
+/// minimum: this is the only place the retarget applies, which is what
+/// leaves every bond already in the set priced as it was registered.
 pub fn precheck_registrations(
     bonds: &BondSet,
     registrations: &[BondRegistration],
+    midwimble_target: &[u8; 32],
     block_timestamp: u64,
 ) -> Result<()> {
     let horizon = est_midstate_height(block_timestamp).saturating_add(MAX_BOND_HORIZON);
-    let min_bond = min_mining_bond(block_timestamp);
+    let min_bond = registration_min_bond(midwimble_target, block_timestamp);
     for registration in registrations {
         let id = registration.bond_id();
         if bonds.contains_key(&id) {
@@ -1448,7 +1560,9 @@ pub fn precheck_registrations(
                 hex::encode(id),
                 value,
                 min_bond,
-                if EARLY_BONDS_UNTIL > 0 && !in_early_phase(block_timestamp) {
+                if min_bond > min_mining_bond(block_timestamp) {
+                    " at this block's difficulty"
+                } else if EARLY_BONDS_UNTIL > 0 && !in_early_phase(block_timestamp) {
                     " now that the early phase is over"
                 } else {
                     ""
@@ -1973,8 +2087,8 @@ mod cap_tests {
         };
         let edge = est_midstate_height(t) + min_remaining_bond_lock(t);
         let none = BondSet::default();
-        precheck_registrations(&none, &[reg(edge)], t).unwrap();
-        let err = precheck_registrations(&none, &[reg(edge - 1)], t).unwrap_err();
+        precheck_registrations(&none, &[reg(edge)], &crate::core::types::GENESIS_TARGET, t).unwrap();
+        let err = precheck_registrations(&none, &[reg(edge - 1)], &crate::core::types::GENESIS_TARGET, t).unwrap_err();
         assert!(err.to_string().contains("not eligible"), "{err}");
     }
 
@@ -2093,8 +2207,8 @@ mod cap_tests {
                 },
             };
             let none = BondSet::default();
-            precheck_registrations(&none, std::slice::from_ref(&reg), last).unwrap();
-            let err = precheck_registrations(&none, &[reg], first)
+            precheck_registrations(&none, std::slice::from_ref(&reg), &crate::core::types::GENESIS_TARGET, last).unwrap();
+            let err = precheck_registrations(&none, &[reg], &crate::core::types::GENESIS_TARGET, first)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("early phase is over"), "{err}");
@@ -2648,5 +2762,225 @@ mod tests {
             forged.proof.coin.value *= 2;
             assert!(forged.verify(&relay, &MW_TARGET).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod retarget_tests {
+    use super::*;
+    use primitive_types::U256;
+
+    /// A target carrying `doublings` more work per block than genesis: work
+    /// is `U256::MAX / target`, so halving the target doubles the work.
+    fn harder_by(doublings: u32) -> [u8; 32] {
+        (U256::from_big_endian(&super::super::types::GENESIS_TARGET) >> doublings as usize)
+            .to_big_endian()
+    }
+
+    /// The easiest target there is, so the least work a block can carry.
+    const EASIEST: [u8; 32] = [0xff; 32];
+
+    /// A moment the retarget is in force, and past any early phase.
+    fn retargeting() -> u64 {
+        BOND_RETARGET_FROM + 1
+    }
+
+    #[test]
+    fn work_doublings_are_measured_against_genesis() {
+        assert_eq!(
+            work_doublings_since_genesis(&super::super::types::GENESIS_TARGET),
+            0,
+            "genesis is the zero point"
+        );
+        for d in 1..=12u32 {
+            assert_eq!(
+                work_doublings_since_genesis(&harder_by(d)),
+                d as i32,
+                "{d} halvings of the target is {d} doublings of work"
+            );
+        }
+        assert!(
+            work_doublings_since_genesis(&EASIEST) < 0,
+            "a chain easier than it launched reads negative"
+        );
+    }
+
+    /// Nothing changes until the retarget begins: a month of mainnet prices
+    /// every bond at the launch minimum however the hashrate moves.
+    #[test]
+    fn the_retarget_is_inert_before_it_begins() {
+        let before = BOND_RETARGET_FROM - 1;
+        for d in [0, 4, 8, 64] {
+            assert_eq!(
+                registration_min_bond(&harder_by(d), before),
+                min_mining_bond(before),
+                "the retarget cannot bite at {before} (+{d} doublings)"
+            );
+        }
+    }
+
+    /// One doubling of the bond per `WORK_DOUBLINGS_PER_BOND_DOUBLING`
+    /// doublings of work, and no partial steps in between.
+    #[test]
+    fn the_minimum_doubles_once_per_four_doublings_of_work() {
+        let t = retargeting();
+        let floor = min_mining_bond(t);
+        let per = WORK_DOUBLINGS_PER_BOND_DOUBLING;
+        for step in 0..=MAX_BOND_DOUBLINGS {
+            for within in 0..per {
+                let d = step * per + within;
+                assert_eq!(
+                    registration_min_bond(&harder_by(d), t),
+                    floor << step,
+                    "{d} doublings of work should ask {} units",
+                    floor << step
+                );
+            }
+        }
+    }
+
+    /// The ceiling holds however far midwimble's hashrate runs, and the
+    /// floor holds however far it falls: the retarget only ever adds to what
+    /// [`eligible`] already asks, so it can never strand a bond.
+    #[test]
+    fn the_retarget_stays_between_the_launch_minimum_and_the_ceiling() {
+        let t = retargeting();
+        for d in [0, 1, 7, 8, 9, 40, 100, 200] {
+            let min = registration_min_bond(&harder_by(d), t);
+            assert!(
+                (min_mining_bond(t)..=MAX_MINING_BOND).contains(&min),
+                "+{d} doublings asked {min}, outside [{}, {}]",
+                min_mining_bond(t),
+                MAX_MINING_BOND
+            );
+            assert_eq!(min.count_ones(), 1, "a bond is one midstate coin: {min}");
+        }
+        assert_eq!(
+            registration_min_bond(&EASIEST, t),
+            min_mining_bond(t),
+            "an easier chain never asks less than the launch minimum"
+        );
+        assert_eq!(
+            registration_min_bond(&harder_by(200), t),
+            MAX_MINING_BOND,
+            "the ceiling is the ceiling"
+        );
+        assert_eq!(
+            registration_min_bond(&[0; 32], t),
+            min_mining_bond(t),
+            "a degenerate target reads as no work at all, which asks the \
+             floor rather than the ceiling: the safe direction"
+        );
+    }
+
+    /// The minimum only ever rises with the work, never falls with it.
+    #[test]
+    fn the_minimum_is_monotone_in_the_work() {
+        let t = retargeting();
+        let mut last = 0;
+        for d in 0..=40u32 {
+            let min = registration_min_bond(&harder_by(d), t);
+            assert!(min >= last, "+{d} doublings dropped the minimum");
+            last = min;
+        }
+    }
+
+    fn registration(value: u64, bonded_until: u64) -> BondRegistration {
+        BondRegistration {
+            proof: BondProof {
+                coin: BondCoin {
+                    script: BondScript {
+                        mining_key: [1; 32],
+                        bonded_until,
+                        owner_pk: [2; 32],
+                    },
+                    value,
+                    salt: [3; 32],
+                },
+                midstate_height: 300_000,
+                roots: MidstateRoots {
+                    coins: [0; 32],
+                    commitments: [0; 32],
+                    chain_mmr: [0; 32],
+                    burned_wots: None,
+                },
+                smt: UtxoAccumulator::from_set([[0; 32]], true)
+                    .prove(&[0; 32], true)
+                    .unwrap(),
+            },
+        }
+    }
+
+    /// Past the switch, a registration at the launch minimum is refused once
+    /// the work has doubled the bar, and one at the new bar is taken.
+    #[test]
+    fn a_registration_under_the_retargeted_minimum_is_refused() {
+        let t = retargeting();
+        let target = harder_by(WORK_DOUBLINGS_PER_BOND_DOUBLING);
+        let asked = registration_min_bond(&target, t);
+        assert_eq!(asked, min_mining_bond(t) * 2, "one step up");
+        let until = est_midstate_height(t) + min_remaining_bond_lock(t);
+        let none = BondSet::default();
+
+        let err = precheck_registrations(&none, &[registration(asked / 2, until)], &target, t)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least"), "{err}");
+        assert!(err.contains("at this block's difficulty"), "{err}");
+
+        precheck_registrations(&none, &[registration(asked, until)], &target, t)
+            .expect("a bond at the retargeted minimum registers");
+        // And the same bond would have been fine at genesis difficulty.
+        precheck_registrations(
+            &none,
+            &[registration(asked / 2, until)],
+            &super::super::types::GENESIS_TARGET,
+            t,
+        )
+        .expect("the launch minimum still registers while the work has not moved");
+    }
+
+    /// The whole point of gating the retarget at registration: a bond locked
+    /// under the old minimum keeps signing, and keeps counting towards the
+    /// cap, after the bar has risen above it. The retarget prices the inflow
+    /// and the stock follows as locks run out, rather than stranding coins
+    /// their owners can no longer move.
+    #[test]
+    fn a_bond_registered_under_the_old_minimum_is_grandfathered() {
+        let t = retargeting();
+        let target = harder_by(MAX_BOND_DOUBLINGS * WORK_DOUBLINGS_PER_BOND_DOUBLING);
+        assert_eq!(registration_min_bond(&target, t), MAX_MINING_BOND);
+
+        let old = BondEntry {
+            mining_key: [7; 32],
+            value: min_mining_bond(t),
+            bonded_until: u64::MAX,
+            proven_height: 0,
+            proven_hash: [0; 32],
+        };
+        assert!(
+            old.value < registration_min_bond(&target, t),
+            "the bar has risen above this bond"
+        );
+        assert!(
+            old.eligible_at(t),
+            "a bond already locked still authorises blocks"
+        );
+
+        let mut bonds = BondSet::default();
+        bonds.insert([9; 32], old);
+        assert_eq!(
+            signer_cap(&bonds, t),
+            signer_cap(&{
+                let mut rich = BondSet::default();
+                rich.insert([9; 32], BondEntry { value: MAX_MINING_BOND, ..old });
+                rich
+            }, t),
+            "the cap counts bonds, not what they lock: an old bond is a full slot"
+        );
+        assert!(
+            bonds.prune_expired(t).is_empty(),
+            "and the retarget never prunes it"
+        );
     }
 }

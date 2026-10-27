@@ -547,6 +547,15 @@ fn window_json(state: &State, now: u64) -> Value {
         // an over-cap block still pays in full, so the explorer must not
         // show a taper that is not being applied yet.
         "tapering": now >= crate::core::bond::EARLY_BONDS_UNTIL,
+        // What a *new* bond must lock at this chain's difficulty, and the
+        // launch minimum every bond already in the set is still judged by
+        // (`bond::registration_min_bond`). The two differ only once the
+        // retarget is in force and midwimble's work has moved.
+        "min_bond": crate::core::bond::registration_min_bond(&state.target, now),
+        "min_bond_floor": crate::core::bond::min_mining_bond(now),
+        "min_bond_ceiling": crate::core::bond::MAX_MINING_BOND,
+        "retargeting": now >= crate::core::bond::BOND_RETARGET_FROM,
+        "retarget_from": crate::core::bond::BOND_RETARGET_FROM,
     })
 }
 

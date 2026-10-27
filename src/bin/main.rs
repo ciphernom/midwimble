@@ -576,6 +576,13 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
                 bond_units(min_mining_bond(now)),
                 min_remaining_bond_lock(now) / 1440
             );
+            if now >= BOND_RETARGET_FROM {
+                out!(
+                    "A busier midwimble asks more of a new bond, up to {} (`midwimble bond register` \
+                     checks the chain's figure). Whatever you lock now keeps its price until the lock ends.",
+                    bond_units(MAX_MINING_BOND)
+                );
+            }
             for warning in bond_warnings(None, until, now) {
                 out!("{warning}");
             }
@@ -671,6 +678,21 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
                     midwimble::core::types::MIDSTATE_BLOCK_HEIGHT,
                 ),
             };
+            // The chain prices a new bond off its own difficulty from
+            // `BOND_RETARGET_FROM` (`core::bond::registration_min_bond`), so
+            // what the offline check above asked may be short of what this
+            // chain will take. A bond already registered keeps its price;
+            // this only ever binds a registration.
+            let asked = registration_min_bond(&target, now);
+            if value < asked {
+                anyhow::bail!(
+                    "this coin holds {}; at this chain's difficulty a new mining bond needs at \
+                     least {}. A bond already registered keeps the price it was registered at, \
+                     so this applies to new bonds and renewals only",
+                    bond_units(value),
+                    bond_units(asked)
+                );
+            }
             if proof.midstate_height <= midwimble::core::types::MIDSTATE_BLOCK_HEIGHT {
                 anyhow::bail!(
                     "the proof (midstate height {}) is not above the chain's midstate anchor ({}): \
@@ -838,8 +860,8 @@ fn utc(ts: u64) -> String {
 
 fn print_params() {
     use midwimble::core::bond::{
-        BONDED_MINING_FROM, EARLY_BONDS_UNTIL, EARLY_MIN_MINING_BOND,
-        EARLY_MIN_REMAINING_BOND_LOCK, MIN_MINING_BOND, MIN_REMAINING_BOND_LOCK,
+        BONDED_MINING_FROM, BOND_RETARGET_FROM, EARLY_BONDS_UNTIL, EARLY_MIN_MINING_BOND,
+        EARLY_MIN_REMAINING_BOND_LOCK, MAX_MINING_BOND, MIN_MINING_BOND, MIN_REMAINING_BOND_LOCK,
     };
     use midwimble::core::state::calculate_work;
     use midwimble::core::types::{
@@ -915,6 +937,15 @@ fn print_params() {
             EARLY_MIN_REMAINING_BOND_LOCK / 1440
         );
     }
+    out!(
+        "bond retarget        from {} ({BOND_RETARGET_FROM}) a *new* bond doubles every {} \
+         doublings of midwimble's work since genesis, {} to {}; bonds already registered keep \
+         the price they registered at",
+        utc(BOND_RETARGET_FROM),
+        midwimble::core::bond::WORK_DOUBLINGS_PER_BOND_DOUBLING,
+        bond(MIN_MINING_BOND),
+        bond(MAX_MINING_BOND)
+    );
     out!("");
     out!(
         "max supply           {} (8 decimal places, reached exactly)",

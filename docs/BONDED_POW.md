@@ -224,6 +224,52 @@ are at most the full ones, a bond's eligibility still only ever runs down with
 time, which is what lets the set forget a bond for good. Mainnet's early phase
 ends on 2026-10-31 00:00 UTC (`docs/TESTNET.md`).
 
+### The bond retarget
+
+A month after the early phase ends (`BOND_RETARGET_FROM`, 2026-11-30 00:00 UTC
+on mainnet) what a **new** bond must lock starts following midwimble's own
+difficulty:
+
+```text
+registration_min_bond(target, t)
+  = MIN_MINING_BOND << clamp(doublings(target) / WORK_DOUBLINGS_PER_BOND_DOUBLING,
+                             0, MAX_BOND_DOUBLINGS)
+  where doublings(target) = ilog2(work(target)) - ilog2(work(GENESIS_TARGET))
+```
+
+One doubling of the bond per four doublings of work, so a 16-fold rise in
+midwimble's hashrate doubles the bond: 2^37 → 2^38 at 16×, → 2^39 at 256×, and
+no further. A midstate coin's value is a power of two, so the minimum can only
+move in doublings; there is no point measuring the input more finely than the
+output can be set, and the 16× step is far coarser than anything ASERT does
+block to block, so the figure is stable without being averaged.
+
+Two things make this safe to do at all.
+
+**It is a gate on registration only.** `precheck_registrations` is the single
+place it applies. `eligible` keeps asking every bond the launch minimum and
+nothing more, so raising the bar never strands a bond someone has already
+locked, and the bond set's invariant — that eligibility only ever runs down
+with time — is untouched. (A minimum that could *fall* inside `eligible` would
+let a bond the set had already forgotten qualify again.) The retarget prices
+the inflow; the stock follows within one unbonding delay, because a bond's
+eligibility runs out with its lock and re-locking it is a fresh registration at
+whatever the bar is then. Same shape as difficulty steering hashrate: the lever
+acts on the margin and the stock converges.
+
+**The ceiling is the point, not a safety margin.** At `CAP_K` eligible bonds a
+2^37 minimum locks about 9% of midstate's terminal supply, 2^38 about 18% and
+2^39 about 35%. A third step would pass 70%, at which point the bonds *are*
+midstate's supply and there is no liquid market left to price them. Two steps
+is the whole usable range, and the flywheel — midwimble's security paying for
+midstate's demand — has to live inside it.
+
+What the retarget cannot do is raise the *number* of bonds wanted. Demand for
+slots is quantity-inelastic at the cap: `B >= s × CAP_K` sums across producers
+to exactly `CAP_K`, and past that floor another bond buys only variance
+headroom. So the sink grows by price per slot or not at all, which is why the
+input is midwimble's difficulty rather than a target bond count.
+
 where
 
 ```text
@@ -245,9 +291,10 @@ deterministic from midwimble's chain alone.
 
 | Constant | Value | Reason |
 |---|---|---|
-| `MIN_MINING_BOND` | 2^37 units (128 gMDS) | About 9 days of revenue for a miner with 1% of midstate's hashrate (three months at 0.1%): real capital, within a committed miner's reach. It puts 32 gMDS behind every block that counts in full, so once 360 bonds are eligible a day of blocks is backed by 46,080 gMDS. Must be a power of two. A launch parameter (`--min-bond`): a testnet uses 2^24, since nobody will lock real money to test someone else's chain, and the bonded path is exercised just as well by a trivial coin. |
+| `MIN_MINING_BOND` | 2^37 units (128 gMDS) | About 9 days of revenue for a miner with 1% of midstate's hashrate (three months at 0.1%): real capital, within a committed miner's reach. It puts about 9 gMDS behind every block that counts in full (128 gMDS over a bond's 14 full-weight blocks a week), so once `CAP_K` = 720 bonds are eligible block production is backed by 92,160 gMDS — about 9% of midstate's terminal supply. Must be a power of two. A launch parameter (`--min-bond`): a testnet uses 2^24, since nobody will lock real money to test someone else's chain, and the bonded path is exercised just as well by a trivial coin. |
 | `MIN_REMAINING_BOND_LOCK` | 43,200 blocks (30 days) | The effective unbonding delay. Also a launch parameter (`--bond-lock-days`); a testnet uses two days so testers' coins come back quickly. |
 | `EARLY_BONDS_UNTIL`, `EARLY_MIN_MINING_BOND`, `EARLY_MIN_REMAINING_BOND_LOCK` | 2026-10-31 00:00 UTC, 2^24 units, 2,880 blocks | An early phase with a testnet's bond: until it ends, the network is the testnet. Launch parameters (`--early-bonds-until`, `--early-min-bond`, `--early-bond-lock-days`); without one, the full minimums hold from the first block. |
+| `BOND_RETARGET_DELAY`, `WORK_DOUBLINGS_PER_BOND_DOUBLING`, `MAX_BOND_DOUBLINGS` | 30 days, 4, 2 | The bond retarget, from 2026-11-30 00:00 UTC. A month of mainnet at a flat price first, so the bar cannot move out from under a network that has only just opened. Four doublings of work per doubling of the bond: genesis was targeted at a hundredth of midstate's hashrate, so full merged-mining adoption is ~100× — one step — which leaves the second for growth beyond midstate's own hashrate. Two steps because a third would lock most of midstate's supply. |
 | `CLOCK_MARGIN` | 10,080 blocks (7 days) | Covers midstate running ahead of its schedule. |
 | `REGISTRATION_WORK_BLOCKS` | 1,440 | A day, in blocks of the registering block's target. |
 | `REGISTRATION_MIN_HEADERS` | 60 | Caps any one header at 1/60 of the requirement. |
@@ -477,7 +524,9 @@ are consensus state: a snapshot carries a week of headers (10,080), from
 which an importing node rebuilds both exactly (`docs/PRUNING.md` §4), and
 storage treats a missing signer or header in either window as corruption.
 
-A registration must lock at least `MIN_MINING_BOND`, and no further than a year
+A registration must lock at least `registration_min_bond` for the registering
+block's own target and timestamp (the launch minimum until the retarget starts,
+and from then on the retargeted figure), and no further than a year
 (`MAX_BOND_HORIZON`) past the block's estimated midstate height, so a forged
 registration expires instead of holding a quota slot forever.
 

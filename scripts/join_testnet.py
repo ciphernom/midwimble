@@ -52,6 +52,12 @@ MAX_BOND_HORIZON_DAYS = 365
 # What this script protected wallets with while the network was a testnet.
 OLD_DEFAULT_PASSWORD = "testnet"
 # The bond rules a build must carry, as the manifest gives them.
+# A month after the early phase ends, what a *new* bond must lock follows
+# midwimble's difficulty (`core::bond::BOND_RETARGET_FROM`). Only the node
+# knows the current figure, so this script states the rule and lets
+# `midwimble bond register` do the arithmetic.
+BOND_RETARGET_DELAY = 30 * 24 * 60 * 60
+
 RULE_KEYS = ("min_bond", "bond_lock_days", "early_bonds_until", "early_min_bond",
              "early_bond_lock_days")
 
@@ -371,6 +377,12 @@ class Join:
             print(f"  more than {self.net['bond_lock_days']} days of its lock remain, so it is "
                   "locked for that long")
             print("  plus however long you mean to mine.")
+            retarget_from = self.early_until + BOND_RETARGET_DELAY
+            if self.early_until and now >= retarget_from:
+                print(f"  Since {utc(retarget_from)} the chain asks more of a *new* bond as")
+                print("  midwimble's difficulty rises. Registration checks the chain's own figure")
+                print("  and says so if this coin is short; what you lock keeps its price until")
+                print("  its lock ends.")
         else:
             print(f"  An early-phase bond: {value} units of real MDS, {value / (1 << 30):.4f} gMDS:")
             print(f"  enough to be a bond, little enough to throw at a testnet. It mines until the")

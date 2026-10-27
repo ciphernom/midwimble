@@ -605,7 +605,12 @@ fn apply_batch_internal(
     }
 
     // 4b. Registrations, against the relay as this block leaves it.
-    super::bond::precheck_registrations(&base.bonds, &batch.registrations, batch.timestamp)?;
+    super::bond::precheck_registrations(
+        &base.bonds,
+        &batch.registrations,
+        &batch.target,
+        batch.timestamp,
+    )?;
     let registered: Vec<([u8; 32], super::bond::BondEntry)> = batch
         .registrations
         .iter()
