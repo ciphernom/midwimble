@@ -90,6 +90,7 @@
   .empty, .note { color: var(--muted); padding: 14px 20px; }
   .note { font-size: 12px; border-top: 1px solid var(--line); }
   .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .charts.two { grid-template-columns: repeat(auto-fit, minmax(430px, 1fr)); }
   .chart { padding: 12px 20px 14px; border-right: 1px solid var(--line); }
   .chart svg { width: 100%; height: 120px; display: block; margin-top: 6px; }
   .diagram { padding: 14px 20px 18px; }
@@ -112,7 +113,7 @@
 <header>
   <div class="bar-top">
     <a class="brand" href="#/"><img src="/logo.svg" alt=""><b>Midwimble</b></a>
-    <nav><a href="#/">overview</a><a href="#/blocks">blocks</a><a href="#/bonds">bonds</a></nav>
+    <nav><a href="#/">overview</a><a href="#/blocks">blocks</a><a href="#/bonds">bonds</a><a href="#/privacy">privacy</a></nav>
     <form id="search" autocomplete="off">
       <input id="q" placeholder="height, block hash, output commitment, kernel or bond id" spellcheck="false">
       <button>find</button>
@@ -243,6 +244,35 @@ function lineChart(values) {
     svg("polyline", { points: pts.join(" "), fill: "none", stroke: "#a78bfa", "stroke-width": 2, "vector-effect": "non-scaling-stroke" }));
 }
 
+function barChart(values, { colour = "#8b5cf6", log = false, label = String } = {}) {
+  const W = 600, H = 120, f = log ? (v => Math.log10(1 + v)) : (v => v);
+  const max = Math.max(...values.map(f), 1e-9), bw = W / Math.max(values.length, 1);
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none" });
+  values.forEach((v, i) => {
+    if (!v) return;
+    const bh = Math.max(1, (f(v) / max) * (H - 4));
+    const r = svg("rect", { x: i * bw, y: H - bh, width: Math.max(0.8, bw - 0.5), height: bh, fill: colour, opacity: .8 });
+    r.appendChild(svg("title")).textContent = label(v, i);
+    s.appendChild(r);
+  });
+  return s;
+}
+/// A 0..1 series as a filled area, for shares that only make sense against
+/// their own ceiling.
+function shareChart(values, colour, label = String) {
+  const W = 600, H = 120, n = Math.max(values.length - 1, 1);
+  const pts = values.map((v, i) => `${(i / n) * W},${H - 6 - Math.max(0, Math.min(1, v)) * (H - 12)}`);
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none" },
+    svg("polygon", { points: `0,${H} ` + pts.join(" ") + ` ${W},${H}`, fill: colour, opacity: .18 }),
+    svg("polyline", { points: pts.join(" "), fill: "none", stroke: colour, "stroke-width": 2, "vector-effect": "non-scaling-stroke" }));
+  values.forEach((v, i) => {
+    const t = svg("rect", { x: (i / n) * W - 1, y: 0, width: 2, height: H, fill: "transparent" });
+    t.appendChild(svg("title")).textContent = label(v, i);
+    s.appendChild(t);
+  });
+  return s;
+}
+
 // ---------- diagrams ------------------------------------------------------
 // Everything below draws what the chain actually records. On this chain a
 // block is one aggregated transaction: its inputs and kernels are flattened
@@ -252,58 +282,93 @@ function lineChart(values) {
 const COL = { in: "#8b5cf6", out: "#00ff41", kern: "#a78bfa", faint: "rgba(167,139,250,.5)" };
 const slot = (i, n, from, to) => from + ((i + 0.5) * (to - from)) / Math.max(n, 1);
 
+// Ages colour an input by how long its output sat before this block spent
+// it: a cooling ramp, not a warning one -- an old coin is interesting, not
+// wrong.
+const AGE_BANDS = [[10, "#8b5cf6", "\u226410 blocks"], [100, "#a78bfa", "\u2264100"],
+                   [1000, "#c4b5fd", "\u22641k"], [Infinity, "#e9e4ff", ">1k"]];
+const ageColour = a => a == null ? "#4a4458" : (AGE_BANDS.find(([hi]) => a <= hi) || AGE_BANDS[3])[1];
+
 function anatomyDiagram(b) {
   const ins = b.inputs || [];
-  const groups = (b.output_groups || []).map((g, gi) => ({ ...g, gi }));
+  const groups = (b.output_groups || []).map((g, gi) => ({ ...g, gi, coinbase: false }));
+  if (b.coinbase) groups.unshift({ gi: -1, coinbase: true, outputs: b.coinbase.outputs.length,
+    range_proof_bytes: b.coinbase.range_proof_bytes, commitments: b.coinbase.outputs.map(o => o.commitment) });
   const outs = [];
   groups.forEach(g => (g.commitments || []).forEach(c => outs.push({ g, c })));
+  const kerns = (b.kernels || []).concat(b.coinbase ? [b.coinbase.kernel] : []);
   if (!ins.length && !outs.length) return h("div", { class: "empty" }, "nothing to draw: this block carries no transactions");
 
   const CAPN = 28;
-  const si = ins.slice(0, CAPN), so = outs.slice(0, CAPN);
-  const W = 680, pad = 22;
-  const H = Math.max(150, 2 * pad + Math.max(si.length, so.length) * 20);
-  const xIn = 104, xOut = W - 150;
+  const si = ins.slice(0, CAPN), so = outs.slice(0, CAPN), sk = kerns.slice(0, CAPN);
+  const W = 760, pad = 24;
+  const H = Math.max(170, 2 * pad + Math.max(si.length, so.length, sk.length) * 20);
+  const xIn = 96, xKern = W / 2 - 30, xOut = W - 210;
   const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
   const yi = i => slot(i, si.length, pad, H - pad);
   const yo = i => slot(i, so.length, pad, H - pad);
+  const yk = i => slot(i, sk.length, pad + 6, H - pad - 6);
 
-  // The anonymity set: every input could have funded every output. Drawn
-  // faintly and in full while that stays legible, as a band once it would
-  // not. Either way it is the same claim -- no edge here is recorded.
+  // Every pairing the chain leaves consistent, drawn behind everything else.
   const edges = si.length * so.length;
   if (edges && edges <= 420) {
     si.forEach((_, i) => so.forEach((_, j) => s.appendChild(svg("line", {
       x1: xIn + 7, y1: yi(i), x2: xOut - 7, y2: yo(j),
-      stroke: COL.faint, "stroke-width": 0.4, opacity: Math.max(0.05, 1.6 / Math.sqrt(edges)),
+      stroke: "rgba(167,139,250,.5)", "stroke-width": 0.4, opacity: Math.max(0.05, 1.6 / Math.sqrt(edges)),
     }))));
   } else if (edges) {
-    s.appendChild(svg("path", {
-      d: `M${xIn + 7},${yi(0)} L${xOut - 7},${yo(0)} L${xOut - 7},${yo(so.length - 1)} L${xIn + 7},${yi(si.length - 1)} Z`,
-      fill: COL.faint, opacity: .07,
-    }));
+    s.appendChild(svg("path", { d: `M${xIn + 7},${yi(0)} L${xOut - 7},${yo(0)} L${xOut - 7},${yo(so.length - 1)} L${xIn + 7},${yi(si.length - 1)} Z`,
+      fill: "rgba(167,139,250,.5)", opacity: .07 }));
   }
 
+  // Kernels float in the middle on their own backing, deliberately wired to
+  // nothing: a kernel proves some transaction balanced, never which one.
+  sk.forEach((k, i) => {
+    const y = yk(i);
+    s.appendChild(svg("rect", { x: xKern - 30, y: y - 8, width: 60, height: 16, rx: 8, fill: "#07070a", opacity: .92 }));
+    const d = svg("path", { d: `M${xKern - 7},${y} L${xKern},${y - 6} L${xKern + 7},${y} L${xKern},${y + 6} Z`,
+      fill: "#a78bfa", opacity: .9 });
+    d.appendChild(svg("title")).textContent =
+      (k.fee ? "fee " + coins(k.fee) : "no fee") + "\n" + k.excess + "\nproves a transaction balanced \u2014 not which one";
+    s.appendChild(d);
+  });
+
   si.forEach((inp, i) => {
-    const r = svg("rect", { x: xIn - 7, y: yi(i) - 6, width: 14, height: 12, rx: 3, fill: COL.in, opacity: .85 });
-    r.appendChild(svg("title")).textContent =
-      inp.commitment + (inp.created_height != null ? "\ncreated in block " + inp.created_height : "\ncreating block not indexed");
+    const age = inp.created_height != null ? b.height - inp.created_height : null;
+    const r = svg("rect", { x: xIn - 7, y: yi(i) - 6, width: 14, height: 12, rx: 3, fill: ageColour(age), opacity: .9 });
+    r.appendChild(svg("title")).textContent = inp.commitment +
+      (age != null ? "\ncreated in block " + inp.created_height + " \u2014 " + age + " blocks earlier" : "\ncreating block not indexed");
     s.appendChild(r);
   });
+
+  // Outputs, boxed by the transaction that made them. Hovering a box lifts
+  // its members and dims the rest: the one link aggregation leaves standing.
+  const allOut = [];
   groups.forEach(g => {
     const mine = so.map((o, i) => [o, i]).filter(([o]) => o.g === g).map(([, i]) => i);
     if (!mine.length) return;
     const top = yo(mine[0]) - 11, bot = yo(mine[mine.length - 1]) + 11;
-    s.appendChild(svg("rect", { x: xOut - 13, y: top, width: 124, height: bot - top, rx: 7,
-      fill: "rgba(0,255,65,.05)", stroke: "rgba(0,255,65,.3)", "stroke-width": 1 }));
-    const t = svg("text", { x: xOut + 20, y: (top + bot) / 2 + 4, fill: COL.out, "font-size": 10, opacity: .85 });
-    t.textContent = "tx \u00b7 " + g.outputs + " out \u00b7 " + g.range_proof_bytes + "B";
+    const stroke = g.coinbase ? "rgba(245,196,81,.45)" : "rgba(0,255,65,.3)";
+    const box = svg("rect", { x: xOut - 13, y: top, width: 186, height: bot - top, rx: 7,
+      fill: g.coinbase ? "rgba(245,196,81,.05)" : "rgba(0,255,65,.05)", stroke, "stroke-width": 1 });
+    s.appendChild(box);
+    const t = svg("text", { x: xOut + 20, y: (top + bot) / 2 + 4, fill: g.coinbase ? "#f5c451" : "#00ff41", "font-size": 10, opacity: .9 });
+    t.textContent = (g.coinbase ? "coinbase" : "tx") + " \u00b7 " + g.outputs + " out \u00b7 " + g.range_proof_bytes + "B";
     s.appendChild(t);
-  });
-  so.forEach((o, i) => {
-    const r = svg("rect", { x: xOut - 7, y: yo(i) - 6, width: 14, height: 12, rx: 3, fill: COL.out, opacity: .85 });
-    r.appendChild(svg("title")).textContent = o.c;
-    s.appendChild(r);
+    const mates = mine.map(i => {
+      const o = so[i];
+      const r = svg("rect", { x: xOut - 7, y: yo(i) - 6, width: 14, height: 12, rx: 3,
+        fill: g.coinbase ? "#f5c451" : "#00ff41", opacity: .85 });
+      r.appendChild(svg("title")).textContent = o.c + (g.coinbase ? "\ncoinbase output, value public" : "\ncreated with " + (g.outputs - 1) + " sibling" + (g.outputs === 2 ? "" : "s"));
+      s.appendChild(r);
+      allOut.push(r);
+      return r;
+    });
+    if (g.outputs > 1) {
+      const lift = on => allOut.forEach(r => r.setAttribute("opacity", mates.includes(r) ? (on ? 1 : .85) : (on ? .2 : .85)));
+      [box, t].forEach(e => { e.addEventListener("mouseenter", () => lift(true)); e.addEventListener("mouseleave", () => lift(false)); });
+      box.setAttribute("style", "cursor: help");
+    }
   });
 
   const label = (x, y, txt, fill, anchor) => {
@@ -311,15 +376,26 @@ function anatomyDiagram(b) {
     t.textContent = txt;
     return t;
   };
-  s.appendChild(label(xIn, 13, (b.inputs || []).length + " inputs", COL.in, "middle"));
-  s.appendChild(label(xOut, 13, (b.outputs || []).length + " outputs", COL.out, "middle"));
-  s.appendChild(label(W / 2, H - 5, (b.kernels || []).length + " kernels \u2014 no input\u2013output link is recorded", "#9c98aa", "middle"));
-  if (ins.length > CAPN) s.appendChild(label(xIn, H - 5, "+" + (ins.length - CAPN) + " more", "#9c98aa", "middle"));
-  if (outs.length > CAPN) s.appendChild(label(xOut, H - 5, "+" + (outs.length - CAPN) + " more", "#9c98aa", "middle"));
-  return h("div", { class: "diagram" }, s, h("div", { class: "legend" },
-    h("span", null, h("i", { style: "background:" + COL.in }), "input, sorted by commitment"),
-    h("span", null, h("i", { style: "background:" + COL.out }), "output, boxed with its transaction's siblings"),
-    h("span", null, h("i", { style: "background:" + COL.faint }), "every pairing the chain permits")));
+  s.appendChild(label(xIn, 14, ins.length + " inputs", "#8b5cf6", "middle"));
+  s.appendChild(label(xKern, 14, kerns.length + " kernels", "#a78bfa", "middle"));
+  const funded = (b.outputs || []).length;
+  s.appendChild(label(xOut + 10, 14, funded + " outputs" + (b.coinbase ? " + coinbase" : ""), "#00ff41", "middle"));
+  s.appendChild(label(xKern, H - 6, "wired to nothing \u2014 a kernel proves a transaction balanced, never which one", "#9c98aa", "middle"));
+  if (ins.length > CAPN) s.appendChild(label(xIn, H - 6, "+" + (ins.length - CAPN) + " more", "#9c98aa", "middle"));
+
+  // The coinbase is minted rather than funded, so it is not a candidate for
+  // any input and stays out of the count.
+  const pairings = ins.length * funded;
+  return h("div", { class: "diagram" }, s,
+    h("div", { class: "legend" },
+      h("span", null, h("i", { style: "background:#00ff41" }), "output \u00b7 boxed with its transaction's siblings"),
+      h("span", null, h("i", { style: "background:#f5c451" }), "coinbase \u00b7 value public"),
+      h("span", null, h("i", { style: "background:#a78bfa" }), "kernel"),
+      ...AGE_BANDS.map(([, c, t]) => h("span", null, h("i", { style: "background:" + c }), "input " + t))),
+    h("div", { class: "legend" }, h("span", null,
+      pairings
+        ? num(ins.length) + " inputs \u00d7 " + num(funded) + " funded outputs = " + num(pairings) + " assignments the chain leaves consistent"
+        : "nothing to pair: this block spends nothing")));
 }
 
 // Where this block's coins came from and went. The only transaction graph
@@ -378,12 +454,12 @@ function ageHistogram(b) {
   const buckets = [[1, 1, "same\u2011ish"], [2, 10, "2\u201310"], [11, 100, "11\u2013100"], [101, 1000, "101\u20131k"],
                    [1001, 10000, "1k\u201310k"], [10001, Infinity, "10k+"]];
   const counts = buckets.map(([lo, hi]) => ages.filter(a => a >= lo && a <= hi).length);
-  const W = 680, H = 120, max = Math.max(1, ...counts), bw = W / counts.length;
+  const W = 680, H = 96, max = Math.max(1, ...counts), bw = W / counts.length;
   const s = svg("svg", { viewBox: `0 0 ${W} ${H}` });
   counts.forEach((c, i) => {
     const bh = (c / max) * (H - 34);
     if (c) {
-      const r = svg("rect", { x: i * bw + 10, y: H - 22 - bh, width: bw - 20, height: Math.max(2, bh), rx: 3, fill: COL.in, opacity: .8 });
+      const r = svg("rect", { x: i * bw + bw * 0.3, y: H - 22 - bh, width: bw * 0.4, height: Math.max(2, bh), rx: 3, fill: COL.in, opacity: .8 });
       r.appendChild(svg("title")).textContent = c + " spent after " + buckets[i][2] + " blocks";
       s.appendChild(r);
       const v = svg("text", { x: i * bw + bw / 2, y: H - 26 - bh, fill: "#f4f3f7", "font-size": 11, "text-anchor": "middle" });
@@ -677,6 +753,58 @@ async function bondPage(m) {
       b.recent_blocks.length ? h("div", { class: "empty" }, b.recent_blocks.map((x, i) => [i ? " · " : null, link("block", x, num(x))])) : h("div", { class: "empty" }, "none yet")));
 }
 
+async function privacyPage() {
+  const r = await get("/explorer/blocks?count=200");
+  const b = r.blocks.slice().reverse();                // oldest first
+  const outs = b.map(x => x.body_outputs != null ? x.body_outputs : x.outputs);
+  const txs = b.map(x => x.kernels);                   // one kernel, one transaction
+  const linked = b.map(x => x.linked_outputs || 0);
+  const pairs = b.map((x, i) => x.inputs * outs[i]);
+  const mix = b.map((x, i) => txs[i] ? (x.inputs + outs[i]) / txs[i] : 0);
+  const carried = b.map((x, i) => i).filter(i => outs[i] > 0);
+  const share = carried.map(i => linked[i] / outs[i]);
+
+  const sum = a => a.reduce((p, c) => p + c, 0);
+  const busy = b.filter((_, i) => txs[i] > 0).length;
+  const totOut = sum(outs), totLinked = sum(linked), totTx = sum(txs);
+  const meanPairs = busy ? sum(pairs) / busy : 0;
+  const meanMix = busy ? sum(mix.filter((_, i) => txs[i] > 0)) / busy : 0;
+  const pct = x => (x * 100).toFixed(1) + "%";
+
+  const stats = h("div", { class: "grid" },
+    cell("blocks examined", num(b.length)),
+    cell("carried a transaction", num(busy)),
+    cell("transactions", num(totTx)),
+    cell("mean pairings a block", busy ? num(Math.round(meanPairs)) : "\u2014"),
+    cell("outputs with a public sibling", totOut ? pct(totLinked / totOut) : "\u2014"),
+    cell("mean aggregation", busy ? meanMix.toFixed(2) + " in+out per tx" : "\u2014", true));
+
+  const charts = h("div", { class: "charts two" },
+    h("div", { class: "chart" }, h("div", { class: "k" }, "pairings a block permits \u00b7 log scale"),
+      barChart(pairs, { log: true, colour: "#8b5cf6", label: (v, i) => v + " pairings in block " + b[i].height })),
+    h("div", { class: "chart" }, h("div", { class: "k" }, "share of outputs with a public sibling \u00b7 blocks carrying transactions"),
+      carried.length
+        ? shareChart(share, "#f5c451", (v, k) => pct(v) + " of " + outs[carried[k]] + " outputs in block " + b[carried[k]].height)
+        : h("div", { class: "empty" }, "no transactions in this span")),
+    h("div", { class: "chart" }, h("div", { class: "k" }, "transactions a block"),
+      barChart(txs, { colour: "#00ff41", label: (v, i) => v + " in block " + b[i].height })),
+    h("div", { class: "chart" }, h("div", { class: "k" }, "aggregation \u00b7 inputs+outputs per transaction"),
+      barChart(mix, { colour: "#a78bfa", label: (v, i) => v.toFixed(2) + " in block " + b[i].height })));
+
+  view.replaceChildren(
+    h("div", { class: "title" }, h("h1", null, "Privacy"), h("span", { class: "dim" }, "what this chain does and does not reveal, over its last " + num(b.length) + " blocks")),
+    section("Measured", "refreshes every 20s", stats, charts),
+    section("What each number means", null,
+      dl([
+        ["pairings", "A block is one aggregated transaction, so any of its inputs could have funded any of its outputs: inputs \u00d7 outputs is how many assignments the chain leaves consistent. One input and one output in a block means no ambiguity at all \u2014 the pairing is forced. The number grows fastest when unrelated transactions land in the same block, which is why a busy block is a private one."],
+        ["public sibling", "Outputs that share a range proof were created by one transaction (" + "an " + "output group), and that grouping survives aggregation. For the usual payment-and-change transaction it publicly ties the two together, which is the one linkage this chain does not erase. A wallet can avoid it by proving each output on its own, at the cost of a larger proof; this is the share that did not."],
+        ["transactions", "One kernel is one transaction that balanced in this block. Kernels are sorted by id, so their order says nothing about which outputs are theirs."],
+        ["aggregation", "Inputs plus outputs divided by transactions: how much unrelated traffic each block merged into one body. Higher is better \u2014 it is the ratio that makes the pairings above ambiguous."],
+      ]),
+      h("div", { class: "note" }, "Nothing here reads an amount, an address or a sender: the chain records none of them. These are structural measures of how much the aggregation hides, which is the only privacy property a third party can check for itself.")));
+  schedule(privacyPage, 20000);
+}
+
 // ---------- routing, refresh, search ---------------------------------------
 let timer = null, generation = 0;
 function schedule(fn, ms) {
@@ -691,6 +819,7 @@ const routes = [
   [/^#\/output\/([0-9a-fA-F]{64})$/, outputPage],
   [/^#\/kernel\/([0-9a-fA-F]{64})$/, kernelPage],
   [/^#\/bonds$/, bondsPage],
+  [/^#\/privacy$/, privacyPage],
   [/^#\/bond\/([0-9a-fA-F]{64})$/, bondPage],
 ];
 async function route() {

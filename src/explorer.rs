@@ -270,6 +270,22 @@ fn summary(height: u64, b: &Batch, prev_timestamp: Option<u64>, minted: Option<u
         "inputs": b.body.body.inputs.len(),
         "outputs": body_outputs(b).count() + coinbase_outputs(b).count(),
         "kernels": b.body.body.kernels.len(),
+        // Privacy structure, per block. A kernel is one transaction that
+        // balanced here, and an output group is one transaction's outputs
+        // (`mw::transaction::OutputGroup`). `linked_outputs` counts the
+        // outputs that share their group with a sibling: those are the only
+        // outputs on this chain whose common origin is public, so the pair
+        // is the one linkage aggregation does not erase.
+        "groups": b.body.body.outputs.len(),
+        "linked_outputs": b
+            .body
+            .body
+            .outputs
+            .iter()
+            .filter(|g| g.outputs.len() > 1)
+            .map(|g| g.outputs.len())
+            .sum::<usize>(),
+        "body_outputs": body_outputs(b).count(),
         "fees": fees(b),
         "reward": scheduled,
         "minted": minted,
