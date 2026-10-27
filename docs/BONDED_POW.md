@@ -254,7 +254,7 @@ deterministic from midwimble's chain alone.
 | `MAX_RELAY_HEADERS_PER_BLOCK` | 1,440 | A day of midstate headers: enough to catch up, or to relay a launch's first bond with its burial. Bounds what a block can make every node verify. |
 | `RELAY_WINDOW` | 2,880 | Two days of midstate headers kept: registrations and forks must be this recent. |
 | `RELAY_MAX_FUTURE` | 30 minutes | How far a relayed header's timestamp may be past its block's: twice the future limit of either chain, so real headers always fit and fake ones cannot claim time that has not passed. |
-| `CAP_WINDOW`, `CAP_K` | 1,440 blocks, 360 | Four full-weight blocks a bond a day (the per-bond cap, below). |
+| `CAP_WINDOW`, `CAP_K` | 10,080 blocks (7 days), 720 | Fourteen full-weight blocks a bond a week, two a day (the per-bond cap, below). |
 | `WORK_CAP_WINDOW` | 10,080 blocks (7 days) | No block counts for more than a quarter above the lowest of the week before it (the work cap, below). |
 
 ## How much work a registration needs
@@ -397,11 +397,12 @@ A pool's block capacity scales with the bonds behind it. Anyone can lock a
 bond naming the pool's mining key: they keep the owner key, so only they can
 ever spend the coin, and the pool signs blocks with the bond.
 
-**The cap is a fork-choice rule, not a validity rule.** Over any 1,440 blocks
-(`CAP_WINDOW`), a bond adds full work to its chain's weight for at most
-`ceil(1440 / min(eligible bonds, 360))` of them (`CAP_K = 360`): four blocks
-a day once 360 or more bonds are eligible. Blocks beyond that stay valid and
-pay, but add only 1/1024 of their work. So:
+**The cap is a fork-choice rule, not a validity rule.** Over any 10,080 blocks
+(`CAP_WINDOW`, a week), a bond adds full work to its chain's weight for at most
+`ceil(10080 / min(eligible bonds, 720))` of them (`CAP_K = 720`): fourteen
+blocks a week, two a day, once 720 or more bonds are eligible. Blocks beyond
+that stay valid, but add only 1/1024 of their work and, from the mainnet
+switch, mint only `cap / n` of their subsidy. So:
 
 - the chain never stalls: a lone producer can always extend it, and a longer
   chain is always a heavier one;
@@ -412,14 +413,19 @@ pay, but add only 1/1024 of their work. So:
 - the cap counts *registered, eligible* bonds, not recent signers. On an
   attacker's private chain the attacker is the only signer, so a cap measured
   by signers would lift exactly where it is needed;
-- a pool with a share `s` of the hashrate needs about `360 × s` bonds for all
-  of its blocks to count in full: 108 bonds at 30%. Covering the whole
-  network takes 360 bonds, so the capital locked behind block production
-  grows with the hashrate it covers, while a miner with less than 1/360 of it
-  needs only its one bond.
+- a pool with a share `s` of the hashrate needs about `720 × s` bonds for all
+  of its blocks to count in full: 216 bonds at 30%. Covering the whole
+  network takes 720 bonds, so the capital locked behind block production
+  grows with the hashrate it covers, while a miner with less than 1/720 of it
+  needs only its one bond. `CAP_K` alone sets that requirement: the window
+  cancels out of `s × W / B <= W / CAP_K`, leaving `B >= s × CAP_K`. The
+  window instead sets how many blocks the cap is counted over, and so how
+  much of a bond's quota ordinary luck wastes -- a week is long enough that a
+  producer provisioned at its cap keeps nearly all of its pay, where a day
+  cost it about a fifth.
 
-While the network has fewer than 360 eligible bonds, they share the window
-equally, and a lone producer is uncapped. The window is the last 1,440 blocks,
+While the network has fewer than 720 eligible bonds, they share the window
+equally, and a lone producer is uncapped. The window is the last 10,080 blocks,
 the new one included. It is not part of the state root: nodes rebuild it from
 their stored blocks. Cumulative work, which checkpoints and anchors measure, is
 unchanged; fork choice compares it less the work the caps withheld.

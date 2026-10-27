@@ -1131,24 +1131,40 @@ pub fn bond_proof_from_json(coin: BondCoin, v: &serde_json::Value) -> Result<Bon
 // --- Fork-choice cap (co-bonded mining) -------------------------------------
 
 /// Over any `CAP_WINDOW` blocks, one bond adds full work to fork choice for at
-/// most `signer_cap` of them. Blocks beyond that stay valid and pay, but add
-/// only `1 / OVER_CAP_WORK_DIVISOR` of their work, so a chain outweighs another
-/// only with enough bonds behind its hashrate: a pool's capacity scales with
-/// the bonds co-signed to its mining key.
+/// most `signer_cap` of them. Blocks beyond that stay valid, but add only
+/// `1 / OVER_CAP_WORK_DIVISOR` of their work and mint only `cap / n` of their
+/// subsidy ([`capped_subsidy`]), so a chain outweighs another only with enough
+/// bonds behind its hashrate: a pool's capacity scales with the bonds
+/// co-signed to its mining key.
+///
+/// A week, not a day. The window does not change how many bonds a producer
+/// needs -- that is [`CAP_K`] alone -- it changes how many blocks the cap is
+/// counted over, and so how much of a bond's quota ordinary luck wastes. Over
+/// a day a bond's quota is small enough that a producer provisioned exactly at
+/// its cap keeps only about four fifths of its pay; over a week the count is
+/// large enough to keep nearly all of it, for the same bonds.
 #[cfg(not(feature = "fast-mining"))]
-pub const CAP_WINDOW: usize = 24 * 60;
+pub const CAP_WINDOW: usize = 7 * 24 * 60;
 /// Test and devnet builds use a small window, so the cap is reachable.
 #[cfg(feature = "fast-mining")]
 pub const CAP_WINDOW: usize = 16;
 /// With at least this many eligible bonds, each may sign `1 / CAP_K` of the
 /// window at full weight; with fewer, they share it equally.
 ///
-/// 360 divides the window exactly: four full-weight blocks a bond a day. A
-/// pool with a share `s` of the hashrate then needs about `360 × s` bonds (108
-/// at 30%), so the capital behind block production grows with the hashrate it
-/// covers, while a miner with less than 1/360 of it needs only its one bond.
+/// 720 divides the window exactly: fourteen full-weight blocks a bond a week,
+/// two a day. A pool with a share `s` of the hashrate then needs about
+/// `720 × s` bonds (216 at 30%), so the capital behind block production grows
+/// with the hashrate it covers, while a miner with less than 1/720 of it needs
+/// only its one bond.
+///
+/// This divisor alone sets that requirement: untapered needs `s × W / B <= W /
+/// CAP_K`, and the window cancels, leaving `B >= s × CAP_K`. Raising it asks
+/// more bonds of a large producer without touching a small one, which is also
+/// what deepens the pool of midstate locked behind the chain. It binds only
+/// once this many bonds are registered; until then the bonds share the window
+/// equally and the floor never applies.
 #[cfg(not(feature = "fast-mining"))]
-pub const CAP_K: usize = 360;
+pub const CAP_K: usize = 720;
 #[cfg(feature = "fast-mining")]
 pub const CAP_K: usize = 4;
 pub const OVER_CAP_WORK_DIVISOR: u128 = 1024;
@@ -1633,7 +1649,7 @@ mod cap_tests {
         assert_eq!(just_over, (reward as u128 * 36 / 37) as u64);
         assert!(just_over < reward && just_over > reward - reward / 36);
         // Far past it, pay falls off with the overshoot. The bond that signed
-        // 1,387 of the last 1,440 against a cap of 36 keeps about 2.6%.
+        // 1,387 blocks of a window against a cap of 36 keeps about 2.6%.
         assert_eq!(capped_subsidy(reward, 72, 36), reward / 2);
         assert_eq!(
             capped_subsidy(reward, 1_387, 36),
