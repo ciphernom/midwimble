@@ -27,6 +27,11 @@ pub struct BlockTemplate {
     pub mining_hash: [u8; 32],
     pub height: u64,
     pub fees: u64,
+    /// What this block's coinbase may mint: the scheduled reward, less
+    /// whatever the per-bond cap tapered away (`bond::capped_subsidy`). A
+    /// pool proportions its payouts against this, not against the schedule,
+    /// or it pays out more than the block actually mints.
+    pub subsidy: u64,
 }
 
 impl BlockTemplate {
@@ -95,6 +100,7 @@ pub fn rebind(
         batch,
         height: template.height,
         fees: template.fees,
+        subsidy: template.subsidy,
     })
 }
 
@@ -449,9 +455,15 @@ pub fn build_template_relayed(
         })
         .collect::<Result<_>>()?;
 
-    let mut next = apply_body(state_after_relay, &body, coinbase.as_ref())?;
-    super::state::apply_registrations(&mut next, &registered)?;
-    let state_root = next.state_root();
+    // The bond set this block leaves behind. Both the signer and the cap its
+    // pay is judged against have to be settled before the coinbase is built,
+    // so the registrations this block carries are folded in here rather than
+    // waiting for `apply_registrations` below (which repeats the duplicate
+    // check and is where a clash is reported).
+    let mut bonds_after = state_after_relay.bonds.clone();
+    for (id, entry) in &registered {
+        bonds_after.insert(*id, *entry);
+    }
 
     // The signer: whichever of the producer's bonds can sign, or none. From
     // BONDED_MINING_FROM a block must be signed whenever any registered bond
@@ -459,10 +471,10 @@ pub fn build_template_relayed(
     // can sign mines only while no other bond can either. A producer with a
     // bond holds to that before then too, rather than mine unsigned blocks
     // its bond was configured to sign.
-    let signer = bond.and_then(|b| b.signer_for(&next.bonds, &state.signer_counts, timestamp));
+    let signer = bond.and_then(|b| b.signer_for(&bonds_after, &state.signer_counts, timestamp));
     if signer.is_none()
         && (bond.is_some() || height >= BONDED_MINING_FROM)
-        && crate::core::bond::any_can_sign(&next.bonds, timestamp)
+        && crate::core::bond::any_can_sign(&bonds_after, timestamp)
     {
         return Err(not_ready.unwrap_or_else(|| match bond {
             Some(_) if retired => anyhow!(
@@ -489,12 +501,51 @@ pub fn build_template_relayed(
     let credited = crate::core::bond::credit_in_window(
         &mut recent,
         &mut counts,
-        &next.bonds,
+        &bonds_after,
         height,
         signer,
         creditable,
         timestamp,
     );
+
+    // What this block may mint, by the rule `state::apply_batch` will judge
+    // it against: `credit_in_window` has just counted this block, so
+    // `counts[signer]` is `n`. Past the cap the subsidy tapers and the
+    // remainder is burned, so the coinbase paid above -- which claimed the
+    // whole scheduled reward -- has to be paid again at the lower figure, or
+    // the chain rejects this producer's own block.
+    let subsidy = match signer {
+        Some(id) if timestamp >= crate::core::bond::EARLY_BONDS_UNTIL => {
+            let n = counts.get(&id).copied().unwrap_or(0) as usize;
+            let cap = crate::core::bond::signer_cap(&bonds_after, timestamp);
+            crate::core::bond::capped_subsidy(block_reward(height), n, cap)
+        }
+        _ => block_reward(height),
+    };
+    // Re-pay the coinbase at the tapered figure. It can only ever shrink (a
+    // smaller total drops payouts, never adds them), so the block cannot
+    // outgrow the room the relay was chosen for: a lighter coinbase leaves
+    // headers unrelayed, never a block over weight.
+    let (coinbase, receipts) = if subsidy == block_reward(height) {
+        (coinbase, receipts)
+    } else {
+        let amount = subsidy
+            .checked_add(fees)
+            .ok_or_else(|| anyhow!("reward overflow"))?;
+        if amount == 0 {
+            (None, Vec::new())
+        } else {
+            let split = split_by_weight(amount, payouts)?;
+            let (cb, cb_receipts) = build_coinbase_with(&split, extra)?;
+            let cb_receipts: Vec<(StealthAddress, PayoutReceipt)> =
+                split.iter().map(|(a, _)| *a).zip(cb_receipts).collect();
+            (Some(cb), cb_receipts)
+        }
+    };
+
+    let mut next = apply_body(state_after_relay, &body, coinbase.as_ref(), subsidy)?;
+    super::state::apply_registrations(&mut next, &registered)?;
+    let state_root = next.state_root();
     let mut batch = Batch {
         prev_midstate: state.mw_midstate,
         prev_header_hash: state.header_hash,
@@ -515,7 +566,7 @@ pub fn build_template_relayed(
     };
     // Structural self-check (skip proofs: they were verified on admission and
     // the coinbase was just built here).
-    validate_block_contents(&batch, height, true)?;
+    validate_block_contents(&batch, height, true, subsidy)?;
     if let (Some(bond), Some(signer)) = (bond, signer) {
         let message = authorization_message(&state.mw_midstate, &batch);
         batch.miner = Some(MinerAuth {
@@ -535,6 +586,7 @@ pub fn build_template_relayed(
             mining_hash,
             height,
             fees,
+            subsidy,
         },
         receipts,
     ))

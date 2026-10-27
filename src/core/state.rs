@@ -264,7 +264,12 @@ pub fn apply_batch_trusted(
 /// Stateless rules for a block's contents: structure, weight, cross-checks
 /// between body and coinbase, both balance equations and (unless skipped)
 /// every proof and signature.
-pub fn validate_block_contents(batch: &Batch, height: u64, skip_crypto: bool) -> Result<()> {
+pub fn validate_block_contents(
+    batch: &Batch,
+    height: u64,
+    skip_crypto: bool,
+    subsidy: u64,
+) -> Result<()> {
     let is_genesis = height == 0;
     let body = &batch.body;
     body.validate_structure(Context::Block)?;
@@ -302,7 +307,7 @@ pub fn validate_block_contents(batch: &Batch, height: u64, skip_crypto: bool) ->
     // always be claimed: an unclaimed fee would leave the chain's Pedersen
     // audit (`State::verify_supply`) unbalanced forever.
     let fees = body.fee()?;
-    let amount = block_reward(height)
+    let amount = subsidy
         .checked_add(fees)
         .ok_or_else(|| anyhow!("reward overflow"))?;
 
@@ -387,7 +392,12 @@ pub fn validate_block_contents(batch: &Batch, height: u64, skip_crypto: bool) ->
 /// Does not touch the chain-linkage fields (`midstate`, `header_hash`,
 /// `chain_mmr`, `depth`, `height`, `timestamp`, `target`), so the result's
 /// [`State::state_root`] is exactly what the block must commit to.
-pub fn apply_body(state: &State, body: &Transaction, coinbase: Option<&Coinbase>) -> Result<State> {
+pub fn apply_body(
+    state: &State,
+    body: &Transaction,
+    coinbase: Option<&Coinbase>,
+    subsidy: u64,
+) -> Result<State> {
     let height = state.height;
     let mut next = state.clone();
 
@@ -473,15 +483,20 @@ pub fn apply_body(state: &State, body: &Transaction, coinbase: Option<&Coinbase>
         scalar_from_bytes(&body.kernel_offset).ok_or_else(|| anyhow!("invalid kernel offset"))?;
     next.total_kernel_offset = (total + offset).to_bytes();
 
-    // The supply is a pure function of height: whatever the block's shape,
-    // it mints exactly what the schedule allows, and nothing after the cap.
+    // The schedule is a ceiling, not an amount. A block mints `subsidy`: the
+    // whole scheduled reward, until the per-bond cap tapers it
+    // (`bond::capped_subsidy`). What the taper withholds is never minted, so
+    // supply stays at or below the schedule and parts from it for good — the
+    // chain's final supply is under MAX_SUPPLY by every block's withholding.
+    // `State::verify_supply` audits the Pedersen sums against this tracked
+    // supply rather than the schedule, so a burn leaves the audit balanced.
     next.supply = next
         .supply
-        .checked_add(block_reward(height))
+        .checked_add(subsidy)
         .ok_or_else(|| anyhow!("supply overflow"))?;
-    if next.supply != issued_before(height + 1) {
+    if next.supply > issued_before(height + 1) {
         bail!(
-            "supply {} does not match the emission schedule at height {}",
+            "supply {} exceeds the emission schedule at height {}",
             next.supply,
             height
         );
@@ -644,11 +659,27 @@ fn apply_batch_internal(
         );
     }
 
+    // 5a-ii. What this block may mint. `credit_in_window` has just counted
+    //     this block, so `counts[signer]` is `n`: the blocks its bond signed
+    //     in the last CAP_WINDOW, this one included. Over its cap the subsidy
+    //     tapers as `reward × cap / n`, on the same test that just dropped an
+    //     over-cap block's work to a sliver, and what is withheld is burned
+    //     rather than paid to anyone. Unsigned blocks, and every block stamped
+    //     before the mainnet switch, mint the full scheduled reward.
+    let subsidy = match signer {
+        Some(id) if batch.timestamp >= super::bond::EARLY_BONDS_UNTIL => {
+            let n = counts.get(&id).copied().unwrap_or(0) as usize;
+            let cap = super::bond::signer_cap(&bonds, batch.timestamp);
+            super::bond::capped_subsidy(block_reward(height), n, cap)
+        }
+        _ => block_reward(height),
+    };
+
     // 5b. Contents: structure, balances, proofs and signatures.
-    validate_block_contents(batch, height, skip_crypto)?;
+    validate_block_contents(batch, height, skip_crypto, subsidy)?;
 
     // 6. State transition and root.
-    let mut next = apply_body(&base, &batch.body, batch.coinbase.as_ref())?;
+    let mut next = apply_body(&base, &batch.body, batch.coinbase.as_ref(), subsidy)?;
     next.bonds = bonds;
     next.effects = std::sync::Arc::new(BlockEffects {
         bonds_added: registered,

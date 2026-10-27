@@ -1323,6 +1323,10 @@ struct Job {
     /// [`job_commitment`] of the two windows: each miner's `extra` binds it.
     commitment: [u8; 32],
     fee_ppm: u64,
+    /// What this job's coinbase actually mints: the scheduled reward, less
+    /// whatever the per-bond cap tapered away. Miners proportion their
+    /// expected payout against this, so it is published with the window.
+    subsidy: u64,
     /// Each miner's copy of the job, by address.
     variants: std::sync::Mutex<HashMap<AddrKey, Arc<Variant>>>,
     /// (copy's mining hash, nonce) submitted for this job, including those
@@ -1889,6 +1893,7 @@ async fn build_job(
         next,
         commitment: extra,
         fee_ppm: fee,
+        subsidy: tpl["reward"].as_u64().unwrap_or(0),
         variants: Default::default(),
         seen: Default::default(),
     })
@@ -2475,6 +2480,7 @@ async fn api_window(State(state): State<Arc<PoolState>>, Query(q): Query<JobQuer
         "height": job.height,
         "prev_hash": hex::encode(job.prev_hash),
         "fee_ppm": job.fee_ppm,
+        "subsidy": job.subsidy,
         "operator": hex::encode(owner_id(&state.cfg.pool_address)),
         "max_paid": MAX_PAID_MINERS,
         "window": window_json(&job.paying.window),
@@ -2668,7 +2674,20 @@ pub fn audit_job_with_fee_limit(
         next_root,
         window: paying.clone(),
     };
-    let total = crate::core::types::block_reward(height)
+    // What the block may mint. Past the mainnet switch a producer whose bond
+    // is over its per-bond cap mints less than the schedule
+    // (`bond::capped_subsidy`), and its coinbase commits to that lower
+    // figure, so the audit has to be told it. A job may only ever claim
+    // *less* than the schedule: claiming more is refused here, and claiming
+    // less than the chain's own figure gets the block rejected outright, so
+    // there is nothing to skim either way. Absent, the schedule stands, which
+    // is every job before the switch.
+    let scheduled = crate::core::types::block_reward(height);
+    let subsidy = window["subsidy"].as_u64().unwrap_or(scheduled);
+    if subsidy > scheduled {
+        bail!("job claims a subsidy of {subsidy} above the schedule at height {height}");
+    }
+    let total = subsidy
         .checked_add(batch.body.fee()?)
         .ok_or_else(|| anyhow!("reward overflow"))?;
     let cb = match batch.coinbase.as_ref() {
@@ -3276,6 +3295,7 @@ mod tests {
             next: empty,
             commitment,
             fee_ppm: 0,
+            subsidy: crate::core::types::block_reward(1),
             variants: std::sync::Mutex::new(variants),
             seen: Default::default(),
         })

@@ -297,10 +297,18 @@ impl Snapshot {
         // itself is one the emission schedule could ever have produced, so a
         // node bootstrapping from a snapshot inherits the 1,000,000 cap
         // rather than taking the snapshot's word for it.
+        //
+        // The schedule is a ceiling, not an exact figure: blocks whose signer
+        // was over its per-bond cap minted less than the schedule allowed
+        // (`bond::capped_subsidy`), and the difference was burned, so a real
+        // chain's supply sits below the curve and drifts further under it
+        // over time. Claiming *more* than the schedule is still the forgery
+        // this guards against; claiming less is proven honest by the audit
+        // below, which ties the number to the coins actually in the snapshot.
         let scheduled = crate::core::types::issued_before(cp.mw_height);
-        if state.supply != scheduled {
+        if state.supply > scheduled {
             bail!(
-                "snapshot claims a supply of {} at height {}, but the schedule allows {}",
+                "snapshot claims a supply of {} at height {}, but the schedule allows at most {}",
                 state.supply,
                 cp.mw_height,
                 scheduled

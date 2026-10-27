@@ -318,13 +318,13 @@ fn kernel_replay_is_rejected() {
     // inputs were ever re-created and the transaction replayed).
     let mut replay_state = chain.state.clone();
     replay_state.kernels.insert(tx.body.kernels[0].id(), true);
-    let err = apply_body(&replay_state, &tx, None)
+    let err = apply_body(&replay_state, &tx, None, 0)
         .unwrap_err()
         .to_string();
     assert!(err.contains("already on chain"), "{err}");
 
     // Without the prior kernel the same body applies.
-    apply_body(&chain.state, &tx, None).unwrap();
+    apply_body(&chain.state, &tx, None, 0).unwrap();
 }
 
 #[test]
@@ -425,7 +425,7 @@ fn overpaying_coinbase_is_rejected() {
     let mut batch = template.batch.clone();
     batch.coinbase =
         Some(super::mw::build_coinbase(&[(miner.address(), block_reward(1) + 1)]).unwrap());
-    let err = super::state::validate_block_contents(&batch, 1, false)
+    let err = super::state::validate_block_contents(&batch, 1, false, block_reward(1))
         .unwrap_err()
         .to_string();
     assert!(err.contains("coinbase does not pay exactly"), "{err}");
@@ -490,14 +490,14 @@ fn blocks_after_the_last_coin_need_no_coinbase() {
     // An empty block there pays nobody and carries no coinbase.
     let template = build_template(&after, &chain.timestamps, &[], &alice.address(), None).unwrap();
     assert!(template.batch.coinbase.is_none());
-    validate_block_contents(&template.batch, after.height, false).unwrap();
-    let next = apply_body(&after, &template.batch.body, None).unwrap();
+    validate_block_contents(&template.batch, after.height, false, block_reward(after.height)).unwrap();
+    let next = apply_body(&after, &template.batch.body, None, 0).unwrap();
     assert_eq!(next.supply, supply, "no coins after the cap");
 
     // Claiming anything there is invalid.
     let mut forged = template.batch.clone();
     forged.coinbase = Some(super::mw::build_coinbase(&[(alice.address(), 1)]).unwrap());
-    assert!(validate_block_contents(&forged, after.height, true).is_err());
+    assert!(validate_block_contents(&forged, after.height, true, block_reward(after.height)).is_err());
 }
 
 /// Fees still have to be claimed after issuance ends: an unclaimed fee would
@@ -541,12 +541,12 @@ fn fees_after_the_last_coin_still_need_a_coinbase() {
         .as_ref()
         .expect("a fee-paying block still pays the miner");
     cb.verify_sum(fee).expect("the coinbase claims the fees");
-    validate_block_contents(&template.batch, after.height, false).unwrap();
+    validate_block_contents(&template.batch, after.height, false, block_reward(after.height)).unwrap();
 
     // Dropping the coinbase would burn the fee, and is rejected.
     let mut stripped = template.batch.clone();
     stripped.coinbase = None;
-    assert!(validate_block_contents(&stripped, after.height, true).is_err());
+    assert!(validate_block_contents(&stripped, after.height, true, block_reward(after.height)).is_err());
 
     // The chain itself is unaffected at ordinary heights.
     chain.mine(&[tx], &alice.address()).unwrap();
@@ -955,16 +955,16 @@ fn registrations_are_verified_and_limited() {
         relayed.headers.len(),
         bond.midstate.as_ref().unwrap().headers.len()
     );
-    validate_block_contents(&block, height, false).unwrap();
+    validate_block_contents(&block, height, false, block_reward(height)).unwrap();
     // A relayed header with a forged proof of work is caught with the
     // block's other proofs.
     let mut forged = block.clone();
     forged.relay.as_mut().unwrap().headers[5].nonce ^= 1;
-    assert!(validate_block_contents(&forged, height, false).is_err());
+    assert!(validate_block_contents(&forged, height, false, block_reward(height)).is_err());
     // Two registrations in one block are refused outright.
     let mut two = block.clone();
     two.registrations.push(block.registrations[0].clone());
-    assert!(validate_block_contents(&two, height, true).is_err());
+    assert!(validate_block_contents(&two, height, true, block_reward(height)).is_err());
 }
 
 /// Without the relay holding its header, a registration has nothing to be
@@ -1171,4 +1171,67 @@ fn a_bond_registers_once() {
         .unwrap();
     let mut state = chain.state.clone();
     assert!(apply_registrations(&mut state, &[(registration.bond_id(), entry)]).is_err());
+}
+
+/// Past the mainnet switch a producer over its per-bond cap may mint less,
+/// and its own template pays the lower figure: `validate_block_contents`
+/// accepts the block at the tapered subsidy and refuses it at the full
+/// scheduled reward. That is the producer and the chain agreeing on what the
+/// coinbase may claim — if they disagreed, `Coinbase::verify_sum` would fail
+/// and the producer's blocks would be rejected the moment the switch landed.
+///
+/// The window is filled with blocks stamped now (a node refuses a block more
+/// than 900s ahead of its clock, so the switch itself cannot be mined through
+/// in a test); only the block under test is stamped past it.
+#[test]
+fn past_the_switch_a_template_pays_an_over_cap_block_less() {
+    let mut chain = TestChain::new();
+    let payout = TestWallet::new().address();
+    let mut bonds = bonded_miners(
+        &chain,
+        &[(b"greedy", locked_long()), (b"other", locked_long())],
+    );
+    let (greedy, other) = (bonds.remove(0), bonds.remove(0));
+
+    // Both bonds on chain: one registration a block.
+    chain
+        .apply(chain.make_bonded_block(&greedy, &payout).unwrap())
+        .unwrap();
+    chain
+        .apply(chain.make_bonded_block(&other, &payout).unwrap())
+        .unwrap();
+    // The greedy bond then takes the whole window for itself.
+    for _ in 0..crate::core::bond::CAP_WINDOW {
+        chain
+            .apply(chain.make_bonded_block(&greedy, &payout).unwrap())
+            .unwrap();
+    }
+
+    // One block stamped after the switch, built by this producer's template.
+    let t = crate::core::bond::EARLY_BONDS_UNTIL + 60;
+    let height = chain.state.height;
+    let batch = chain.bonded_block_at(&greedy, &payout, t).unwrap();
+
+    // What the chain will let it mint, worked out the way `apply_batch` does.
+    let cap = crate::core::bond::signer_cap(&chain.state.bonds, t);
+    let mut recent = chain.state.recent_signers.clone();
+    let mut counts = chain.state.signer_counts.clone();
+    crate::core::bond::credit_in_window(
+        &mut recent,
+        &mut counts,
+        &chain.state.bonds,
+        height,
+        Some(greedy.bond_id),
+        0,
+        t,
+    );
+    let n = counts.get(&greedy.bond_id).copied().unwrap_or(0) as usize;
+    assert!(n > cap, "the greedy bond should be past its cap ({n} of {cap})");
+    let scheduled = block_reward(height);
+    let tapered = crate::core::bond::capped_subsidy(scheduled, n, cap);
+    assert!(tapered < scheduled, "an over-cap block should mint less");
+
+    // The template paid exactly the tapered figure, and nothing else passes.
+    validate_block_contents(&batch, height, true, tapered).unwrap();
+    assert!(validate_block_contents(&batch, height, true, scheduled).is_err());
 }

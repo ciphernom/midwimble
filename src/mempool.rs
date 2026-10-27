@@ -135,8 +135,9 @@ impl Mempool {
             }
         }
         // Inputs exist with matching owner keys and maturity, outputs are new,
-        // kernels have never been mined: exactly the consensus rules.
-        apply_body(state, tx, None)?;
+        // kernels have never been mined: exactly the consensus rules. No
+        // coinbase rides along, so this application mints nothing.
+        apply_body(state, tx, None, 0)?;
         Ok(())
     }
 
@@ -232,7 +233,7 @@ impl Mempool {
             .entries
             .iter()
             .filter(|(_, e)| {
-                e.tx.lock_height() > state.height || apply_body(state, &e.tx, None).is_err()
+                e.tx.lock_height() > state.height || apply_body(state, &e.tx, None, 0).is_err()
             })
             .map(|(h, _)| *h)
             .collect();

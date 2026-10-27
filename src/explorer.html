@@ -142,6 +142,23 @@ function coins(units) {
   const whole = Math.floor(units / COIN), frac = String(units % COIN).padStart(8, "0");
   return whole.toLocaleString() + "." + frac;
 }
+// A bond's value is in midstate's base units, not midwimble's, so coins()
+// is the wrong scale for it: it divides by midwimble's COIN (1e8) and showed
+// a 128 gMDS bond as "1,374.38953472 MDS". Midstate quotes bonds in gMDS,
+// 2^30 base units each, which is the unit the network's minimums are set in.
+// Midstate's base unit is the MDS itself, and the prefix is binary: a gMDS
+// is 2^30 of them, which is how the bond minimums are quoted (mainnet asks
+// 128 gMDS, the early phase 2^24 MDS). Large bonds read better in gMDS,
+// small ones in plain MDS, so the unit comes back with the number.
+const GMDS = 1073741824;
+function gmds(units) {
+  const u = Number(units);
+  if (u < GMDS) return u.toLocaleString() + " MDS";
+  const n = u / GMDS;
+  return (Number.isInteger(n)
+    ? n.toLocaleString()
+    : n.toLocaleString(undefined, { maximumFractionDigits: 6 })) + " gMDS";
+}
 function dur(s) {
   if (s == null) return "—";
   const a = Math.abs(s), sign = s < 0 ? "-" : "";
@@ -315,7 +332,7 @@ async function blockPage(m) {
       b.merged && ["commit", full(b.merged.commit_address) ],
       ["signed by", b.miner ? link("bond", b.miner.bond_id, b.miner.bond_id) : h("span", { class: "dim" }, "unsigned")],
       ...b.registrations.map(r => ["registers bond", h("span", null, link("bond", r.bond_id, short(r.bond_id, 16)),
-        h("span", { class: "dim" }, ` · ${coins(r.value)} MDS · locked to midstate ${num(r.bonded_until)} · ${r.headers} headers`))]),
+        h("span", { class: "dim" }, ` · ${gmds(r.value)} · locked to midstate ${num(r.bonded_until)} · ${r.headers} headers`))]),
     ])),
   ];
   if (cb) {
@@ -387,19 +404,27 @@ async function kernelPage(m) {
 function bondTable(r) {
   const w = r.window;
   if (!r.bonds.length) return h("div", { class: "empty" }, "no bonds registered");
-  return h("div", null, table(["bond", "value (MDS)", "locked to", "eligible", "window · cap " + num(w.cap) + " of " + num(w.size), "blocks signed"],
+  return h("div", null, table(["bond", "value", "locked to", "eligible", "window · cap " + num(w.cap) + " of " + num(w.size), "blocks signed", "mints"],
     r.bonds.map(b => {
       const share = b.window_signed / Math.max(w.cap, 1);
+      // Past its cap a bond mints cap/n of the reward; the rest is burned.
+      const over = w.tapering && b.window_signed > w.cap;
+      const pay = over ? w.cap / b.window_signed : 1;
       return [
         link("bond", b.bond_id, short(b.bond_id, 14)),
-        b.value != null ? coins(b.value) : "—",
+        b.value != null ? gmds(b.value) : "—",
         b.bonded_until != null ? num(b.bonded_until) : "—",
         b.eligible_now ? h("span", { style: "color: var(--green)" }, "yes") : h("span", { style: "color: var(--amber)" }, "no"),
         h("div", { style: "min-width: 170px" }, num(b.window_signed) + " / " + num(w.cap) + (share >= 1 ? "  over cap" : ""), meter(share, share >= 1)),
         num(b.blocks_signed),
+        w.tapering
+          ? (over
+              ? h("span", { style: "color: var(--amber)" }, (pay * 100).toFixed(1) + "%")
+              : h("span", { style: "color: var(--green)" }, "100%"))
+          : h("span", { class: "dim" }, "—"),
       ];
-    }), [5]),
-    h("div", { class: "note" }, "Fork choice counts a bond's blocks at full weight up to its cap over the last " + num(w.size) + " blocks; past the cap they stay valid and pay, but add 1/1024 of their work. The cap is an equal share among eligible bonds, never below 1/360. No block counts for more than a quarter above the lowest-work block of the week before it."));
+    }), [5, 6]),
+    h("div", { class: "note" }, "Fork choice counts a bond's blocks at full weight up to its cap over the last " + num(w.size) + " blocks; past the cap they stay valid but add only 1/1024 of their work. The cap is an equal share among eligible bonds, never below 1/360. No block counts for more than a quarter above the lowest-work block of the week before it." + (w.tapering ? " Past the cap a block also mints less: a bond that signed n of the window keeps cap/n of each block's subsidy, and what is withheld is never minted by anyone." : " From the mainnet switch, an over-cap block will also mint only cap/n of its subsidy, the rest never minted \u2014 mints shows what each bond would keep.")));
 }
 
 async function bondsPage() {
@@ -421,7 +446,7 @@ async function bondPage(m) {
     section("Bond", null, dl([
       ["bond id (midstate coin)", full(b.bond_id)],
       ["mining key", b.mining_key ? full(b.mining_key) : "—"],
-      ["value", b.value != null ? coins(b.value) + " MDS" : "—"],
+      ["value", b.value != null ? gmds(b.value) + " (" + num(b.value) + " base units)" : "—"],
       ["locked until", b.bonded_until != null ? "midstate height " + num(b.bonded_until) : "—"],
       ["registered in", b.registered_height != null ? link("block", b.registered_height, "block " + num(b.registered_height)) : "—"],
     ])),

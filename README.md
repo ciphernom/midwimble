@@ -49,16 +49,30 @@ recovery design.
 
 ### Emission (`core/types.rs`, `docs/LAUNCH.md`)
 
-- **Supply:** exactly 1,000,000.00000000 coins (8 decimals), reached exactly
-  rather than approached, at about block 49.7 million (~95 years).
+- **Supply:** at most 1,000,000.00000000 coins (8 decimals). The schedule
+  reaches that exactly at about block 49.7 million (~95 years), but it is a
+  ceiling rather than a promise: a block whose signer is over its per-bond cap
+  mints less than the schedule allows and the difference is burned, so the
+  chain's supply parts from the curve and its final total settles below the
+  cap (see **Over-cap taper**).
 - **Slow start:** the reward ramps linearly over the first 30 days, so the
   blocks mined while the network is small and least known are worth little.
 - **Halvings:** 0.23932616 per block in era 0, halving every 2,100,000 blocks,
   the same wall-clock era as Bitcoin's. ASERT's genesis anchoring keeps the
   halving dates predictable to within a day or two.
+- **Over-cap taper:** from the mainnet switch, a bond that has signed `n` of
+  the last 1,440 blocks against a cap of `cap` mints only `reward x cap / n`
+  of a block's subsidy, rounded down; fees are always paid in full. What the
+  taper withholds is never minted by anyone -- it is a burn, not a
+  redistribution -- so earning the whole reward means spreading hashrate over
+  enough bonds, and the capital locked grows with the hashrate it covers. It
+  is the same `n > cap` test that already drops an over-cap block's
+  fork-choice weight to 1/1024 of its work, so pay and weight agree.
 - **Checkable anywhere:** the schedule is defined by its running total, so any
-  node can verify a supply claim at any height; checkpoint-synced nodes check
-  the snapshot they start from.
+  node can check that a supply claimed at any height is one the schedule could
+  have produced -- never above it, and below it by whatever has been burned;
+  checkpoint-synced nodes check the snapshot they start from. The Pedersen
+  audit ties the figure to the coins that actually exist.
 - **After the cap:** a block pays only its fees, and a block with none carries
   no coinbase.
 
@@ -73,7 +87,7 @@ recovery design.
   ```text
   Pedersen:  Σ C_out − Σ C_in + fee·G = Σ E + o·H
   Owner:     Σ Ko_in              = Σ E' + x·G
-  Coinbase:  Σ C_cb − (reward + fees)·G = E_cb
+  Coinbase:  Σ C_cb − (subsidy + fees)·G = E_cb
   ```
 
 - **Further rules:**

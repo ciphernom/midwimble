@@ -1604,7 +1604,9 @@ impl Node {
         let mined = self.mempool.on_block(batch, &self.state);
         self.reorg_cache.record(height, mined);
         self.stem_pool
-            .retain(|_, (tx, _)| crate::core::state::apply_body(&self.state, tx, None).is_ok());
+            .retain(|_, (tx, _)| {
+                crate::core::state::apply_body(&self.state, tx, None, 0).is_ok()
+            });
         self.cache_state();
         self.push_light_tip(batch);
         self.publish_info();

@@ -112,7 +112,12 @@ impl StateMeta {
 
     /// The scalars after `batch` (at `self.height`): the same updates
     /// `apply_batch` makes, for blocks already validated.
-    pub fn advance(&self, batch: &Batch) -> Result<Self> {
+    /// `subsidy` is what the block was allowed to mint: the scheduled reward,
+    /// less whatever the per-bond cap tapered away (`bond::capped_subsidy`).
+    /// It must be the figure `state::apply_batch` arrived at, or a chain
+    /// restored from this metadata carries a different supply — and supply is
+    /// part of the state root.
+    pub fn advance(&self, batch: &Batch, subsidy: u64) -> Result<Self> {
         let height = self.height;
         let mut excess =
             decompress(&self.kernel_excess_sum).ok_or_else(|| anyhow!("corrupt excess sum"))?;
@@ -130,7 +135,7 @@ impl StateMeta {
             + scalar_from_bytes(&batch.body.kernel_offset)
                 .ok_or_else(|| anyhow!("invalid offset"))?;
         let reward = if batch.coinbase.is_some() {
-            block_reward(height)
+            subsidy
         } else {
             0
         };
@@ -947,7 +952,6 @@ impl Storage {
                     new_kernels.push(k.id());
                 }
 
-                let next = meta.advance(batch)?;
                 let block_effects: &BlockEffects = &effects[i];
                 apply_bond_effects(&mut bonds, block_effects);
                 for (id, _) in &block_effects.bonds_removed {
@@ -974,6 +978,20 @@ impl Storage {
                     creditable,
                     batch.timestamp,
                 );
+                // What the block was allowed to mint, by the rule
+                // `state::apply_batch` applied when it accepted the block:
+                // the scheduled reward, tapered once its signer is over cap
+                // for the window. `credit_in_window` has just counted this
+                // block, so `counts[signer]` is `n`.
+                let subsidy = match signer {
+                    Some(id) if batch.timestamp >= crate::core::bond::EARLY_BONDS_UNTIL => {
+                        let n = counts.get(&id).copied().unwrap_or(0) as usize;
+                        let cap = crate::core::bond::signer_cap(&bonds, batch.timestamp);
+                        crate::core::bond::capped_subsidy(block_reward(height), n, cap)
+                    }
+                    _ => block_reward(height),
+                };
+                let next = meta.advance(batch, subsidy)?;
                 capped = capped.saturating_add(work - credited);
                 if batch.chain_weight != next.depth.saturating_sub(capped) {
                     bail!(

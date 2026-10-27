@@ -522,6 +522,11 @@ fn window_json(state: &State, now: u64) -> Value {
         "size": CAP_WINDOW,
         "filled": state.recent_signers.len(),
         "cap": signer_cap(&state.bonds, now),
+        // From the mainnet switch a bond past its cap mints `cap / n` of the
+        // reward and the rest is burned (`bond::capped_subsidy`). Before it,
+        // an over-cap block still pays in full, so the explorer must not
+        // show a taper that is not being applied yet.
+        "tapering": now >= crate::core::bond::EARLY_BONDS_UNTIL,
     })
 }
 

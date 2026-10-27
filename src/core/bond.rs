@@ -1189,6 +1189,32 @@ pub fn signer_cap(bonds: &BondSet, block_timestamp: u64) -> usize {
     CAP_WINDOW.div_ceil(eligible.clamp(1, CAP_K))
 }
 
+/// The coinbase subsidy a signed block may mint: the whole `reward` while its
+/// bond has signed at most `cap` of the last [`CAP_WINDOW`] blocks, and
+/// `reward × cap / n` (rounded down) once it has signed `n > cap` of them,
+/// this block included.
+///
+/// This is the pay-side of the test fork choice already applies to work: the
+/// same `n > signer_cap` that drops an over-cap block to a [`sliver`]
+/// ([`credit_in_window`]) tapers what it may mint, so a producer earns the
+/// full reward only by spreading its hashrate over enough bonds. The curve is
+/// smooth — at `n == cap + 1` the loss is one part in `n`, so there is no
+/// cliff to stop mining at, or to switch keys to dodge.
+///
+/// The withheld part is **not** redistributed: it is never minted at all, so
+/// the chain's supply ends below the emission schedule by the sum of every
+/// block's withholding. Callers leave unsigned blocks and blocks stamped
+/// before [`EARLY_BONDS_UNTIL`] untapered.
+///
+/// Integer maths throughout, in `u128` so the product cannot overflow: a
+/// signed over-cap block has `n >= 2`, so the division is always defined.
+pub fn capped_subsidy(reward: u64, n: usize, cap: usize) -> u64 {
+    if n <= cap {
+        return reward;
+    }
+    ((reward as u128 * cap as u128) / n as u128) as u64
+}
+
 /// Whether any registered bond could sign a block timestamped
 /// `block_timestamp`. From [`BONDED_MINING_FROM`] a block must be signed
 /// exactly when one could.
@@ -1561,6 +1587,54 @@ mod cap_tests {
         let signers = vec![Some([1u8; 32]); CAP_WINDOW];
         rebuild_signer_window(&mut state, signers);
         assert_eq!(credit_work(&mut state, Some([1; 32]), work, 0), work);
+    }
+
+    /// The pay-side of the cap: inside it a block mints the whole reward,
+    /// past it the subsidy falls away as `cap / n`. The step at the boundary
+    /// is one part in `n`, so there is no cliff to stop mining at.
+    #[test]
+    fn the_subsidy_tapers_only_past_the_cap() {
+        let reward = 23_932_616u64;
+        // At the cap and under it, the block mints everything.
+        assert_eq!(capped_subsidy(reward, 1, 36), reward);
+        assert_eq!(capped_subsidy(reward, 35, 36), reward);
+        assert_eq!(capped_subsidy(reward, 36, 36), reward);
+        // One past it: a slope, not a cliff — less than 1/36 is withheld.
+        let just_over = capped_subsidy(reward, 37, 36);
+        assert_eq!(just_over, (reward as u128 * 36 / 37) as u64);
+        assert!(just_over < reward && just_over > reward - reward / 36);
+        // Far past it, pay falls off with the overshoot. The bond that signed
+        // 1,387 of the last 1,440 against a cap of 36 keeps about 2.6%.
+        assert_eq!(capped_subsidy(reward, 72, 36), reward / 2);
+        assert_eq!(
+            capped_subsidy(reward, 1_387, 36),
+            (reward as u128 * 36 / 1_387) as u64
+        );
+        assert!(capped_subsidy(reward, 1_387, 36) * 38 < reward);
+    }
+
+    /// Integer maths, rounded down, and never a panic. What the rounding
+    /// leaves behind is simply not minted: nobody is paid it.
+    #[test]
+    fn the_taper_rounds_down_and_never_overflows() {
+        assert_eq!(capped_subsidy(10, 4, 3), 7); // 7.5 floors to 7
+        assert_eq!(capped_subsidy(1, 2, 1), 0); // a whole block's reward withheld
+        assert_eq!(capped_subsidy(0, 1_000, 1), 0); // after the last coin is issued
+                                                    // The product is taken in u128, so the largest reward cannot wrap.
+        assert_eq!(capped_subsidy(u64::MAX, 2, 1), u64::MAX / 2);
+    }
+
+    /// A lone producer fills the window with its own blocks and is still
+    /// inside its cap, so it is never tapered — the same reason it is never
+    /// weighed down (`a_lone_producer_is_never_capped`). This is why the
+    /// taper barely bites in the first window after the switch.
+    #[test]
+    fn a_lone_producer_mints_in_full() {
+        let mut bonds = BondSet::default();
+        bonds.insert([1; 32], eligible_bond());
+        let cap = signer_cap(&bonds, 0);
+        assert_eq!(cap, CAP_WINDOW);
+        assert_eq!(capped_subsidy(23_932_616, CAP_WINDOW, cap), 23_932_616);
     }
 
     #[test]

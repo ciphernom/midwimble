@@ -1012,7 +1012,7 @@ async fn mining_template(
         "height": template.height,
         "target": hex::encode(template.batch.target),
         "mining_hash": hex::encode(template.mining_hash),
-        "reward": crate::core::types::block_reward(template.height),
+        "reward": template.subsidy,
         "fees": template.fees,
         "template_hex": hex::encode(bincode::serialize(&template.batch).map_err(bad)?),
         "receipts": receipts,
@@ -1050,6 +1050,10 @@ pub fn template_from_hex(
         batch,
         mining_hash,
         height,
+        // Not known without the chain: a reassembled template is only ever
+        // sealed with a solution, never re-costed, so `height` is a
+        // placeholder here too.
+        subsidy: 0,
     })
 }
 
