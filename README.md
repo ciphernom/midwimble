@@ -61,7 +61,7 @@ recovery design.
   the same wall-clock era as Bitcoin's. ASERT's genesis anchoring keeps the
   halving dates predictable to within a day or two.
 - **Over-cap taper:** from the mainnet switch, a bond that has signed `n` of
-  the last 10,080 blocks (a week) against a cap of `cap` mints only `reward x cap / n`
+  the last 1,440 blocks against a cap of `cap` mints only `reward x cap / n`
   of a block's subsidy, rounded down; fees are always paid in full. What the
   taper withholds is never minted by anyone -- it is a burn, not a
   redistribution -- so earning the whole reward means spreading hashrate over

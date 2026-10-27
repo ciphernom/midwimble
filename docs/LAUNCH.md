@@ -153,7 +153,7 @@ them months apart for decades. Late February does not.
   Bitcoin's era. Because ASERT is anchored to genesis, halvings land within a
   day or two of their predicted dates.
 - **Over-cap taper:** from the mainnet switch, a bond that has signed `n` of
-  the last 10,080 blocks (a week) against a cap of `cap` mints only `reward x cap / n`
+  the last 1,440 blocks against a cap of `cap` mints only `reward x cap / n`
   of a block's subsidy, rounded down; fees are always paid in full. What it
   withholds is never minted by anyone, so a producer earns the whole reward
   only by spreading its hashrate over enough bonds.
@@ -187,7 +187,7 @@ actually exist, so the cap does not depend on trusting whoever served it.
 | Bond retarget | from 2026-11-30 00:00 UTC | a **new** bond's minimum doubles per 16× rise in midwimble's work since genesis, 128 → 512 gMDS and no further; registrations only, so a bond already locked keeps the price it registered at |
 | Relayed midstate headers | midstate's own difficulty, timestamps at most 30 minutes ahead | a fake branch costs real midstate work, more the further it runs ahead |
 | Bond eligibility | more than 30 days of lock left | judged on midwimble's clock, 7-day margin |
-| Fork choice | 14 full-weight blocks a bond a week (two a day); no block counts above 1.25× the week's lowest | weight, never validity |
+| Fork choice | 4 full-weight blocks a bond a day; no block counts above 1.25× the week's lowest | weight, never validity |
 | Registration | a day of relayed midstate work above the proof's header | the header must be on the relay's chain (revoked if a heavier branch replaces it); no header counts for more than 1/60 |
 | Anchor evidence | 1,000 midstate confirmations, 2^19 a header | about an hour of midstate's network to forge |
 | Finality | 100 blocks after an anchored checkpoint | fixed for everyone |
