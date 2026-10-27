@@ -1652,7 +1652,9 @@ fn run(cli: Cli) -> Result<()> {
                         out!("(incoming: payments to this wallet waiting for a block; spendable once one confirms them)");
                     }
                     out!(
-                        "(one block reward is currently {})",
+                        "(the emission schedule pays {} a block at this height; a \
+                         producer whose bond is over its per-block-window cap mints \
+                         less than that, and the difference is never minted)",
                         format_amount(block_reward(r.tip))
                     );
                 }

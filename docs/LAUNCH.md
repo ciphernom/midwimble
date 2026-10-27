@@ -143,26 +143,36 @@ them months apart for decades. Late February does not.
 
 ## The emission, briefly
 
-- **Supply:** exactly 1,000,000.00000000 coins, with 8 decimal places.
+- **Supply:** at most 1,000,000.00000000 coins, with 8 decimal places. The
+  schedule is a ceiling rather than a promise: what the over-cap taper
+  withholds is burned, so the chain's total settles below it.
 - **Slow start:** the reward ramps linearly over the first 43,200 blocks
   (30 days). Day one pays about 5.7 coins and the whole month about 5,170.
 - **Era 0:** after the ramp, 0.23932616 coins per block until block 2,100,000.
 - **Halvings:** every 2,100,000 blocks, the same wall-clock length as
   Bitcoin's era. Because ASERT is anchored to genesis, halvings land within a
   day or two of their predicted dates.
-- **Endgame:** issuance reaches the cap exactly at about block 49.7 million
-  (roughly 95 years in). After that a block pays its fees, and a block with no
+- **Over-cap taper:** from the mainnet switch, a bond that has signed `n` of
+  the last 1,440 blocks against a cap of `cap` mints only `reward x cap / n`
+  of a block's subsidy, rounded down; fees are always paid in full. What it
+  withholds is never minted by anyone, so a producer earns the whole reward
+  only by spreading its hashrate over enough bonds.
+- **Endgame:** the schedule reaches the cap at about block 49.7 million
+  (roughly 95 years in); the chain itself lands under it by whatever the taper
+  has burned by then. After that a block pays its fees, and a block with no
   fees carries no coinbase at all.
 
-Any node can check any claimed supply against the schedule
-(`types::issued_before`). Checkpoint-synced nodes do this for the snapshot they
-start from, so the cap does not depend on trusting whoever served it.
+Any node can check a claimed supply against the schedule
+(`types::issued_before`): it may sit below the curve, by whatever has been
+burned, but never above it. Checkpoint-synced nodes do this for the snapshot
+they start from, and the Pedersen audit ties the figure to the coins that
+actually exist, so the cap does not depend on trusting whoever served it.
 
 ## Settled parameters
 
 | | | |
 |---|---|---|
-| Supply | 1,000,000.00000000, 8 decimals | reached exactly |
+| Supply | 1,000,000.00000000, 8 decimals | a ceiling: the over-cap taper burns what it withholds, so the total settles below it |
 | Slow start | 43,200 blocks (30 days) | linear ramp |
 | Halving | every 2,100,000 blocks | Bitcoin's era length |
 | Bonded mining | from block 1, whenever a registered bond could sign | minimum bond 128 gMDS (2^37 units), a launch parameter; while no bond can sign, blocks are unsigned and count for 1/1,024 of their work |

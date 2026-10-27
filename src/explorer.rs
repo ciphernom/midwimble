@@ -248,7 +248,19 @@ fn fees(b: &Batch) -> u64 {
         .fold(0u64, |acc, k| acc.saturating_add(k.fee))
 }
 
-fn summary(height: u64, b: &Batch, prev_timestamp: Option<u64>) -> Value {
+/// `minted` is what the block's coinbase actually paid out of the schedule,
+/// as this node recorded it when it applied the block.
+///
+/// `None` means this node never applied it: it has no record below a snapshot
+/// it checkpoint-synced from. For a block stamped before the mainnet switch
+/// that still settles the figure -- nothing could taper it, so it minted the
+/// whole scheduled reward -- but from the switch on it is genuinely unknown,
+/// and reporting the schedule there would show a tapered block as full pay.
+/// Unknown is published as `null`, not guessed.
+fn summary(height: u64, b: &Batch, prev_timestamp: Option<u64>, minted: Option<u64>) -> Value {
+    let scheduled = block_reward(height);
+    let minted = minted
+        .or_else(|| (b.timestamp < crate::core::bond::EARLY_BONDS_UNTIL).then_some(scheduled));
     json!({
         "height": height,
         "hash": hex::encode(b.extension.final_hash),
@@ -259,7 +271,9 @@ fn summary(height: u64, b: &Batch, prev_timestamp: Option<u64>) -> Value {
         "outputs": body_outputs(b).count() + coinbase_outputs(b).count(),
         "kernels": b.body.body.kernels.len(),
         "fees": fees(b),
-        "reward": block_reward(height),
+        "reward": scheduled,
+        "minted": minted,
+        "withheld": minted.map(|m| scheduled.saturating_sub(m)),
         "size": bincode::serialized_size(b).unwrap_or(0),
         "miner": b.miner.as_ref().map(|m| hex::encode(m.bond_id)),
         "merged": b.aux_pow.is_some(),
@@ -329,7 +343,8 @@ pub async fn blocks(
             .filter(|(i, _)| from + *i as u64 >= start)
             .map(|(i, b)| {
                 let prev = i.checked_sub(1).map(|p| batches[p].timestamp);
-                summary(from + i as u64, b, prev)
+                let h = from + i as u64;
+                summary(h, b, prev, node.storage().subsidy_at(h).ok().flatten())
             })
             .collect();
         out.reverse();
@@ -367,7 +382,12 @@ pub async fn block(
         let b = load(height)?.ok_or_else(|| not_found("block"))?;
         let prev = if height > 0 { load(height - 1)? } else { None };
         let next = if height + 1 < tip { load(height + 1)? } else { None };
-        let mut v = summary(height, &b, prev.map(|p| p.timestamp));
+        let mut v = summary(
+            height,
+            &b,
+            prev.map(|p| p.timestamp),
+            storage.subsidy_at(height).ok().flatten(),
+        );
 
         let body = &b.body.body;
         v["prev_hash"] = json!(hex::encode(b.prev_header_hash));

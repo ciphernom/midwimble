@@ -514,14 +514,8 @@ pub fn build_template_relayed(
     // remainder is burned, so the coinbase paid above -- which claimed the
     // whole scheduled reward -- has to be paid again at the lower figure, or
     // the chain rejects this producer's own block.
-    let subsidy = match signer {
-        Some(id) if timestamp >= crate::core::bond::EARLY_BONDS_UNTIL => {
-            let n = counts.get(&id).copied().unwrap_or(0) as usize;
-            let cap = crate::core::bond::signer_cap(&bonds_after, timestamp);
-            crate::core::bond::capped_subsidy(block_reward(height), n, cap)
-        }
-        _ => block_reward(height),
-    };
+    let subsidy =
+        crate::core::bond::subsidy_for(signer, &counts, &bonds_after, height, timestamp);
     // Re-pay the coinbase at the tapered figure. It can only ever shrink (a
     // smaller total drops payouts, never adds them), so the block cannot
     // outgrow the room the relay was chosen for: a lighter coinbase leaves

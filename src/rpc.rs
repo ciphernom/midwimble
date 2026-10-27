@@ -462,7 +462,14 @@ async fn state(AxState(node): AxState<NodeHandle>) -> Json<Value> {
         "supply": s.supply,
         "max_supply": midwimble_max_supply(),
         "decimals": 8,
+        // The emission schedule's figure for the next block. From the
+        // mainnet switch it is a ceiling rather than a promise: a block whose
+        // signer is over its per-bond cap mints `cap / n` of it and the rest
+        // is burned (`bond::capped_subsidy`), so a reader that wants what a
+        // block actually paid takes it from the explorer, which records it
+        // per block. `tapering` says whether that rule is live yet.
         "block_reward": crate::core::types::block_reward(s.height),
+        "tapering": s.timestamp >= crate::core::bond::EARLY_BONDS_UNTIL,
         "era": s.height / crate::core::types::HALVING_INTERVAL,
         "next_halving_height": next_halving(s.height),
         "utxos": s.utxos.len(),

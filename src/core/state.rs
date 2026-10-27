@@ -666,14 +666,7 @@ fn apply_batch_internal(
     //     over-cap block's work to a sliver, and what is withheld is burned
     //     rather than paid to anyone. Unsigned blocks, and every block stamped
     //     before the mainnet switch, mint the full scheduled reward.
-    let subsidy = match signer {
-        Some(id) if batch.timestamp >= super::bond::EARLY_BONDS_UNTIL => {
-            let n = counts.get(&id).copied().unwrap_or(0) as usize;
-            let cap = super::bond::signer_cap(&bonds, batch.timestamp);
-            super::bond::capped_subsidy(block_reward(height), n, cap)
-        }
-        _ => block_reward(height),
-    };
+    let subsidy = super::bond::subsidy_for(signer, &counts, &bonds, height, batch.timestamp);
 
     // 5b. Contents: structure, balances, proofs and signatures.
     validate_block_contents(batch, height, skip_crypto, subsidy)?;

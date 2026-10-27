@@ -336,7 +336,17 @@ async function blockPage(m) {
     ])),
   ];
   if (cb) {
-    parts.push(section("Coinbase", coins(b.reward + b.fees) + " = reward " + coins(b.reward) + " + fees " + coins(b.fees),
+    // What the coinbase actually paid. Past its cap a block mints less than
+    // the schedule allows and the difference is burned, so "reward" here is
+    // what was minted, not what the schedule listed. A null means this node
+    // never applied the block (it checkpoint-synced past it) and the figure
+    // is unknown -- showing the schedule there would pass a tapered block
+    // off as full pay.
+    const withheldNote = b.withheld ? "  \u00b7  withheld " + coins(b.withheld) + " (over cap, never minted)" : "";
+    const coinbaseHead = b.minted != null
+      ? coins(b.minted + b.fees) + " = reward " + coins(b.minted) + " + fees " + coins(b.fees) + withheldNote
+      : "reward \u2014 not recorded on this node  \u00b7  fees " + coins(b.fees);
+    parts.push(section("Coinbase", coinbaseHead,
       table(["output", "status", "owner key", "payload"], outputRows(cb.outputs)),
       dl([
         ["kernel", link("kernel", cb.kernel.excess, cb.kernel.excess)],

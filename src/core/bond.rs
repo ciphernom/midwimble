@@ -1215,6 +1215,35 @@ pub fn capped_subsidy(reward: u64, n: usize, cap: usize) -> u64 {
     ((reward as u128 * cap as u128) / n as u128) as u64
 }
 
+/// What the block at `height` may mint, which is the whole of the taper rule
+/// in one place: the scheduled reward for an unsigned block or one stamped
+/// before the mainnet switch, and [`capped_subsidy`] of it for a signed block
+/// from the switch on.
+///
+/// `counts` must be the signer window **with this block already counted**, as
+/// [`credit_in_window`] leaves it, so `counts[signer]` is `n`; `bonds` is the
+/// set as the block leaves it, the same one the cap was taken against. Three
+/// places have to agree on this figure exactly -- the node applying a block,
+/// storage replaying one, and a producer's template paying its own coinbase --
+/// and a disagreement is a chain split, so they all call this rather than
+/// keeping a copy of the rule.
+pub fn subsidy_for(
+    signer: Option<[u8; 32]>,
+    counts: &im::HashMap<[u8; 32], u32>,
+    bonds: &BondSet,
+    height: u64,
+    block_timestamp: u64,
+) -> u64 {
+    let reward = super::types::block_reward(height);
+    match signer {
+        Some(id) if block_timestamp >= EARLY_BONDS_UNTIL => {
+            let n = counts.get(&id).copied().unwrap_or(0) as usize;
+            capped_subsidy(reward, n, signer_cap(bonds, block_timestamp))
+        }
+        _ => reward,
+    }
+}
+
 /// Whether any registered bond could sign a block timestamped
 /// `block_timestamp`. From [`BONDED_MINING_FROM`] a block must be signed
 /// exactly when one could.
@@ -1622,6 +1651,43 @@ mod cap_tests {
         assert_eq!(capped_subsidy(0, 1_000, 1), 0); // after the last coin is issued
                                                     // The product is taken in u128, so the largest reward cannot wrap.
         assert_eq!(capped_subsidy(u64::MAX, 2, 1), u64::MAX / 2);
+    }
+
+    /// The whole rule, as the node, storage and a producer's template all
+    /// now read it. Only a signed block, past its cap, stamped from the
+    /// switch on, mints less than the schedule.
+    #[test]
+    fn the_taper_only_bites_on_a_signed_over_cap_block_after_the_switch() {
+        let mut bonds = BondSet::default();
+        bonds.insert([1; 32], eligible_bond());
+        bonds.insert([2; 32], eligible_bond());
+        let switch = EARLY_BONDS_UNTIL;
+        let cap = signer_cap(&bonds, switch);
+        let height = 1;
+        let full = super::super::types::block_reward(height);
+
+        let mut over = im::HashMap::new();
+        over.insert([1u8; 32], (cap + 1) as u32);
+
+        // Stamped a second before the switch, an over-cap bond still mints
+        // the lot: the rule is not live yet.
+        assert_eq!(
+            subsidy_for(Some([1; 32]), &over, &bonds, height, switch - 1),
+            full
+        );
+        // From the switch it keeps cap/n.
+        let tapered = subsidy_for(Some([1; 32]), &over, &bonds, height, switch);
+        assert_eq!(tapered, capped_subsidy(full, cap + 1, cap));
+        assert!(tapered < full);
+        // An unsigned block is never tapered, whatever the window holds.
+        assert_eq!(subsidy_for(None, &over, &bonds, height, switch), full);
+        // Nor is a bond still inside its cap.
+        let mut inside = im::HashMap::new();
+        inside.insert([2u8; 32], cap as u32);
+        assert_eq!(
+            subsidy_for(Some([2; 32]), &inside, &bonds, height, switch),
+            full
+        );
     }
 
     /// A lone producer fills the window with its own blocks and is still

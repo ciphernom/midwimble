@@ -38,7 +38,7 @@ use crate::core::relay::{Relay, RelayEntry};
 use crate::core::scan::{ScanBlock, ScanRun};
 use crate::core::snapshot::{mmr_from_peaks, mmr_peak_values, Snapshot, SNAPSHOT_HEADERS};
 use crate::core::state::{calculate_target, calculate_work};
-use crate::core::types::{block_reward, utxo_leaf, BlockEffects, UtxoEntry};
+use crate::core::types::{utxo_leaf, BlockEffects, UtxoEntry};
 use crate::core::{Batch, BatchHeader, State};
 use anyhow::{anyhow, bail, Context, Result};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -69,6 +69,12 @@ const SIGNERS: TableDefinition<u64, &[u8]> = TableDefinition::new("signers");
 /// leaves that cap out, which is harmless: fork choice only compares branches
 /// that share every entry below the point where they part.
 const CAPPED: TableDefinition<u64, &[u8]> = TableDefinition::new("capped");
+/// What each block was allowed to mint: the scheduled reward less whatever
+/// the per-bond cap tapered away (`bond::capped_subsidy`). Recorded from the
+/// release that introduced the taper on, which is before the switch that
+/// activates it, so every block that ever withheld anything has an entry; a
+/// height with none predates that and withheld nothing.
+const SUBSIDY: TableDefinition<u64, &[u8]> = TableDefinition::new("subsidy");
 /// Cumulative proof of work of the chain up to and including each block, so
 /// finality can compare a checkpoint's claimed work without summing headers.
 const DEPTHS: TableDefinition<u64, &[u8]> = TableDefinition::new("depths");
@@ -355,6 +361,7 @@ impl Storage {
             txn.open_table(PEERS)?;
             txn.open_table(SIGNERS)?;
             txn.open_table(CAPPED)?;
+            txn.open_table(SUBSIDY)?;
             txn.open_table(DEPTHS)?;
             txn.open_table(BONDS)?;
             txn.open_table(RELAY)?;
@@ -701,6 +708,19 @@ impl Storage {
         })
     }
 
+    /// What the block at `height` minted: the scheduled reward, less whatever
+    /// the per-bond cap withheld and burned. `None` for a block committed
+    /// before this was recorded -- every one of those predates the taper, so
+    /// it minted the whole scheduled reward.
+    pub fn subsidy_at(&self, height: u64) -> Result<Option<u64>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(SUBSIDY)?;
+        Ok(match table.get(height)? {
+            Some(v) => Some(bincode::deserialize(v.value())?),
+            None => None,
+        })
+    }
+
     /// Replaces every block at or above `first_height` with `batches`, whose
     /// application yields `state`. The blocks must already be validated, and
     /// `effects` holds what applying each one changed in the bond set (each
@@ -752,6 +772,7 @@ impl Storage {
             let mut meta_table = txn.open_table(META)?;
             let mut signer_log = txn.open_table(SIGNERS)?;
             let mut capped_table = txn.open_table(CAPPED)?;
+            let mut subsidy_table = txn.open_table(SUBSIDY)?;
             let mut depth_table = txn.open_table(DEPTHS)?;
             let mut bond_table = txn.open_table(BONDS)?;
             let mut relay_table = txn.open_table(RELAY)?;
@@ -819,6 +840,7 @@ impl Storage {
                 headers.remove(h)?;
                 signer_log.remove(h)?;
                 capped_table.remove(h)?;
+                subsidy_table.remove(h)?;
                 depth_table.remove(h)?;
                 meta = undo.prev;
             }
@@ -983,14 +1005,13 @@ impl Storage {
                 // the scheduled reward, tapered once its signer is over cap
                 // for the window. `credit_in_window` has just counted this
                 // block, so `counts[signer]` is `n`.
-                let subsidy = match signer {
-                    Some(id) if batch.timestamp >= crate::core::bond::EARLY_BONDS_UNTIL => {
-                        let n = counts.get(&id).copied().unwrap_or(0) as usize;
-                        let cap = crate::core::bond::signer_cap(&bonds, batch.timestamp);
-                        crate::core::bond::capped_subsidy(block_reward(height), n, cap)
-                    }
-                    _ => block_reward(height),
-                };
+                let subsidy = crate::core::bond::subsidy_for(
+                    signer,
+                    &counts,
+                    &bonds,
+                    height,
+                    batch.timestamp,
+                );
                 let next = meta.advance(batch, subsidy)?;
                 capped = capped.saturating_add(work - credited);
                 if batch.chain_weight != next.depth.saturating_sub(capped) {
@@ -1003,6 +1024,7 @@ impl Storage {
                 }
                 signer_log.insert(height, signer_to_log(signer).as_slice())?;
                 capped_table.insert(height, enc(&capped)?.as_slice())?;
+                subsidy_table.insert(height, enc(&subsidy)?.as_slice())?;
                 depth_table.insert(height, enc(&next.depth)?.as_slice())?;
                 let undo = BlockUndo {
                     spent,
@@ -1662,6 +1684,43 @@ mod tests {
         }
         mine_signed(&storage, &mut loaded, &mut ts, &to, &b);
         mine_signed(&storage, &mut loaded, &mut ts, &to, &a);
+    }
+
+    /// Every committed block records what it was allowed to mint, so the
+    /// explorer can say what a block withheld without re-deriving the window
+    /// from its signers. The record follows the chain through a restart, and
+    /// a height the chain never reached simply has none.
+    #[test]
+    fn storage_records_what_each_block_minted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut state, mut ts) = fresh(dir.path());
+        let to = WalletKeys::random().address();
+        let mut bonds = devnet_bonds(&[b"solo"], &state.target);
+        let bond = bonds.remove(0);
+        let mut minted = Vec::new();
+        for _ in 0..4 {
+            mine_signed(&storage, &mut state, &mut ts, &to, &bond);
+            let height = state.height - 1;
+            minted.push((height, crate::core::types::block_reward(height)));
+        }
+        for &(height, expected) in &minted {
+            assert_eq!(
+                storage.subsidy_at(height).unwrap(),
+                Some(expected),
+                "height {height}"
+            );
+        }
+        drop(storage);
+
+        let storage = Storage::open(dir.path()).unwrap();
+        for &(height, expected) in &minted {
+            assert_eq!(
+                storage.subsidy_at(height).unwrap(),
+                Some(expected),
+                "after a restart, height {height}"
+            );
+        }
+        assert_eq!(storage.subsidy_at(state.height + 50).unwrap(), None);
     }
 
     /// One cheap block (its parent stamped four hours late, which doubles
