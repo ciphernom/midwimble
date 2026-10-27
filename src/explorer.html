@@ -97,6 +97,14 @@
   .diagram svg { width: 100%; display: block; }
   .legend { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); font-size: 11px; letter-spacing: .06em; margin-top: 10px; }
   .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  .facts { display: grid; grid-template-columns: minmax(130px, auto) 1fr; gap: 1px 16px; padding: 4px 20px 16px; }
+  .facts .who { color: var(--muted); font: 600 11px var(--mono); letter-spacing: .12em; text-transform: uppercase; padding: 9px 0; white-space: nowrap; }
+  .facts .pills { padding: 7px 0; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .facts .yes, .facts .no { border-radius: 999px; padding: 2px 10px; font-size: 12px; border: 1px solid transparent; }
+  .facts .yes { color: var(--green); border-color: rgba(0,255,65,.3); background: rgba(0,255,65,.06); }
+  .facts .no { color: var(--muted); border-color: var(--line); opacity: .75; }
+  .facts .no::before { content: "\00d7 "; opacity: .6; }
+  .facts .yes::before { content: "\2713 "; opacity: .7; }
   .heat { display: grid; grid-template-columns: minmax(120px, auto) 1fr minmax(96px, auto); align-items: center; gap: 2px 14px; padding: 14px 20px 18px; }
   .heat svg { width: 100%; height: 13px; display: block; }
   .heat .lab { font-size: 12px; white-space: nowrap; }
@@ -474,6 +482,19 @@ function ageHistogram(b) {
     h("div", { class: "legend" }, h("span", null, "blocks between an output being created and this block spending it")));
 }
 
+// Who learns what, as pills rather than paragraphs: a reader should be able
+// to scan a row in a second and hover the diagram for the rest.
+function facts(rows) {
+  const grid = h("div", { class: "facts" });
+  rows.forEach(([who, knows, blind]) => {
+    grid.appendChild(h("div", { class: "who" }, who));
+    grid.appendChild(h("div", { class: "pills" },
+      knows.map(k => h("span", { class: "yes" }, k)),
+      blind.map(k => h("span", { class: "no" }, k))));
+  });
+  return grid;
+}
+
 // Dandelion++: a transaction does not go straight to the gossip network.
 // It walks a private stem, one peer at a time, and only then fluffs out to
 // everyone. The fluff probability is not fixed -- `Node::route_stem` sets it
@@ -507,14 +528,32 @@ function dandelionDiagram(d) {
   burst.appendChild(svg("animate", { attributeName: "opacity", values: ".9;0", dur: "1.6s", begin: "2.4s;burst.end+2.4s", repeatCount: "1" }));
   s.appendChild(burst);
 
+  // The explanation lives in the picture: hover a node and the caption says
+  // what that node knows. One line at a time beats six paragraphs nobody
+  // reads.
+  const base = d.fluff_percent + "% chance of fluffing at each hop \u00b7 about " + d.expected_hops.toFixed(1) + " hops \u00b7 " + d.stem_timeout_secs + "s embargo";
+  const caption = txt(W / 2, H - 10, base, "#9c98aa", "middle", 11);
+  const tells = (node, what, colour) => {
+    const hit = svg("circle", { cx: node.cx, cy: y, r: 22, fill: "transparent", style: "cursor: help" });
+    hit.addEventListener("mouseenter", () => { caption.textContent = what; caption.setAttribute("fill", colour); });
+    hit.addEventListener("mouseleave", () => { caption.textContent = base; caption.setAttribute("fill", "#9c98aa"); });
+    s.appendChild(hit);
+  };
   for (let i = 0; i <= hops; i++) {
     const cx = x0 + step * i;
     s.appendChild(dot(cx, y, i === 0 ? 9 : 6, i === 0 ? "#f4f3f7" : "#8b5cf6", i === 0 ? 1 : .85));
     if (i === 0) s.appendChild(txt(cx, y - 20, "you", "#f4f3f7"));
     else s.appendChild(txt(cx, y - 18, "hop " + i, "#9c98aa", "middle", 10));
+    tells({ cx }, i === 0
+      ? "you hold it \u00b7 nobody else has seen it yet"
+      : i === 1
+        ? "knows your address, and that you sent it \u2014 not that you wrote it"
+        : "knows only the hop before it \u00b7 " + i + " nodes from you now",
+      i === 0 ? "#f4f3f7" : "#a78bfa");
   }
   s.appendChild(dot(xF, y, 9, "#00ff41"));
   s.appendChild(txt(xF, y - 22, "fluff", "#00ff41"));
+  tells({ cx: xF }, "broadcasts to everyone \u00b7 what they see is a node that probably did not write it", "#00ff41");
 
   // The travelling transaction.
   const car = dot(0, 0, 4.5, "#f5c451");
@@ -524,9 +563,7 @@ function dandelionDiagram(d) {
   s.appendChild(txt(W / 2, 30, "stem \u00b7 one peer at a time, nobody else sees it", "#a78bfa"));
   s.appendChild(txt(x0, H - 34, "your node", "#9c98aa", "start", 10));
   s.appendChild(txt(xF + 86, H - 34, "the whole network", "#9c98aa", "end", 10));
-  s.appendChild(txt(W / 2, H - 10,
-    d.fluff_percent + "% chance of fluffing at each hop \u00b7 about " + d.expected_hops.toFixed(1) + " hops \u00b7 " + d.stem_timeout_secs + "s embargo",
-    "#9c98aa", "middle", 11));
+  s.appendChild(caption);
   return h("div", { class: "diagram" }, s);
 }
 
@@ -601,9 +638,9 @@ function signerHeatmap(r) {
       num(b.window_signed) + " / " + num(w.cap)));
   });
   return h("div", null, grid, h("div", { class: "note" },
-    "Each tick is a block this bond signed, placed where it falls in the window. A row in amber has signed more than its cap, so its extra blocks add only 1/1024 of their work to fork choice"
-    + (w.tapering ? " and mint only cap/n of their subsidy." : ", and from the mainnet switch will mint only cap/n of their subsidy.")
-    + " Clustered ticks mean a producer mined a run of blocks; an even spread means it was sharing the window."));
+    "One tick per block signed. Amber is over cap: those blocks add 1/1024 of their work"
+    + (w.tapering ? " and mint cap/n." : ", and from the mainnet switch will mint cap/n.")
+    + " Clustered ticks are a mined run; an even spread is a shared window."));
 }
 
 // ---------- shared block table --------------------------------------------
@@ -708,7 +745,7 @@ async function blockPage(m) {
     ])),
     section("Transaction anatomy", (b.output_groups || []).length + " transaction" + ((b.output_groups || []).length === 1 ? "" : "s") + " aggregated",
       anatomyDiagram(b),
-      h("div", { class: "note" }, "A block is one aggregated transaction. Its inputs and kernels are sorted by commitment and by kernel id, which destroys the order they arrived in, so no input can be tied to an output \u2014 every pairing drawn here is equally consistent with the chain. What does survive aggregation is the grouping on the right: outputs sharing a range proof were created by one transaction, typically a payment and its change.")),
+      h("div", { class: "note" }, "Inputs and kernels are sorted, so no input ties to an output \u2014 every line drawn is equally consistent. Boxed outputs are the exception: siblings share a range proof.")),
     section("Coin flow", "the only graph this chain records", spendArcs(b)),
   ];
   if (cb) {
@@ -892,14 +929,12 @@ async function privacyPage() {
   view.replaceChildren(
     h("div", { class: "title" }, h("h1", null, "Privacy"), h("span", { class: "dim" }, "what this chain does and does not reveal, over its last " + num(b.length) + " blocks")),
     section("Measured", "refreshes every 20s", stats, charts),
-    section("What each number means", null,
-      dl([
-        ["pairings", "A block is one aggregated transaction, so any of its inputs could have funded any of its outputs: inputs \u00d7 outputs is how many assignments the chain leaves consistent. One input and one output in a block means no ambiguity at all \u2014 the pairing is forced. The number grows fastest when unrelated transactions land in the same block, which is why a busy block is a private one."],
-        ["public sibling", "Outputs that share a range proof were created by one transaction (" + "an " + "output group), and that grouping survives aggregation. For the usual payment-and-change transaction it publicly ties the two together, which is the one linkage this chain does not erase. A wallet can avoid it by proving each output on its own, at the cost of a larger proof; this is the share that did not."],
-        ["transactions", "One kernel is one transaction that balanced in this block. Kernels are sorted by id, so their order says nothing about which outputs are theirs."],
-        ["aggregation", "Inputs plus outputs divided by transactions: how much unrelated traffic each block merged into one body. Higher is better \u2014 it is the ratio that makes the pairings above ambiguous."],
-      ]),
-      h("div", { class: "note" }, "Nothing here reads an amount, an address or a sender: the chain records none of them. These are structural measures of how much the aggregation hides, which is the only privacy property a third party can check for itself.")));
+    section("What each number means", null, dl([
+      ["pairings", "inputs \u00d7 outputs \u2014 the assignments the chain leaves consistent. A busy block is a private one."],
+      ["public sibling", "outputs sharing a range proof came from one transaction. The one link aggregation does not erase."],
+      ["transactions", "one kernel, one transaction that balanced here."],
+      ["aggregation", "inputs+outputs per transaction \u2014 how much unrelated traffic merged into one body."],
+    ]), h("div", { class: "note" }, "No amount, address or sender is read: the chain records none. These measure how much the aggregation hides.")));
   schedule(privacyPage, 20000);
 }
 
@@ -908,8 +943,7 @@ async function networkPage() {
   const d = n.dandelion;
   view.replaceChildren(
     h("div", { class: "title" }, h("h1", null, "Network"), h("span", { class: "dim" }, "how a transaction reaches the chain, and who can watch it happen")),
-    section("Dandelion++", "as this node would route a transaction right now", dandelionDiagram(d),
-      h("div", { class: "note" }, "A transaction you submit is not broadcast. It is handed to one peer, which hands it to one peer, and so on along a private stem; only when a hop decides to fluff does it reach everyone at once. Whoever first sees the fluff sees a transaction that has already moved through several nodes, so the node it came from is not the node that made it.")),
+    section("Dandelion++", "as this node would route a transaction right now", dandelionDiagram(d)),
     section("Measured", null, h("div", { class: "grid" },
       cell("fluff chance a hop", d.fluff_percent + "%"),
       cell("expected stem hops", d.expected_hops.toFixed(1)),
@@ -918,14 +952,14 @@ async function networkPage() {
       cell("outbound peers", num(n.outbound)),
       cell("inbound peers", num(n.inbound)))),
     section("Peers", num((n.peers || []).length) + " connected \u00b7 " + num(n.banned) + " banned", peerMap(n)),
-    section("What each watcher learns", null, dl([
-      ["the peer you stem to", "That you sent it a transaction. It cannot tell whether you made it or were yourself a hop, and that ambiguity is the whole point of the stem. It does learn your address, because you connected to it."],
-      ["a later stem hop", "That the previous hop sent it a transaction. It is further from you with every hop, and the stem is a line, not a broadcast, so nobody downstream knows how long the line already is."],
-      ["whoever sees the fluff first", "A transaction, from a node that is probably not its author. If several stem transactions reach their " + d.stem_timeout_secs + "s embargo together this node merges them into one before fluffing, so even the count can be wrong."],
-      ["a node watching all traffic", "Timing. This is the real limit: an adversary running many well-connected nodes can guess an origin from who fluffed first and when. Dandelion++ raises the cost of that guess; it does not make it impossible, and no deployed design does."],
-      ["anyone with the chain", "Commitments, kernels and the shape of each block \u2014 never an amount, an address or a sender. What is and is not linkable on-chain is measured on the privacy page."],
-      ["anyone reading this page", "Peer ids, directions and transports, but not addresses: a peer id paired with an IP is what an attacker needs to sit beside a node and watch its stem traffic, or to eclipse it. This node knows those addresses and does not publish them."],
-    ])));
+    section("Who sees what", "hover the stem above", facts([
+      ["the peer you stem to", ["your address", "a transaction from you"], ["whether you wrote it"]],
+      ["a later stem hop", ["the hop before it"], ["where the stem began", "how long it already is"]],
+      ["first to see the fluff", ["a transaction"], ["its author", "how many were merged into it"]],
+      ["a node watching everything", ["timing", "who fluffed first"], ["certainty"]],
+      ["anyone with the chain", ["commitments", "kernels", "block shape"], ["amounts", "addresses", "senders"]],
+      ["anyone reading this page", ["peer ids", "directions", "transports"], ["peer addresses"]],
+    ]), h("div", { class: "note" }, "Timing is the real limit: enough well-connected nodes can still guess an origin. Dandelion++ raises the cost of that guess \u2014 it does not remove it, and no deployed design does.")));
   schedule(networkPage, 15000);
 }
 
