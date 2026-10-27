@@ -413,7 +413,15 @@ pub async fn block(
         v["output_groups"] = json!(body
             .outputs
             .iter()
-            .map(|g| json!({ "outputs": g.outputs.len(), "range_proof_bytes": g.range_proof.len() }))
+            .map(|g| json!({
+                "outputs": g.outputs.len(),
+                "range_proof_bytes": g.range_proof.len(),
+                // One group is one transaction's outputs: the group survives
+                // aggregation intact, so this membership is public even
+                // though nothing links it to the inputs that funded it
+                // (`mw::transaction::OutputGroup`).
+                "commitments": g.outputs.iter().map(|o| hex::encode(o.commitment)).collect::<Vec<_>>(),
+            }))
             .collect::<Vec<_>>());
         v["kernels"] = json!(body.kernels.iter().map(kernel_json).collect::<Vec<_>>());
         v["coinbase"] = json!(b.coinbase.as_ref().map(|c| json!({
@@ -534,6 +542,19 @@ fn bond_json(id: &[u8; 32], idx: &ExplorerIndex, state: &State, now: u64) -> Val
         "blocks_signed": signed.map_or(0, |v| v.len()),
         "last_signed": signed.and_then(|v| v.last()),
         "window_signed": state.signer_counts.get(id).copied().unwrap_or(0),
+        // The heights this bond signed inside the fork-choice window, so the
+        // explorer can draw when it signed rather than only how often. Sparse
+        // by construction: across every bond these sum to at most one entry
+        // per block in the window.
+        "window_blocks": signed
+            .map(|v| {
+                let from = state.height.saturating_sub(CAP_WINDOW as u64 - 1);
+                let mut in_window: Vec<u64> =
+                    v.iter().rev().take_while(|h| **h >= from).copied().collect();
+                in_window.reverse();
+                in_window
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -541,6 +562,10 @@ fn window_json(state: &State, now: u64) -> Value {
     json!({
         "size": CAP_WINDOW,
         "filled": state.recent_signers.len(),
+        // The window is the `size` blocks ending at the tip; the heatmap
+        // needs its position to place a signed height on the strip.
+        "tip": state.height,
+        "from": state.height.saturating_sub(CAP_WINDOW as u64 - 1),
         "cap": signer_cap(&state.bonds, now),
         // From the mainnet switch a bond past its cap mints `cap / n` of the
         // reward and the rest is burned (`bond::capped_subsidy`). Before it,
