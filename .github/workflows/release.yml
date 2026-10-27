@@ -180,7 +180,14 @@ jobs:
 
           flag=""; [ "$pre" = 1 ] && flag="--prerelease"
           if gh release view "$TAG" >/dev/null 2>&1; then
+            # Re-cutting a release that already exists, which is what a
+            # consensus fix at the same version needs: replace the binaries
+            # *and* the notes. Without the edit the page keeps advertising
+            # the commit the replaced binaries were built from, which is
+            # exactly the claim a re-cut is meant to retract.
             gh release upload "$TAG" out/* --clobber
+            gh release edit "$TAG" --notes-file notes.md \
+              --prerelease="$([ "$pre" = 1 ] && echo true || echo false)"
           else
             gh release create "$TAG" out/* --title "$TAG" --notes-file notes.md --target "$GITHUB_SHA" $flag
           fi
