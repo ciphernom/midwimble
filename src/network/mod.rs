@@ -801,6 +801,27 @@ impl Network {
             .collect()
     }
 
+    /// Each connected midwimble peer, with whether this node dialled it and
+    /// the address the connection runs over. Outbound peers are the ones
+    /// this node chose, so they are the ones an attacker cannot simply
+    /// become; the explorer draws the difference.
+    pub fn peer_details(&self) -> Vec<(String, bool, String)> {
+        let mut out: Vec<(String, bool, String)> = self
+            .connected
+            .iter()
+            .filter(|(p, _)| !self.light_peers.contains(p))
+            .map(|(p, point)| {
+                let addr = match point {
+                    ConnectedPoint::Dialer { address, .. } => address.to_string(),
+                    ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.to_string(),
+                };
+                (p.to_string(), point.is_dialer(), addr)
+            })
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
     pub fn disconnect_peer(&mut self, peer: PeerId) {
         let _ = self.swarm.disconnect_peer_id(peer);
     }

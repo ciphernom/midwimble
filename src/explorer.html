@@ -113,7 +113,7 @@
 <header>
   <div class="bar-top">
     <a class="brand" href="#/"><img src="/logo.svg" alt=""><b>Midwimble</b></a>
-    <nav><a href="#/">overview</a><a href="#/blocks">blocks</a><a href="#/bonds">bonds</a><a href="#/privacy">privacy</a></nav>
+    <nav><a href="#/">overview</a><a href="#/blocks">blocks</a><a href="#/bonds">bonds</a><a href="#/privacy">privacy</a><a href="#/network">network</a></nav>
     <form id="search" autocomplete="off">
       <input id="q" placeholder="height, block hash, output commitment, kernel or bond id" spellcheck="false">
       <button>find</button>
@@ -474,6 +474,104 @@ function ageHistogram(b) {
     h("div", { class: "legend" }, h("span", null, "blocks between an output being created and this block spending it")));
 }
 
+// Dandelion++: a transaction does not go straight to the gossip network.
+// It walks a private stem, one peer at a time, and only then fluffs out to
+// everyone. The fluff probability is not fixed -- `Node::route_stem` sets it
+// to 100/outbound peers, clamped to 2..50 -- so a better-connected node
+// stems further before broadcasting.
+function dandelionDiagram(d) {
+  const W = 760, H = 230, y = 118, x0 = 58, xF = 568;
+  const hops = Math.max(1, Math.min(5, Math.round(d.expected_hops)));
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
+  const dot = (cx, cy, r, fill, op) => svg("circle", { cx, cy, r, fill, opacity: op == null ? 1 : op });
+  const txt = (x, yy, t, fill, anchor, size) => {
+    const e = svg("text", { x, y: yy, fill, "font-size": size || 11, "text-anchor": anchor || "middle" });
+    e.textContent = t;
+    return e;
+  };
+  const step = (xF - x0) / (hops + 1);
+
+  s.appendChild(svg("line", { x1: x0, y1: y, x2: xF, y2: y, stroke: "#8b5cf6", "stroke-width": 2, opacity: .45 }));
+  // The fluff: everyone this node gossips to, and onward.
+  const fan = 11;
+  for (let i = 0; i < fan; i++) {
+    const a = -1.15 + (i / (fan - 1)) * 2.3, len = 74 + (i % 3) * 16;
+    const ex = xF + Math.cos(a) * len, ey = y + Math.sin(a) * len;
+    s.appendChild(svg("line", { x1: xF, y1: y, x2: ex, y2: ey, stroke: "#00ff41", "stroke-width": 1, opacity: .3 }));
+    s.appendChild(dot(ex, ey, 3.5, "#00ff41", .75));
+  }
+  const burst = dot(xF, y, 6, "none", 1);
+  burst.setAttribute("stroke", "#00ff41");
+  burst.setAttribute("fill", "none");
+  burst.appendChild(svg("animate", { attributeName: "r", values: "6;64", dur: "1.6s", begin: "2.4s;burst.end+2.4s", id: "burst", repeatCount: "1" }));
+  burst.appendChild(svg("animate", { attributeName: "opacity", values: ".9;0", dur: "1.6s", begin: "2.4s;burst.end+2.4s", repeatCount: "1" }));
+  s.appendChild(burst);
+
+  for (let i = 0; i <= hops; i++) {
+    const cx = x0 + step * i;
+    s.appendChild(dot(cx, y, i === 0 ? 9 : 6, i === 0 ? "#f4f3f7" : "#8b5cf6", i === 0 ? 1 : .85));
+    if (i === 0) s.appendChild(txt(cx, y - 20, "you", "#f4f3f7"));
+    else s.appendChild(txt(cx, y - 18, "hop " + i, "#9c98aa", "middle", 10));
+  }
+  s.appendChild(dot(xF, y, 9, "#00ff41"));
+  s.appendChild(txt(xF, y - 22, "fluff", "#00ff41"));
+
+  // The travelling transaction.
+  const car = dot(0, 0, 4.5, "#f5c451");
+  car.appendChild(svg("animateMotion", { dur: "2.4s", repeatCount: "indefinite", path: `M${x0},${y} L${xF},${y}` }));
+  s.appendChild(car);
+
+  s.appendChild(txt(W / 2, 30, "stem \u00b7 one peer at a time, nobody else sees it", "#a78bfa"));
+  s.appendChild(txt(x0, H - 34, "your node", "#9c98aa", "start", 10));
+  s.appendChild(txt(xF + 86, H - 34, "the whole network", "#9c98aa", "end", 10));
+  s.appendChild(txt(W / 2, H - 10,
+    d.fluff_percent + "% chance of fluffing at each hop \u00b7 about " + d.expected_hops.toFixed(1) + " hops \u00b7 " + d.stem_timeout_secs + "s embargo",
+    "#9c98aa", "middle", 11));
+  return h("div", { class: "diagram" }, s);
+}
+
+// This node's peers, outbound (ones it chose) distinguished from inbound
+// (ones that chose it). Addresses arrive already stripped of their host.
+function peerMap(n) {
+  const peers = n.peers || [];
+  if (!peers.length) return h("div", { class: "empty" }, "no peers connected");
+  const W = 760, H = 330, cx = W / 2, cy = H / 2, R = 128;
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
+  const COLOURS = { tcp: "#8b5cf6", quic: "#a78bfa", webrtc: "#00ff41", other: "#9c98aa" };
+  peers.forEach((p, i) => {
+    const a = (i / peers.length) * Math.PI * 2 - Math.PI / 2;
+    const rr = R + (p.outbound ? 0 : 42);
+    const x = cx + Math.cos(a) * rr, y = cy + Math.sin(a) * rr;
+    s.appendChild(svg("line", { x1: cx, y1: cy, x2: x, y2: y,
+      stroke: p.outbound ? "#00ff41" : "#8b5cf6", "stroke-width": p.outbound ? 1.4 : 0.8,
+      opacity: p.outbound ? .4 : .22, "stroke-dasharray": p.outbound ? null : "3 4" }));
+    const c = svg("circle", { cx: x, cy: y, r: p.outbound ? 6 : 4.5,
+      fill: COLOURS[p.transport] || COLOURS.other, opacity: p.outbound ? .95 : .6 });
+    c.appendChild(svg("title")).textContent =
+      p.id + "\n" + (p.outbound ? "outbound \u2014 this node dialled it" : "inbound \u2014 it dialled this node") +
+      "\n" + p.transport + " \u00b7 " + p.addr;
+    s.appendChild(c);
+  });
+  const me = svg("circle", { cx, cy, r: 11, fill: "#f4f3f7" });
+  s.appendChild(svg("circle", { cx, cy, r: 11, fill: "none", stroke: "#f4f3f7", "stroke-width": 1, opacity: .5 },
+    svg("animate", { attributeName: "r", values: "11;34", dur: "3s", repeatCount: "indefinite" }),
+    svg("animate", { attributeName: "opacity", values: ".5;0", dur: "3s", repeatCount: "indefinite" })));
+  s.appendChild(me);
+  const lab = svg("text", { x: cx, y: cy + 30, fill: "#f4f3f7", "font-size": 11, "text-anchor": "middle" });
+  lab.textContent = "this node";
+  s.appendChild(lab);
+  // Direction is the line, transport is the dot: say so, rather than
+  // leaving a swatch to imply that green means outbound when it means
+  // webrtc.
+  return h("div", { class: "diagram" }, s, h("div", { class: "legend" },
+    h("span", null, h("i", { style: "background:" + COLOURS.tcp }), "tcp"),
+    h("span", null, h("i", { style: "background:" + COLOURS.quic }), "quic"),
+    h("span", null, h("i", { style: "background:" + COLOURS.webrtc }), "webrtc"),
+    h("span", null, "solid line, larger dot \u2014 outbound, a peer this node chose"),
+    h("span", null, "dashed line \u2014 inbound, a peer that dialled in"),
+    h("span", null, "addresses are shown without their host \u2014 see below")));
+}
+
 // Who signed when, across the fork-choice window. Sparse by construction:
 // one tick per block, so the whole window costs at most `size` marks.
 function signerHeatmap(r) {
@@ -805,6 +903,32 @@ async function privacyPage() {
   schedule(privacyPage, 20000);
 }
 
+async function networkPage() {
+  const n = await get("/explorer/network");
+  const d = n.dandelion;
+  view.replaceChildren(
+    h("div", { class: "title" }, h("h1", null, "Network"), h("span", { class: "dim" }, "how a transaction reaches the chain, and who can watch it happen")),
+    section("Dandelion++", "as this node would route a transaction right now", dandelionDiagram(d),
+      h("div", { class: "note" }, "A transaction you submit is not broadcast. It is handed to one peer, which hands it to one peer, and so on along a private stem; only when a hop decides to fluff does it reach everyone at once. Whoever first sees the fluff sees a transaction that has already moved through several nodes, so the node it came from is not the node that made it.")),
+    section("Measured", null, h("div", { class: "grid" },
+      cell("fluff chance a hop", d.fluff_percent + "%"),
+      cell("expected stem hops", d.expected_hops.toFixed(1)),
+      cell("embargo", d.stem_timeout_secs + "s", true),
+      cell("in the stem pool", num(d.stem_pool) + " of " + num(d.max_stem_pool), true),
+      cell("outbound peers", num(n.outbound)),
+      cell("inbound peers", num(n.inbound)))),
+    section("Peers", num((n.peers || []).length) + " connected \u00b7 " + num(n.banned) + " banned", peerMap(n)),
+    section("What each watcher learns", null, dl([
+      ["the peer you stem to", "That you sent it a transaction. It cannot tell whether you made it or were yourself a hop, and that ambiguity is the whole point of the stem. It does learn your address, because you connected to it."],
+      ["a later stem hop", "That the previous hop sent it a transaction. It is further from you with every hop, and the stem is a line, not a broadcast, so nobody downstream knows how long the line already is."],
+      ["whoever sees the fluff first", "A transaction, from a node that is probably not its author. If several stem transactions reach their " + d.stem_timeout_secs + "s embargo together this node merges them into one before fluffing, so even the count can be wrong."],
+      ["a node watching all traffic", "Timing. This is the real limit: an adversary running many well-connected nodes can guess an origin from who fluffed first and when. Dandelion++ raises the cost of that guess; it does not make it impossible, and no deployed design does."],
+      ["anyone with the chain", "Commitments, kernels and the shape of each block \u2014 never an amount, an address or a sender. What is and is not linkable on-chain is measured on the privacy page."],
+      ["anyone reading this page", "Peer ids, directions and transports, but not addresses: a peer id paired with an IP is what an attacker needs to sit beside a node and watch its stem traffic, or to eclipse it. This node knows those addresses and does not publish them."],
+    ])));
+  schedule(networkPage, 15000);
+}
+
 // ---------- routing, refresh, search ---------------------------------------
 let timer = null, generation = 0;
 function schedule(fn, ms) {
@@ -820,6 +944,7 @@ const routes = [
   [/^#\/kernel\/([0-9a-fA-F]{64})$/, kernelPage],
   [/^#\/bonds$/, bondsPage],
   [/^#\/privacy$/, privacyPage],
+  [/^#\/network$/, networkPage],
   [/^#\/bond\/([0-9a-fA-F]{64})$/, bondPage],
 ];
 async function route() {

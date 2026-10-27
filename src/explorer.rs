@@ -646,6 +646,70 @@ pub async fn bond(
     .await
 }
 
+/// The transport a multiaddr runs over, and the same address with its host
+/// removed.
+///
+/// The explorer may be served to anyone, and a peer id paired with an IP is
+/// exactly what an attacker needs to eclipse a node or to sit next to one
+/// and watch its stem traffic. The shape of the address is useful and the
+/// host is not, so the host goes.
+fn redact_addr(addr: &str) -> (String, String) {
+    let transport = if addr.contains("/webrtc-direct") {
+        "webrtc"
+    } else if addr.contains("/quic") {
+        "quic"
+    } else if addr.contains("/tcp") {
+        "tcp"
+    } else {
+        "other"
+    };
+    let mut out = String::new();
+    let mut hide = false;
+    for part in addr.split('/').skip(1) {
+        out.push('/');
+        if hide {
+            out.push('\u{2026}');
+            hide = false;
+        } else {
+            out.push_str(part);
+            hide = matches!(part, "ip4" | "ip6" | "dns" | "dns4" | "dns6" | "dnsaddr");
+        }
+    }
+    (transport.to_string(), out)
+}
+
+/// This node's view of the network: who it is connected to, and what
+/// Dandelion++ would do with a transaction entered right now.
+pub async fn network(AxState(node): AxState<NodeHandle>) -> Json<Value> {
+    let info = node.info();
+    let d = &info.dandelion;
+    let peers: Vec<Value> = info
+        .peer_details
+        .iter()
+        .map(|p| {
+            let (transport, addr) = redact_addr(&p.addr);
+            json!({ "id": p.id, "outbound": p.outbound, "transport": transport, "addr": addr })
+        })
+        .collect();
+    Json(json!({
+        "peer_id": info.peer_id,
+        "peers": peers,
+        "inbound": peers.iter().filter(|p| p["outbound"] == json!(false)).count(),
+        "outbound": d.outbound_peers,
+        "banned": info.banned.len(),
+        "mempool_count": info.mempool_count,
+        "listening": info.listen_addrs.len(),
+        // Dandelion++ exactly as `Node::route_stem` would apply it now.
+        "dandelion": {
+            "fluff_percent": d.fluff_percent,
+            "expected_hops": if d.fluff_percent > 0 { 100.0 / d.fluff_percent as f64 } else { 0.0 },
+            "stem_timeout_secs": d.stem_timeout_secs,
+            "stem_pool": d.stem_pool,
+            "max_stem_pool": d.max_stem_pool,
+        },
+    }))
+}
+
 /// What a search term names: a height, or a block hash, output commitment,
 /// kernel excess or bond id.
 pub async fn search(

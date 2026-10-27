@@ -204,12 +204,37 @@ impl NodeConfig {
     }
 }
 
+/// One connected peer, as the explorer's network map draws it.
+#[derive(Clone)]
+pub struct PeerDetail {
+    pub id: String,
+    /// This node dialled it, rather than it dialling us.
+    pub outbound: bool,
+    pub addr: String,
+}
+
+/// Dandelion++ as it stands this instant. The fluff probability is not a
+/// constant: it is `100 / outbound peers`, clamped, so a better-connected
+/// node stems further before broadcasting (`Node::route_stem`).
+#[derive(Clone, Default)]
+pub struct DandelionInfo {
+    pub outbound_peers: usize,
+    pub fluff_percent: u32,
+    pub stem_timeout_secs: u64,
+    pub stem_pool: usize,
+    pub max_stem_pool: usize,
+}
+
 /// Read-mostly view published by the node for the RPC and tests.
 #[derive(Clone)]
 pub struct NodeInfo {
     pub state: State,
     pub peer_id: String,
     pub peers: Vec<String>,
+    /// The same peers, with direction and address, for the network map.
+    pub peer_details: Vec<PeerDetail>,
+    /// What Dandelion++ would do with a transaction entered right now.
+    pub dandelion: DandelionInfo,
     pub listen_addrs: Vec<String>,
     /// Addresses browser wallets dial (`Network::webrtc_addrs`).
     pub webrtc_addrs: Vec<String>,
@@ -671,6 +696,8 @@ impl Node {
         let addr_book = AddressBook::new(storage.load_peers()?, &config.bootstrap);
 
         let info = Arc::new(RwLock::new(NodeInfo {
+            peer_details: Vec::new(),
+            dandelion: DandelionInfo::default(),
             state: state.clone(),
             peer_id: network.local_peer_id().to_string(),
             peers: Vec::new(),
@@ -846,6 +873,22 @@ impl Node {
             .iter()
             .map(|p| p.to_string())
             .collect();
+        info.peer_details = self
+            .network
+            .peer_details()
+            .into_iter()
+            .map(|(id, outbound, addr)| PeerDetail { id, outbound, addr })
+            .collect();
+        // Mirrors `route_stem` exactly: the explorer must not publish a
+        // probability the node would not actually use.
+        let outbound = self.network.outbound_peer_count().max(1) as u32;
+        info.dandelion = DandelionInfo {
+            outbound_peers: self.network.outbound_peer_count(),
+            fluff_percent: (100 / outbound).clamp(2, 50),
+            stem_timeout_secs: self.config.stem_timeout.as_secs(),
+            stem_pool: self.stem_pool.len(),
+            max_stem_pool: MAX_STEM_POOL,
+        };
         info.listen_addrs = self
             .network
             .listen_addrs()
