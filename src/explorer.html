@@ -684,22 +684,77 @@ function blockRows(blocks) {
      b.registrations ? tag("ok", "+" + b.registrations + " bond") : null],
   ]);
 }
-// The newest blocks as a strip you can click straight into. A block that
-// arrived since the last render slides in, so the page shows the chain
-// moving rather than just reporting that it did.
-let trainTop = null;
+// The newest blocks as a strip you can click straight into.
+//
+// The strip is kept, not rebuilt. A refresh that brings no new block must
+// touch nothing: rebuilding it every ten seconds would throw away the
+// reader's scroll position and whatever they were hovering, and would make
+// the train lurch when the chain had not moved at all. So the element
+// persists across renders, new blocks are inserted at the front, and only
+// those carry the slide-in. `view.replaceChildren` moves this node rather
+// than copying it, so re-appending the same element keeps its children.
+let trainEl = null, trainTop = null, trainTopHash = null;
+const TRAIN_CARDS = 14;
 function blockTrain(blocks) {
-  const train = h("div", { class: "train" });
-  blocks.slice(0, 14).forEach(b => {
-    const fresh = trainTop != null && b.height > trainTop;
-    train.appendChild(h("a", { class: fresh ? "fresh" : null, href: "#/block/" + b.height },
+  // Detaching a scrollable element resets its scroll, and `replaceChildren`
+  // detaches this one on every render. Keeping the node is not enough on its
+  // own: where the reader had scrolled to has to be put back after it is
+  // re-attached.
+  const keep = trainEl ? trainEl.scrollLeft : 0;
+  let rebuilt = false;
+  const card = b => {
+    const age = h("div", { class: "sub" }, ago(b.timestamp));
+    const el = h("a", { href: "#/block/" + b.height },
       h("div", { class: "hh" }, num(b.height)),
-      h("div", { class: "sub" }, ago(b.timestamp)),
+      age,
       h("div", { class: "sub" }, (b.kernels || 0) + " tx \u00b7 " + num(b.size) + " B"),
-      h("div", { class: "sub" }, b.merged ? "merge-mined" : "native")));
-  });
-  if (blocks.length) trainTop = blocks[0].height;
-  return train;
+      h("div", { class: "sub" }, b.merged ? "merge-mined" : "native"));
+    el._ts = b.timestamp;
+    el._age = age;
+    return el;
+  };
+  const rebuild = () => {
+    trainEl = h("div", { class: "train" });
+    blocks.slice(0, TRAIN_CARDS).forEach(b => trainEl.appendChild(card(b)));
+    rebuilt = true;
+  };
+  if (!blocks.length) return trainEl || (trainEl = h("div", { class: "train" }));
+  const top = blocks[0];
+  if (!trainEl || trainTop == null) {
+    rebuild();
+  } else if (top.height < trainTop || (top.height === trainTop && top.hash !== trainTopHash)) {
+    // A reorg replaced what the strip is showing, so it is no longer the
+    // chain: start again rather than animate blocks that were never added.
+    rebuild();
+  } else {
+    // Oldest first, so each lands at the front in the order it arrived.
+    blocks
+      .filter(b => b.height > trainTop)
+      .sort((a, b) => a.height - b.height)
+      .forEach(b => {
+        const el = card(b);
+        el.classList.add("fresh");
+        trainEl.insertBefore(el, trainEl.firstChild);
+        // Dropped once it has played, so moving the strip into a freshly
+        // rendered page cannot replay it.
+        setTimeout(() => el.classList.remove("fresh"), 700);
+      });
+    while (trainEl.children.length > TRAIN_CARDS) trainEl.removeChild(trainEl.lastChild);
+  }
+  // Ages would otherwise freeze at whatever they were when the card was
+  // made, so they are refreshed in place rather than by rebuilding.
+  for (const el of trainEl.children) if (el._age) el._age.textContent = ago(el._ts);
+  trainTop = top.height;
+  trainTopHash = top.hash;
+  // After a rebuild the strip is a different chain, so it starts at the
+  // newest; otherwise the reader goes back where they were, once the node
+  // is attached again.
+  const scroll = rebuilt ? 0 : keep;
+  if (scroll) {
+    const el = trainEl;
+    requestAnimationFrame(() => { el.scrollLeft = scroll; });
+  }
+  return trainEl;
 }
 
 const BLOCK_HEADS = ["height", "age", "interval", "in / out / kern", "fees", "bytes", "signed by", "work"];
