@@ -97,6 +97,23 @@
   .diagram svg { width: 100%; display: block; }
   .legend { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); font-size: 11px; letter-spacing: .06em; margin-top: 10px; }
   .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  .train { display: flex; gap: 10px; overflow-x: auto; padding: 14px 20px 18px; scrollbar-width: thin; }
+  .train a { flex: 0 0 136px; background: var(--panel2); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 12px; color: var(--text); transition: transform .18s, border-color .18s; }
+  .train a:hover { transform: translateY(-3px); border-color: var(--lilac); text-decoration: none; }
+  .train a.fresh { animation: slidein .55s ease-out; border-color: rgba(0, 255, 65, .55); }
+  @keyframes slidein { from { opacity: 0; transform: translateX(-26px); } }
+  .train .hh { font: 600 15px var(--mono); color: var(--lilac); }
+  .train .sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  svg a { cursor: pointer; }
+  svg a:hover rect, svg a:hover circle, svg a:hover path { opacity: 1; }
+  .txrow { border-bottom: 1px solid var(--line); }
+  .txrow summary { padding: 10px 20px; cursor: pointer; display: grid; gap: 14px; align-items: center;
+    grid-template-columns: minmax(130px, auto) 1fr auto; list-style: none; }
+  .txrow summary::-webkit-details-marker { display: none; }
+  .txrow summary:hover { background: rgba(167, 139, 250, .05); }
+  .txrow[open] summary { background: rgba(167, 139, 250, .07); }
+  .txrow .body { padding: 4px 20px 16px; }
   .facts { display: grid; grid-template-columns: minmax(130px, auto) 1fr; gap: 1px 16px; padding: 4px 20px 16px; }
   .facts .who { color: var(--muted); font: 600 11px var(--mono); letter-spacing: .12em; text-transform: uppercase; padding: 9px 0; white-space: nowrap; }
   .facts .pills { padding: 7px 0; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
@@ -121,7 +138,7 @@
 <header>
   <div class="bar-top">
     <a class="brand" href="#/"><img src="/logo.svg" alt=""><b>Midwimble</b></a>
-    <nav><a href="#/">overview</a><a href="#/blocks">blocks</a><a href="#/bonds">bonds</a><a href="#/privacy">privacy</a><a href="#/network">network</a></nav>
+    <nav><a href="#/">overview</a><a href="#/blocks">blocks</a><a href="#/bonds">bonds</a><a href="#/mempool">mempool</a><a href="#/privacy">privacy</a><a href="#/network">network</a></nav>
     <form id="search" autocomplete="off">
       <input id="q" placeholder="height, block hash, output commitment, kernel or bond id" spellcheck="false">
       <button>find</button>
@@ -230,7 +247,7 @@ function svg(tagName, attrs, ...kids) {
   kids.forEach(k => n.appendChild(k));
   return n;
 }
-function intervalChart(values, target) {
+function intervalChart(values, target, href) {
   const W = 600, H = 120, max = Math.max(target * 3, ...values);
   const bw = W / Math.max(values.length, 1);
   const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none" });
@@ -238,8 +255,7 @@ function intervalChart(values, target) {
     const bh = Math.max(1, (Math.min(v, max) / max) * (H - 4));
     const r = svg("rect", { x: i * bw + 1, y: H - bh, width: Math.max(1, bw - 2), height: bh,
       fill: v > target * 2.5 ? "#f5c451" : "#8b5cf6", opacity: .85 });
-    r.appendChild(svg("title")).textContent = v + "s";
-    s.appendChild(r);
+    s.appendChild(href ? svgLink(href(i), r, v + "s") : (r.appendChild(svg("title")).textContent = v + "s", r));
   });
   const y = H - (target / max) * (H - 4);
   s.appendChild(svg("line", { x1: 0, x2: W, y1: y, y2: y, stroke: "#00ff41", "stroke-dasharray": "4 4", "stroke-width": 1 }));
@@ -252,7 +268,16 @@ function lineChart(values) {
     svg("polyline", { points: pts.join(" "), fill: "none", stroke: "#a78bfa", "stroke-width": 2, "vector-effect": "non-scaling-stroke" }));
 }
 
-function barChart(values, { colour = "#8b5cf6", log = false, label = String } = {}) {
+// Wraps a mark so clicking it goes somewhere. Everything the explorer
+// draws is a block, so almost everything should be clickable.
+function svgLink(href, kid, title) {
+  const a = svg("a", { href });
+  if (title) kid.appendChild(svg("title")).textContent = title;
+  a.appendChild(kid);
+  return a;
+}
+
+function barChart(values, { colour = "#8b5cf6", log = false, label = String, href = null } = {}) {
   const W = 600, H = 120, f = log ? (v => Math.log10(1 + v)) : (v => v);
   const max = Math.max(...values.map(f), 1e-9), bw = W / Math.max(values.length, 1);
   const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none" });
@@ -260,8 +285,7 @@ function barChart(values, { colour = "#8b5cf6", log = false, label = String } = 
     if (!v) return;
     const bh = Math.max(1, (f(v) / max) * (H - 4));
     const r = svg("rect", { x: i * bw, y: H - bh, width: Math.max(0.8, bw - 0.5), height: bh, fill: colour, opacity: .8 });
-    r.appendChild(svg("title")).textContent = label(v, i);
-    s.appendChild(r);
+    s.appendChild(href ? svgLink(href(i), r, label(v, i)) : (r.appendChild(svg("title")).textContent = label(v, i), r));
   });
   return s;
 }
@@ -429,11 +453,15 @@ function spendArcs(b) {
     const x = xOf(hh), lift = (up ? -1 : 1) * (mid - 18);
     const p = svg("path", { d: `M${x},${mid} Q${(x + W / 2) / 2},${mid + lift} ${W / 2},${mid}`,
       fill: "none", stroke: colour, "stroke-width": Math.min(4, 0.8 + Math.log2(1 + n)), opacity: .55 });
-    p.appendChild(svg("title")).textContent =
-      n + (n === 1 ? " output" : " outputs") + (up ? " created in block " : " spent in block ") + hh +
+    const tip = n + (n === 1 ? " output" : " outputs") + (up ? " created in block " : " spent in block ") + hh +
       " (" + Math.abs(hh - b.height) + " blocks " + (up ? "earlier" : "later") + ")";
-    s.appendChild(p);
-    s.appendChild(svg("circle", { cx: x, cy: mid, r: 2.5, fill: colour, opacity: .8 }));
+    // A 1-4px arc is a miserable click target, so each one carries an
+    // invisible fat stroke underneath purely to be hit.
+    const hit = svg("path", { d: p.getAttribute("d"), fill: "none", stroke: "transparent", "stroke-width": 14 });
+    const a = svgLink("#/block/" + hh, hit, tip);
+    a.appendChild(p);
+    s.appendChild(a);
+    s.appendChild(svgLink("#/block/" + hh, svg("circle", { cx: x, cy: mid, r: 2.5, fill: colour, opacity: .8 })));
   };
   [...back.entries()].forEach(([hh, n]) => arc(hh, n, true, COL.in));
   [...fwd.entries()].forEach(([hh, n]) => arc(hh, n, false, COL.out));
@@ -629,8 +657,7 @@ function signerHeatmap(r) {
       const x = ((hh - w.from) / size) * W;
       const t = svg("rect", { x: Math.max(0, Math.min(W - 2, x)), y: 1, width: 2, height: 11,
         fill: over ? "#f5c451" : COL.out, opacity: .85 });
-      t.appendChild(svg("title")).textContent = "block " + hh;
-      s.appendChild(t);
+      s.appendChild(svgLink("#/block/" + hh, t, "block " + hh));
     });
     grid.appendChild(h("div", { class: "lab" }, link("bond", b.bond_id, short(b.bond_id, 12))));
     grid.appendChild(s);
@@ -657,6 +684,24 @@ function blockRows(blocks) {
      b.registrations ? tag("ok", "+" + b.registrations + " bond") : null],
   ]);
 }
+// The newest blocks as a strip you can click straight into. A block that
+// arrived since the last render slides in, so the page shows the chain
+// moving rather than just reporting that it did.
+let trainTop = null;
+function blockTrain(blocks) {
+  const train = h("div", { class: "train" });
+  blocks.slice(0, 14).forEach(b => {
+    const fresh = trainTop != null && b.height > trainTop;
+    train.appendChild(h("a", { class: fresh ? "fresh" : null, href: "#/block/" + b.height },
+      h("div", { class: "hh" }, num(b.height)),
+      h("div", { class: "sub" }, ago(b.timestamp)),
+      h("div", { class: "sub" }, (b.kernels || 0) + " tx \u00b7 " + num(b.size) + " B"),
+      h("div", { class: "sub" }, b.merged ? "merge-mined" : "native")));
+  });
+  if (blocks.length) trainTop = blocks[0].height;
+  return train;
+}
+
 const BLOCK_HEADS = ["height", "age", "interval", "in / out / kern", "fees", "bytes", "signed by", "work"];
 const blockTable = blocks => blocks.length ? table(BLOCK_HEADS, blockRows(blocks), [4, 5]) : h("div", { class: "empty" }, "no blocks yet");
 
@@ -664,7 +709,8 @@ const blockTable = blocks => blocks.length ? table(BLOCK_HEADS, blockRows(blocks
 async function overview() {
   const [s, recent, bonds] = await Promise.all([get("/state"), get("/explorer/blocks?count=100"), get("/explorer/bonds")]);
   const blocks = recent.blocks;
-  const intervals = blocks.map(b => b.interval).filter(x => x != null).reverse();
+  const timed = blocks.filter(b => b.interval != null).slice().reverse();
+  const intervals = timed.map(b => b.interval);
   const avg = intervals.length ? intervals.reduce((a, b) => a + b, 0) / intervals.length : null;
   const bits = blocks.length ? blocks[0].difficulty_bits : 0;
   const hashrate = avg ? Math.pow(2, bits) / Math.max(avg, 1) : null;
@@ -684,11 +730,12 @@ async function overview() {
     cell("peers", String(s.peers.length)),
     cell("this node", (s.mining ? "mining" : "not mining") + (s.syncing ? ", syncing" : ""), true));
   const charts = h("div", { class: "charts" },
-    h("div", { class: "chart" }, h("div", { class: "k" }, "block interval · last " + intervals.length + " · dashed = 60s"), intervalChart(intervals, 60)),
+    h("div", { class: "chart" }, h("div", { class: "k" }, "block interval · last " + intervals.length + " · dashed = 60s · click a bar"),
+      intervalChart(intervals, 60, i => "#/block/" + timed[i].height)),
     h("div", { class: "chart" }, h("div", { class: "k" }, "difficulty (bits) · last " + blocks.length), lineChart(blocks.map(b => b.difficulty_bits).reverse())));
   view.replaceChildren(
     section("Chain", "refreshes every 10s", stats, charts),
-    section("Latest blocks", h("a", { href: "#/blocks" }, "all blocks →"), blockTable(blocks.slice(0, 15))),
+    section("Latest blocks", h("a", { href: "#/blocks" }, "all blocks →"), blockTrain(blocks), blockTable(blocks.slice(0, 15))),
     section("Mining bonds", h("a", { href: "#/bonds" }, "details →"), bondTable(bonds)));
   schedule(overview, 10000);
 }
@@ -938,6 +985,51 @@ async function privacyPage() {
   schedule(privacyPage, 20000);
 }
 
+async function mempoolPage() {
+  const m = await get("/explorer/mempool");
+  const txs = m.transactions || [];
+  const rate = t => t.fee_rate || 0;
+  const stats = h("div", { class: "grid" },
+    cell("waiting", num(m.count)),
+    cell("total fees", coins(m.fees)),
+    cell("weight", num(m.weight)),
+    cell("best fee rate", txs.length ? num(Math.round(rate(txs[0]))) + " units/wt" : "\u2014", true));
+
+  const list = h("div", null);
+  txs.forEach(t => {
+    const row = h("details", { class: "txrow" });
+    const sum = h("summary", null,
+      h("span", { class: "hash" }, short(t.hash, 16)),
+      h("span", { class: "dim" }, t.inputs + " in \u00b7 " + t.outputs + " out \u00b7 " + t.kernels + " kernel" + (t.kernels === 1 ? "" : "s")),
+      h("span", null, coins(t.fee), h("span", { class: "dim" }, "  " + num(Math.round(rate(t))) + " units/wt")));
+    row.appendChild(sum);
+    const body = h("div", { class: "body" });
+    body.appendChild(dl([
+      ["spends", t.spends.length
+        ? h("div", null, t.spends.map((c, i) => [i ? " \u00b7 " : null, link("output", c, short(c, 14))]))
+        : h("span", { class: "dim" }, "nothing \u2014 new coins only")],
+      ...t.groups.map((g, gi) => ["creates" + (t.groups.length > 1 ? " (tx output group " + (gi + 1) + ")" : ""),
+        h("div", null,
+          g.commitments.map((c, i) => [i ? " \u00b7 " : null, link("output", c, short(c, 14))]),
+          h("div", { class: "dim" }, g.commitments.length + " output" + (g.commitments.length === 1 ? "" : "s") + " under one " + num(g.range_proof_bytes) + "-byte range proof"))]),
+      ["weight", num(t.weight)],
+    ]));
+    row.appendChild(body);
+    list.appendChild(row);
+  });
+
+  view.replaceChildren(
+    h("div", { class: "title" }, h("h1", null, "Mempool"), h("span", { class: "dim" }, "transactions waiting, best fee rate first")),
+    section("Waiting", "refreshes every 5s", stats,
+      txs.length ? h("div", { class: "charts" }, h("div", { class: "chart" },
+        h("div", { class: "k" }, "fee rate per transaction"),
+        barChart(txs.map(rate), { colour: "#f5c451", label: (v, i) => num(Math.round(v)) + " units per weight \u00b7 " + short(txs[i].hash, 12) }))) : null),
+    section("Transactions", m.listed < m.count ? "showing " + num(m.listed) + " of " + num(m.count) : null,
+      txs.length ? list : h("div", { class: "empty" }, "nothing waiting"),
+      h("div", { class: "note" }, "Here each of these is a separate transaction, with its own inputs, outputs and kernel. The block that takes them aggregates them \u2014 inputs and kernels flattened and sorted \u2014 and these boundaries stop existing. Every output above is already a working link: follow it after the block lands and it resolves to the block that created it.")));
+  schedule(mempoolPage, 5000);
+}
+
 async function networkPage() {
   const n = await get("/explorer/network");
   const d = n.dandelion;
@@ -979,6 +1071,7 @@ const routes = [
   [/^#\/bonds$/, bondsPage],
   [/^#\/privacy$/, privacyPage],
   [/^#\/network$/, networkPage],
+  [/^#\/mempool$/, mempoolPage],
   [/^#\/bond\/([0-9a-fA-F]{64})$/, bondPage],
 ];
 async function route() {

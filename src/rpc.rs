@@ -106,6 +106,7 @@ pub fn router_with(node: NodeHandle, options: &RpcOptions, index: SharedIndex) -
             get(crate::explorer::output),
         )
         .route("/explorer/kernel/{excess}", get(crate::explorer::kernel))
+        .route("/explorer/mempool", get(crate::explorer::mempool))
         .route("/explorer/network", get(crate::explorer::network))
         .route("/explorer/bonds", get(crate::explorer::bonds))
         .route("/explorer/bond/{id}", get(crate::explorer::bond))
@@ -138,6 +139,7 @@ pub fn explorer_router(node: NodeHandle, index: SharedIndex) -> Router {
             get(crate::explorer::output),
         )
         .route("/explorer/kernel/{excess}", get(crate::explorer::kernel))
+        .route("/explorer/mempool", get(crate::explorer::mempool))
         .route("/explorer/network", get(crate::explorer::network))
         .route("/explorer/bonds", get(crate::explorer::bonds))
         .route("/explorer/bond/{id}", get(crate::explorer::bond))

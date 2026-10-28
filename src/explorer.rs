@@ -646,6 +646,71 @@ pub async fn bond(
     .await
 }
 
+/// Most mempool transactions the explorer lists.
+const MAX_MEMPOOL_LISTED: usize = 200;
+
+/// The mempool, transaction by transaction.
+///
+/// This is the only place on this chain where a transaction exists as a
+/// separate object. The block that takes it will aggregate it with every
+/// other transaction it carries -- inputs and kernels flattened and sorted,
+/// the boundaries gone -- so what is listed here is strictly more than any
+/// later observer can recover. The output commitments come with it: the
+/// same links keep working once the transaction confirms, which is how a
+/// reader follows one *through* aggregation and watches it stop being
+/// distinguishable.
+pub async fn mempool(AxState(node): AxState<NodeHandle>) -> ApiResult {
+    let txs = node.mempool().await.map_err(internal)?;
+    let (count, weight) = (txs.len(), txs.iter().map(|t| t.weight()).sum::<u64>());
+    let fees: u64 = txs.iter().map(|t| t.fee().unwrap_or(0)).sum();
+    let mut list: Vec<Value> = txs
+        .iter()
+        .map(|t| {
+            let outputs: Vec<&crate::core::mw::transaction::OutputGroup> =
+                t.body.outputs.iter().collect();
+            let fee = t.fee().unwrap_or(0);
+            let weight = t.weight().max(1);
+            json!({
+                "hash": hex::encode(t.hash()),
+                "fee": fee,
+                "weight": weight,
+                "fee_rate": fee as f64 / weight as f64,
+                "inputs": t.body.inputs.len(),
+                "outputs": outputs.iter().map(|g| g.outputs.len()).sum::<usize>(),
+                "kernels": t.body.kernels.len(),
+                "groups": outputs
+                    .iter()
+                    .map(|g| json!({
+                        "range_proof_bytes": g.range_proof.len(),
+                        "commitments": g.outputs.iter().map(|o| hex::encode(o.commitment)).collect::<Vec<_>>(),
+                    }))
+                    .collect::<Vec<_>>(),
+                "spends": t
+                    .body
+                    .inputs
+                    .iter()
+                    .map(|i| hex::encode(i.commitment))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    // Highest fee rate first: the order a miner would take them in.
+    list.sort_by(|a, b| {
+        b["fee_rate"]
+            .as_f64()
+            .unwrap_or(0.0)
+            .total_cmp(&a["fee_rate"].as_f64().unwrap_or(0.0))
+    });
+    list.truncate(MAX_MEMPOOL_LISTED);
+    Ok(Json(json!({
+        "count": count,
+        "weight": weight,
+        "fees": fees,
+        "listed": list.len(),
+        "transactions": list,
+    })))
+}
+
 /// The transport a multiaddr runs over, and the same address with its host
 /// removed.
 ///
