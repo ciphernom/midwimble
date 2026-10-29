@@ -19,6 +19,7 @@ pub mod snapshot;
 pub mod state;
 pub mod template;
 pub mod types;
+pub mod walk;
 pub mod wots;
 pub mod wots_simd;
 

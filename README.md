@@ -31,7 +31,12 @@ recovery design.
 
 ### Consensus (midstate)
 
-- **Proof of work:** sequential BLAKE3 (`H^N(H(header ‖ nonce))`, N = 1,000,000).
+- **Proof of work:** sequential BLAKE3 (`H^N(H(header ‖ nonce))`, N = 1,000,000)
+  below `WALK_ACTIVATION_HEIGHT` (86,400), then **Midstate Walk**
+  (`core/walk.rs`, shared with midstate), a CPU-friendly walk over a 256 KiB
+  scratchpad, natively and merged. Relayed and anchored midstate headers
+  follow midstate's own switch at its height 420,000
+  (`MIDSTATE_WALK_ACTIVATION_HEIGHT`, which must match midstate's).
 - **Difficulty and time:** ASERT with a 4-hour half-life and a 60-second target.
   Timestamps must beat the median of the last 11 blocks and may be at most 15
   minutes ahead.
@@ -383,6 +388,12 @@ verify. The vendored copy keys the file by a seed fingerprint.
   assumed; pruning stays off (`docs/ANCHORING.md`).
 - [x] `EXTENSION_ITERATIONS` stays 1,000,000: midstate compatibility, and so
   merged mining.
+- [ ] Midstate Walk: confirm `WALK_ACTIVATION_HEIGHT` (expected a few hours
+  before midstate's switch, so this chain stops taking GPU-friendly work
+  first), `WALK_TARGET_SHIFT`, and that `MIDSTATE_WALK_ACTIVATION_HEIGHT` and
+  `MIDSTATE_WALK_TARGET_SHIFT` equal midstate's release. Merged mining pauses
+  between the two switches; the merge miner and pools mine midstate alone
+  meanwhile.
 - [x] Consensus encodings pinned: block hashes cover bincode 1 encodings, so
   bincode is pinned to `=1.3.3`, and `core/golden.rs` and the protocol tests
   hold vectors for every hashed encoding and the wire format. Build releases

@@ -25,7 +25,10 @@ miners the fractured wallet that importing mined coinbases produces.
   node signs every block with whichever bond has the most quota left
   (`docs/BONDED_POW.md`, "Co-bonding and the per-bond cap").
 - **Miners** keep mining midstate shares exactly as now, and never need a
-  bond. A miner who registers a midwimble address with the pool is paid
+  bond. (Both chains switch from the BLAKE3 chain to Midstate Walk, each at
+  its own height. A pool merges only jobs whose two blocks take the same
+  proof of work: `/merge/job` says which in `pow`. Between the switches it
+  mines midstate alone.) A miner who registers a midwimble address with the pool is paid
   directly in the midwimble coinbase, provably, the same way midwimble's own
   pool pays.
 

@@ -2,7 +2,8 @@
 //! types (see `merge_mining.rs` for provenance) with its commit rules.
 #![allow(dead_code)]
 
-use midwimble::core::extension::create_extension;
+use midwimble::core::extension::create_extension_with;
+use midwimble::core::types::{midstate_pow_algo_at, PowAlgo};
 use std::sync::{Arc, Mutex};
 
 pub mod midstate_ref {
@@ -381,6 +382,9 @@ async fn start_mock(base: u64, prev_header_hash: [u8; 32], relayable: bool) -> (
                 "batch_template": serde_json::to_value(&batch).unwrap(),
                 "total_fees": 0,
                 "block_reward": REWARD,
+                // As midstate's own templates say from Midstate Walk on.
+                "height": c.height,
+                "pow": midstate_pow_algo_at(c.height).name(),
             })),
         )
     }
@@ -388,7 +392,7 @@ async fn start_mock(base: u64, prev_header_hash: [u8; 32], relayable: bool) -> (
     async fn submit(State(c): State<Mock>, Json(batch): Json<Batch>) -> (StatusCode, Json<Value>) {
         let mut c = c.lock().unwrap();
         let (mining, post_tx) = batch.mining_hash();
-        let ext = create_extension(mining, batch.extension.nonce);
+        let ext = create_extension_with(midstate_pow_algo_at(c.height), mining, batch.extension.nonce);
         let ok = ext.final_hash == batch.extension.final_hash
             && ext.final_hash < batch.target
             && batch.prev_header_hash == c.prev_header_hash;
@@ -533,8 +537,9 @@ pub fn mine_midstate_block(addr: &str) {
     let mut batch = tpl["batch_template"].clone();
     let mining = midwimble::core::auxpow::bytes32(&tpl["mining_midstate"]).unwrap();
     let target = midwimble::core::auxpow::bytes32(&tpl["target"]).unwrap();
+    let algo = PowAlgo::of_midstate_template(&tpl).unwrap();
     let (nonce, ext) = (0u64..)
-        .map(|n| (n, create_extension(mining, n)))
+        .map(|n| (n, create_extension_with(algo, mining, n)))
         .find(|(_, e)| e.final_hash < target)
         .unwrap();
     batch["extension"] =

@@ -3,9 +3,12 @@
 //! ordinary Commit transaction or coinbase salt.
 
 use super::auxpow::{bytes32, merge_commitment, midstate_coin_id, tx_fold_item};
-use super::simd_mining::{check_pow_chains, pow_seed, PowCheck};
+use super::simd_mining::{check_pow_jobs, PowCheck, PowJob};
 use super::state::calculate_work;
-use super::types::{hash_concat, hash_domain, midstate_header_hash, network_anchor, BatchHeader};
+use super::types::{
+    hash_concat, hash_domain, midstate_header_hash, midstate_pow_algo_at, network_anchor,
+    BatchHeader, PowAlgo,
+};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -99,12 +102,17 @@ pub struct HeaderLink {
     pub final_hash: [u8; 32],
 }
 
-/// Identifies a Midstate header whose proof of work has been checked: its
-/// mining hash (which commits to its predecessor and every field), nonce and
-/// final hash. Equal keys mean the same proof-of-work computation.
-pub fn link_key(mining_hash: &[u8; 32], link: &HeaderLink) -> [u8; 32] {
+/// Identifies a Midstate header whose proof of work has been checked under
+/// `algo`: its mining hash (which commits to its predecessor and every
+/// field), nonce and final hash. Equal keys mean the same proof-of-work
+/// computation. Keys of BLAKE3-chain headers are what they always were.
+pub fn link_key(mining_hash: &[u8; 32], link: &HeaderLink, algo: PowAlgo) -> [u8; 32] {
+    let domain: &[u8] = match algo {
+        PowAlgo::Blake3Chain => b"midwimble.checked-midstate-header.v1",
+        PowAlgo::Walk => b"midwimble.checked-midstate-header.walk.v1",
+    };
     hash_domain(
-        b"midwimble.checked-midstate-header.v1",
+        domain,
         &[mining_hash, &link.nonce.to_le_bytes(), &link.final_hash],
     )
 }
@@ -189,6 +197,12 @@ impl MidstateInclusion {
     /// Cheap checks come first, then the proofs of work: the first alone, so
     /// a forged record costs one extension to reject, then the rest in
     /// parallel SIMD batches.
+    ///
+    /// Each header is checked with the proof of work midstate requires at the
+    /// height the evidence gives it (`midstate_height`, then one more for each
+    /// confirmation). Like everything else here that height is the prover's
+    /// claim: a forger may label headers below midstate's switch to Midstate
+    /// Walk and do BLAKE3-chain work, as forging cost before the switch.
     pub fn verify_proofs(&self, payload: &[u8; 32]) -> Result<()> {
         self.verify_proofs_with(payload, |_| false).map(|_| ())
     }
@@ -221,16 +235,22 @@ impl MidstateInclusion {
             if link.final_hash >= link.target {
                 bail!("Midstate header {i} of the anchor evidence misses its own target");
             }
+            let algo = midstate_pow_algo_at(self.midstate_height.saturating_add(i as u64));
             let mining = link_mining_hash(prev, link);
-            let key = link_key(&mining, link);
+            let key = link_key(&mining, link, algo);
             if !known(&key) {
-                jobs.push((pow_seed(&mining, link.nonce), link.final_hash));
+                jobs.push(PowJob {
+                    algo,
+                    mining_hash: mining,
+                    nonce: link.nonce,
+                    final_hash: link.final_hash,
+                });
                 index.push(i);
             }
             keys.push(key);
             prev = link.final_hash;
         }
-        match check_pow_chains(&jobs) {
+        match check_pow_jobs(&jobs) {
             Ok(()) => Ok(keys),
             Err(PowCheck::Bad(j)) => bail!(
                 "Midstate header {} of the anchor evidence fails its proof of work",
@@ -339,12 +359,18 @@ pub fn midstate_header_link(batch: &Value) -> Result<HeaderLink> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::extension::create_extension;
+    use crate::core::extension::create_extension_with;
     use crate::core::types::{hash, Batch, State};
 
     /// Genuine evidence for `payload` (a Commit) with `confirmations` more
     /// headers, on the easiest target so each header is a single extension.
     fn evidence(payload: &[u8; 32], n: usize) -> MidstateInclusion {
+        evidence_at(10, payload, n)
+    }
+
+    /// [`evidence`] for a block at midstate height `height`, each header
+    /// mined with the proof of work midstate requires at its height.
+    fn evidence_at(height: u64, payload: &[u8; 32], n: usize) -> MidstateInclusion {
         let mine = |prev: [u8; 32], post: [u8; 32], i: u64| {
             let mut link = HeaderLink {
                 post_tx_midstate: post,
@@ -354,7 +380,9 @@ mod tests {
                 nonce: 0,
                 final_hash: [0; 32],
             };
-            link.final_hash = create_extension(link_mining_hash(prev, &link), 0).final_hash;
+            let algo = midstate_pow_algo_at(height + i);
+            link.final_hash =
+                create_extension_with(algo, link_mining_hash(prev, &link), 0).final_hash;
             link
         };
         let pre = hash(b"pre");
@@ -368,7 +396,7 @@ mod tests {
             confirmations.push(link);
         }
         MidstateInclusion {
-            midstate_height: 10,
+            midstate_height: height,
             kind: AnchoredItem::Commit,
             pre_item_midstate: pre,
             items_after: vec![],
@@ -376,6 +404,26 @@ mod tests {
             block,
             confirmations,
         }
+    }
+
+    /// Evidence straddling midstate's switch to Midstate Walk: its headers
+    /// carry the chain below the switch and the Walk from it, and the same
+    /// headers given another height fail.
+    #[test]
+    fn evidence_follows_midstates_switch_to_the_walk() {
+        use crate::core::types::MIDSTATE_WALK_ACTIVATION_HEIGHT as SWITCH;
+        let payload = hash(b"straddling");
+        let ev = evidence_at(SWITCH - 1, &payload, 2);
+        ev.verify_proofs(&payload).unwrap();
+        let mut shifted = ev.clone();
+        shifted.midstate_height = SWITCH;
+        assert!(shifted.verify_proofs(&payload).is_err());
+        // A key remembered for one algorithm does not vouch for the other.
+        let mining = link_mining_hash(ev.prev_header_hash, &ev.block);
+        assert_ne!(
+            link_key(&mining, &ev.block, PowAlgo::Blake3Chain),
+            link_key(&mining, &ev.block, PowAlgo::Walk)
+        );
     }
 
     #[test]

@@ -249,6 +249,119 @@ pub const EXTENSION_ITERATIONS: u64 = 1_000_000;
 #[cfg(feature = "fast-mining")]
 pub const EXTENSION_ITERATIONS: u64 = 100;
 
+// ── Proof of work: the switch to Midstate Walk ──────────────────────────────
+
+/// Height from which midwimble blocks carry Midstate Walk (`core::walk`)
+/// instead of the `EXTENSION_ITERATIONS` BLAKE3 chain, natively and merged.
+///
+/// # Reasoning
+/// Midstate makes the same switch at its own `WALK_ACTIVATION_HEIGHT`
+/// ([`MIDSTATE_WALK_ACTIVATION_HEIGHT`] here), for the same reason: a GPU
+/// runs tens of thousands of BLAKE3-chain attempts at once. A merged-mined
+/// block's work is its parent's, and counts here only if it is the proof of
+/// work this height asks for, so merged mining pauses while one chain has
+/// switched and the other has not. Both chains run 60-second blocks, so this
+/// height is the one expected a few hours before midstate's switch: midwimble
+/// stops accepting BLAKE3-chain work first, and is never the GPU-mineable
+/// chain of the two.
+///
+/// # Safety / Invariants
+/// - **Consensus-critical (hard fork).** Every block keeps the proof of work
+///   in force at its height for ever ([`pow_algo_at`]).
+#[cfg(not(feature = "fast-mining"))]
+pub const WALK_ACTIVATION_HEIGHT: u64 = 86_400;
+/// Test builds switch early, so tests cross the boundary.
+#[cfg(feature = "fast-mining")]
+pub const WALK_ACTIVATION_HEIGHT: u64 = 20;
+
+/// Difficulty reset at [`WALK_ACTIVATION_HEIGHT`], in powers of two (see
+/// midstate's `WALK_TARGET_SHIFT`): from that height ASERT's schedule moves by
+/// this many half-lives. Midwimble's work is mostly merged-mined, so its
+/// attempt rate changes by about midstate's factor and takes midstate's shift.
+#[cfg(not(feature = "fast-mining"))]
+pub const WALK_TARGET_SHIFT: i64 = 3;
+#[cfg(feature = "fast-mining")]
+pub const WALK_TARGET_SHIFT: i64 = 0;
+
+/// Midstate's switch to Midstate Walk, which midstate headers relayed to this
+/// chain or offered as anchor evidence follow. **Must equal midstate's
+/// `WALK_ACTIVATION_HEIGHT`.**
+#[cfg(not(feature = "fast-mining"))]
+pub const MIDSTATE_WALK_ACTIVATION_HEIGHT: u64 = 420_000;
+/// Test builds: a few dozen headers above the stand-in midstate's root
+/// (`relay::devnet`), so relay and bond tests cross it.
+#[cfg(feature = "fast-mining")]
+pub const MIDSTATE_WALK_ACTIVATION_HEIGHT: u64 = MIDSTATE_BLOCK_HEIGHT + 40;
+
+/// Midstate's difficulty reset at its switch. **Must equal midstate's
+/// `WALK_TARGET_SHIFT`**: relayed headers must carry exactly the target
+/// midstate's rule gives them (`relay::midstate_target`).
+#[cfg(not(feature = "fast-mining"))]
+pub const MIDSTATE_WALK_TARGET_SHIFT: i64 = 3;
+#[cfg(feature = "fast-mining")]
+pub const MIDSTATE_WALK_TARGET_SHIFT: i64 = 0;
+
+/// A proof-of-work algorithm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PowAlgo {
+    /// `EXTENSION_ITERATIONS` sequential BLAKE3 hashes (`extension::create_extension`).
+    Blake3Chain,
+    /// Midstate Walk (`core::walk`).
+    Walk,
+}
+
+impl PowAlgo {
+    /// The name miners and RPC clients see (`"blake3-chain"`, `"walk"`), as
+    /// midstate's templates spell it.
+    pub fn name(self) -> &'static str {
+        match self {
+            PowAlgo::Blake3Chain => "blake3-chain",
+            PowAlgo::Walk => "walk",
+        }
+    }
+
+    /// The algorithm a [`PowAlgo::name`] names.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "blake3-chain" => Some(PowAlgo::Blake3Chain),
+            "walk" => Some(PowAlgo::Walk),
+            _ => None,
+        }
+    }
+
+    /// The algorithm a midstate template's `pow` field asks for. Midstate
+    /// nodes and pools that predate Midstate Walk send none, and want the
+    /// BLAKE3 chain.
+    pub fn of_midstate_template(template: &serde_json::Value) -> anyhow::Result<Self> {
+        match template.get("pow").and_then(|v| v.as_str()) {
+            None => Ok(PowAlgo::Blake3Chain),
+            Some(name) => Self::from_name(name)
+                .ok_or_else(|| anyhow::anyhow!("midstate asks for an unknown proof of work: {name}")),
+        }
+    }
+}
+
+/// The proof of work midwimble block `height` carries, natively or merged.
+#[inline]
+pub fn pow_algo_at(height: u64) -> PowAlgo {
+    if height >= WALK_ACTIVATION_HEIGHT {
+        PowAlgo::Walk
+    } else {
+        PowAlgo::Blake3Chain
+    }
+}
+
+/// The proof of work midstate's block `midstate_height` carries: what relayed
+/// and anchored midstate headers are checked with.
+#[inline]
+pub fn midstate_pow_algo_at(midstate_height: u64) -> PowAlgo {
+    if midstate_height >= MIDSTATE_WALK_ACTIVATION_HEIGHT {
+        PowAlgo::Walk
+    } else {
+        PowAlgo::Blake3Chain
+    }
+}
+
 // ── Economics ───────────────────────────────────────────────────────────────
 
 pub const BLOCKS_PER_YEAR: u64 = 365 * 24 * 3600 / TARGET_BLOCK_TIME;

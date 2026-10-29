@@ -14,9 +14,9 @@
 //! ([`SyncSession::timed_out`]). A dropped session stops its background
 //! work, so retries do not pile up on the CPU.
 
-use crate::core::simd_mining::{check_pow_chains_with, pow_seed, PowCheck};
+use crate::core::simd_mining::{check_pow_jobs_with, PowCheck, PowJob};
 use crate::core::state::{calculate_target, calculate_work, current_timestamp, validate_timestamp};
-use crate::core::types::{compute_header_hash, MEDIAN_TIME_PAST_WINDOW};
+use crate::core::types::{compute_header_hash, pow_algo_at, MEDIAN_TIME_PAST_WINDOW};
 use crate::core::{Batch, BatchHeader, State};
 use anyhow::{bail, Context as _, Result};
 use libp2p::request_response::OutboundRequestId;
@@ -163,11 +163,13 @@ pub fn verify_header_chain_with(
 
     if check_pow {
         let checked: Vec<&BatchHeader> = headers.iter().filter(|h| h.height > 0).collect();
-        // Each header's chain seed and expected result: its own for native
-        // blocks, its parent's for merged-mined ones.
-        let mut jobs: Vec<(u64, [u8; 32], [u8; 32])> = Vec::with_capacity(checked.len());
+        // Each header's proof of work: its own for native blocks, its
+        // parent's for merged-mined ones, under the algorithm its height asks
+        // for (heights were checked consecutive above).
+        let mut jobs: Vec<(u64, PowJob)> = Vec::with_capacity(checked.len());
         for h in &checked {
             let mining_hash = compute_header_hash(h);
+            let algo = pow_algo_at(h.height);
             match &h.aux_pow {
                 None => {
                     if h.extension.final_hash >= h.target {
@@ -175,14 +177,18 @@ pub fn verify_header_chain_with(
                     }
                     jobs.push((
                         h.height,
-                        pow_seed(&mining_hash, h.extension.nonce),
-                        h.extension.final_hash,
+                        PowJob {
+                            algo,
+                            mining_hash,
+                            nonce: h.extension.nonce,
+                            final_hash: h.extension.final_hash,
+                        },
                     ));
                 }
                 Some(aux) => {
                     aux.check_claims(&mining_hash, &h.extension, &h.target)
                         .map_err(|e| anyhow::anyhow!("header {}: {}", h.height, e))?;
-                    jobs.push((h.height, aux.pow_seed(&mining_hash), aux.final_hash));
+                    jobs.push((h.height, aux.pow_job(algo, &mining_hash)));
                 }
             }
         }
@@ -190,8 +196,8 @@ pub fn verify_header_chain_with(
         // costs one extension; then pieces wide enough to keep every thread
         // busy, small enough that an abandoned verification stops within
         // seconds.
-        let chains: Vec<([u8; 32], [u8; 32])> = jobs.iter().map(|j| (j.1, j.2)).collect();
-        match check_pow_chains_with(&chains, &mut proceed) {
+        let pow: Vec<PowJob> = jobs.iter().map(|j| j.1).collect();
+        match check_pow_jobs_with(&pow, &mut proceed) {
             Ok(()) => {}
             Err(PowCheck::Bad(i)) => bail!("proof of work invalid at height {}", jobs[i].0),
             Err(PowCheck::Abandoned) => bail!("header verification abandoned"),

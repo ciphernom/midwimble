@@ -42,10 +42,11 @@
 //! which takes more than midstate's whole hashrate for up to two days.
 
 use super::anchor::{link_mining_hash, HeaderLink};
-use super::simd_mining::{check_pow_chains, pow_seed, PowCheck};
+use super::simd_mining::{check_pow_jobs, PowCheck, PowJob};
 use super::state::{asert_target, calculate_work};
 use super::types::{
-    hash_domain, MAX_FUTURE_BLOCK_TIME, MIDSTATE_BLOCK_HASH, MIDSTATE_BLOCK_HEIGHT,
+    hash_domain, midstate_pow_algo_at, PowAlgo, MAX_FUTURE_BLOCK_TIME, MIDSTATE_BLOCK_HASH,
+    MIDSTATE_BLOCK_HEIGHT, MIDSTATE_WALK_TARGET_SHIFT,
 };
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
@@ -118,13 +119,19 @@ pub fn midstate_schedule(height: u64) -> u64 {
 
 /// The target midstate's difficulty rule gives its header at `height`, whose
 /// parent is timestamped `parent_timestamp` (midstate checks exactly this:
-/// `calculate_target(prev.height + 1, prev.timestamp)`).
+/// `calculate_target(prev.height + 1, prev.timestamp)`), including its
+/// difficulty reset from its switch to Midstate Walk.
 pub fn midstate_target(height: u64, parent_timestamp: u64) -> [u8; 32] {
+    let shift = match midstate_pow_algo_at(height) {
+        PowAlgo::Walk => MIDSTATE_WALK_TARGET_SHIFT,
+        PowAlgo::Blake3Chain => 0,
+    };
     asert_target(
         &MIDSTATE_ASERT_TARGET,
         MIDSTATE_ASERT_TIME,
         height,
         parent_timestamp,
+        shift,
     )
 }
 
@@ -235,17 +242,23 @@ impl RelayHeaders {
     /// once [`Relay::extend`] has accepted the run. The first header is
     /// checked alone and the rest in parallel batches, so a forged run costs
     /// one extension to reject.
-    pub fn verify_pow(&self) -> Result<()> {
+    ///
+    /// `first_height` is the midstate height of the first header (one above
+    /// the relay entry `prev` names): each header is checked with the proof
+    /// of work midstate requires at its height ([`midstate_pow_algo_at`]).
+    pub fn verify_pow(&self, first_height: u64) -> Result<()> {
         let mut prev = self.prev;
         let mut jobs = Vec::with_capacity(self.headers.len());
-        for link in &self.headers {
-            jobs.push((
-                pow_seed(&link_mining_hash(prev, link), link.nonce),
-                link.final_hash,
-            ));
+        for (i, link) in self.headers.iter().enumerate() {
+            jobs.push(PowJob {
+                algo: midstate_pow_algo_at(first_height + i as u64),
+                mining_hash: link_mining_hash(prev, link),
+                nonce: link.nonce,
+                final_hash: link.final_hash,
+            });
             prev = link.final_hash;
         }
-        match check_pow_chains(&jobs) {
+        match check_pow_jobs(&jobs) {
             Ok(()) => Ok(()),
             Err(PowCheck::Bad(i)) => bail!("relayed midstate header {i} fails its proof of work"),
             Err(PowCheck::Abandoned) => bail!("relay verification abandoned"),
@@ -547,7 +560,7 @@ impl MidstateHeaders {
             prev: self.prev,
             headers: self.headers.clone(),
         }
-        .verify_pow()
+        .verify_pow(self.start)
     }
 }
 
@@ -644,7 +657,7 @@ impl RelayFeed {
 pub mod devnet {
     use super::*;
     use crate::core::bond::{BondCoin, BondProof, MidstateRoots};
-    use crate::core::extension::create_extension;
+    use crate::core::extension::create_extension_with;
     use crate::core::mmr::UtxoAccumulator;
     use crate::core::types::hash;
 
@@ -719,8 +732,9 @@ pub mod devnet {
                     final_hash: [0; 32],
                 };
                 let mining = link_mining_hash(prev, &link);
+                let algo = midstate_pow_algo_at(height);
                 loop {
-                    let fin = create_extension(mining, link.nonce).final_hash;
+                    let fin = create_extension_with(algo, mining, link.nonce).final_hash;
                     if fin < link.target {
                         link.final_hash = fin;
                         break;
@@ -1024,6 +1038,23 @@ mod tests {
         }
     }
 
+    /// Midstate's difficulty reset at its switch to Midstate Walk, mirrored:
+    /// on schedule, the last BLAKE3-chain header carries the genesis target
+    /// and the first Walk header that target times `2^MIDSTATE_WALK_TARGET_SHIFT`.
+    #[test]
+    fn midstates_walk_difficulty_reset_is_mirrored() {
+        use crate::core::types::{
+            MIDSTATE_WALK_ACTIVATION_HEIGHT as SWITCH, MIDSTATE_WALK_TARGET_SHIFT,
+        };
+        let before = midstate_target(SWITCH - 1, midstate_schedule(SWITCH - 2));
+        let after = midstate_target(SWITCH, midstate_schedule(SWITCH - 1));
+        assert_eq!(before, MIDSTATE_ASERT_TARGET);
+        assert_eq!(
+            U256::from_big_endian(&after),
+            U256::from_big_endian(&MIDSTATE_ASERT_TARGET) << (MIDSTATE_WALK_TARGET_SHIFT as usize)
+        );
+    }
+
     /// A relayed header may be timestamped at most RELAY_MAX_FUTURE past the
     /// block relaying it, root's child included.
     #[test]
@@ -1068,13 +1099,43 @@ mod tests {
             headers: run.headers,
         };
         Relay::genesis().extend(&mined, LATER).unwrap();
-        mined.verify_pow().unwrap();
+        mined.verify_pow(run.start).unwrap();
         // A forged proof of work passes the cheap checks and fails the
         // expensive one.
         let mut forged = mined.clone();
         forged.headers[3].nonce += 1;
         Relay::genesis().extend(&forged, LATER).unwrap();
-        assert!(forged.verify_pow().is_err());
+        assert!(forged.verify_pow(run.start).is_err());
+    }
+
+    /// Test builds: a run across midstate's switch to Midstate Walk. Below
+    /// it headers carry the BLAKE3 chain, from it the Walk, and each is
+    /// refused if checked as if it sat on the other side.
+    #[cfg(feature = "fast-mining")]
+    #[test]
+    fn relayed_headers_switch_to_the_walk_with_midstate() {
+        use crate::core::types::MIDSTATE_WALK_ACTIVATION_HEIGHT as SWITCH;
+        let mut ms = devnet::DevnetMidstate::new();
+        ms.mine(SWITCH - ms.mined.start + 3);
+        let run = ms.from_height(ms.mined.start);
+        let relayed = RelayHeaders {
+            prev: run.prev,
+            headers: run.headers.clone(),
+        };
+        let mut relay = Relay::genesis();
+        relay.extend(&relayed, LATER).unwrap();
+        relayed.verify_pow(run.start).unwrap();
+        assert_eq!(relay.tip().height, SWITCH + 2);
+        // Labelled one height lower, the last chain header is checked with
+        // the Walk and the first Walk header with the chain: both fail.
+        let around = ms.from_height(SWITCH - 1);
+        let two = RelayHeaders {
+            prev: around.prev,
+            headers: around.headers[..2].to_vec(),
+        };
+        two.verify_pow(SWITCH - 1).unwrap();
+        assert!(two.verify_pow(SWITCH).is_err());
+        assert!(two.verify_pow(SWITCH - 2).is_err());
     }
 
     /// Real midstate headers (`testdata/midstate-headers.txt`, from a mainnet
@@ -1161,7 +1222,7 @@ mod tests {
                 prev: run.prev,
                 headers: run.headers[..3].to_vec(),
             }
-            .verify_pow()
+            .verify_pow(real[1].height)
             .unwrap();
         }
 

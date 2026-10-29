@@ -2423,7 +2423,7 @@ mod tests {
                 prev,
                 headers: vec![link.clone()],
             }
-            .verify_pow()
+            .verify_pow(297_691)
         };
         relayed(&link).unwrap();
         let mut flipped = link.clone();

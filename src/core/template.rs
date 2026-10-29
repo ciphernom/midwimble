@@ -10,7 +10,7 @@ use super::bond::{
     authorization_message, check_miner_authorization, BondRegistration, MinerAuth, MinerBond,
     BONDED_MINING_FROM,
 };
-use super::extension::create_extension;
+use super::extension::create_extension_at;
 use super::mw::{build_coinbase_with, PayoutReceipt, StealthAddress, Transaction};
 use super::relay::{
     MidstateHeaders, RelayFeed, RelayHeaders, RELAY_MAX_FUTURE, RELAY_WEIGHT_PER_HEADER,
@@ -53,12 +53,13 @@ impl BlockTemplate {
         batch
     }
 
-    /// Single-threaded grind for tests and tiny devnets.
+    /// Single-threaded grind for tests and tiny devnets, under the proof of
+    /// work this template's height asks for.
     pub fn mine_blocking(&self) -> Batch {
         let target = self.batch.target;
         let mut nonce = 0u64;
         loop {
-            let ext = create_extension(self.mining_hash, nonce);
+            let ext = create_extension_at(self.height, self.mining_hash, nonce);
             if ext.final_hash < target {
                 return self.seal(ext);
             }
@@ -562,7 +563,13 @@ pub fn build_template_relayed(
     };
     // Structural self-check (skip proofs: they were verified on admission and
     // the coinbase was just built here).
-    validate_block_contents(&batch, height, true, subsidy)?;
+    validate_block_contents(
+        &batch,
+        height,
+        true,
+        subsidy,
+        super::state::relay_start(state, &batch),
+    )?;
     if let (Some(bond), Some(signer)) = (bond, signer) {
         let message = authorization_message(&state.mw_midstate, &batch);
         batch.miner = Some(MinerAuth {

@@ -36,18 +36,31 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// `height` and `timestamp` are the *parent's*: the result is the target for
 /// block `height`.
+///
+/// From [`WALK_ACTIVATION_HEIGHT`] the schedule moves by
+/// [`WALK_TARGET_SHIFT`] half-lives, the difficulty reset of the switch to
+/// Midstate Walk.
 pub fn calculate_target(height: u64, timestamp: u64) -> [u8; 32] {
-    asert_target(&GENESIS_TARGET, GENESIS_TIMESTAMP, height, timestamp)
+    let shift = match pow_algo_at(height) {
+        PowAlgo::Walk => WALK_TARGET_SHIFT,
+        PowAlgo::Blake3Chain => 0,
+    };
+    asert_target(&GENESIS_TARGET, GENESIS_TIMESTAMP, height, timestamp, shift)
 }
 
 /// [`calculate_target`] for a chain whose genesis (height 0) had
 /// `genesis_target` and `genesis_timestamp`: midstate's own rule, which the
 /// midstate relay holds relayed headers to (`relay::midstate_target`).
+///
+/// `shift` whole half-lives are added to the drift's, as midstate does from
+/// its own switch to Midstate Walk; it must be added here, before the
+/// clamps, for the result to be midstate's bit for bit.
 pub fn asert_target(
     genesis_target: &[u8; 32],
     genesis_timestamp: u64,
     height: u64,
     timestamp: u64,
+    shift: i64,
 ) -> [u8; 32] {
     if height == 0 {
         return *genesis_target;
@@ -58,7 +71,7 @@ pub fn asert_target(
     let drift = actual_time.saturating_sub(ideal_time);
 
     let exponent = drift.saturating_mul(65536) / ASERT_HALF_LIFE;
-    let shifts = exponent >> 16;
+    let shifts = (exponent >> 16).saturating_add(shift);
     let frac = exponent & 0xFFFF;
 
     let mut factor = 65536i64;
@@ -261,14 +274,28 @@ pub fn apply_batch_trusted(
     )
 }
 
+/// The midstate height of the first midstate header `batch` relays, on the
+/// relay of `state` (the block's parent state): one above the entry the run
+/// builds on. `None` if it relays nothing or builds on no entry.
+pub fn relay_start(state: &State, batch: &Batch) -> Option<u64> {
+    let relayed = batch.relay.as_ref()?;
+    state.relay.by_hash(&relayed.prev).map(|e| e.height + 1)
+}
+
 /// Stateless rules for a block's contents: structure, weight, cross-checks
 /// between body and coinbase, both balance equations and (unless skipped)
 /// every proof and signature.
+///
+/// `relay_from` ([`relay_start`]) is the midstate height of the first
+/// midstate header the block relays (one above the relay entry the run
+/// builds on), which decides each relayed header's proof of work; `None` if
+/// the run does not build on the relay, which `Relay::extend` refuses anyway.
 pub fn validate_block_contents(
     batch: &Batch,
     height: u64,
     skip_crypto: bool,
     subsidy: u64,
+    relay_from: Option<u64>,
 ) -> Result<()> {
     let is_genesis = height == 0;
     let body = &batch.body;
@@ -296,7 +323,9 @@ pub fn validate_block_contents(
             );
         }
         if !skip_crypto {
-            relayed.verify_pow()?;
+            let from = relay_from
+                .ok_or_else(|| anyhow!("relayed midstate headers do not build on the relay"))?;
+            relayed.verify_pow(from)?;
         }
     }
 
@@ -568,6 +597,7 @@ fn apply_batch_internal(
     if !is_genesis {
         match preverified_hash {
             None => verify_pow(
+                height,
                 mining_hash,
                 &batch.extension,
                 &batch.target,
@@ -597,6 +627,9 @@ fn apply_batch_internal(
     //     are checked with the block's other proofs below). A heavier branch
     //     revokes every bond proven against a header it replaced.
     let mut relay_change = super::relay::RelayChange::default();
+    // Where the relayed run starts, read before extending (which may prune
+    // the entry it builds on out of the window).
+    let relay_from = relay_start(&base, batch);
     if let Some(relayed) = &batch.relay {
         relay_change = base.relay.extend(relayed, batch.timestamp)?;
         if let Some(fork) = relay_change.fork_from {
@@ -674,7 +707,7 @@ fn apply_batch_internal(
     let subsidy = super::bond::subsidy_for(signer, &counts, &bonds, height, batch.timestamp);
 
     // 5b. Contents: structure, balances, proofs and signatures.
-    validate_block_contents(batch, height, skip_crypto, subsidy)?;
+    validate_block_contents(batch, height, skip_crypto, subsidy, relay_from)?;
 
     // 6. State transition and root.
     let mut next = apply_body(&base, &batch.body, batch.coinbase.as_ref(), subsidy)?;
@@ -749,6 +782,19 @@ mod tests {
         let ceiling = U256::from_big_endian(&[0xff; 32]);
         assert!(slower == base * 2 || slower == ceiling);
         assert_eq!(faster, base / 2);
+    }
+
+    #[test]
+    fn walk_activation_moves_the_target_by_the_shift() {
+        let on_schedule = |h: u64| GENESIS_TIMESTAMP + h * TARGET_BLOCK_TIME;
+        let last_chain = WALK_ACTIVATION_HEIGHT - 1;
+        let before = calculate_target(last_chain, on_schedule(last_chain));
+        let after = calculate_target(WALK_ACTIVATION_HEIGHT, on_schedule(WALK_ACTIVATION_HEIGHT));
+        assert_eq!(before, GENESIS_TARGET);
+        assert_eq!(
+            U256::from_big_endian(&after),
+            U256::from_big_endian(&GENESIS_TARGET) << (WALK_TARGET_SHIFT as usize)
+        );
     }
 
     #[test]

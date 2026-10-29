@@ -425,7 +425,7 @@ fn overpaying_coinbase_is_rejected() {
     let mut batch = template.batch.clone();
     batch.coinbase =
         Some(super::mw::build_coinbase(&[(miner.address(), block_reward(1) + 1)]).unwrap());
-    let err = super::state::validate_block_contents(&batch, 1, false, block_reward(1))
+    let err = super::state::validate_block_contents(&batch, 1, false, block_reward(1), None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("coinbase does not pay exactly"), "{err}");
@@ -490,14 +490,14 @@ fn blocks_after_the_last_coin_need_no_coinbase() {
     // An empty block there pays nobody and carries no coinbase.
     let template = build_template(&after, &chain.timestamps, &[], &alice.address(), None).unwrap();
     assert!(template.batch.coinbase.is_none());
-    validate_block_contents(&template.batch, after.height, false, block_reward(after.height)).unwrap();
+    validate_block_contents(&template.batch, after.height, false, block_reward(after.height), None).unwrap();
     let next = apply_body(&after, &template.batch.body, None, 0).unwrap();
     assert_eq!(next.supply, supply, "no coins after the cap");
 
     // Claiming anything there is invalid.
     let mut forged = template.batch.clone();
     forged.coinbase = Some(super::mw::build_coinbase(&[(alice.address(), 1)]).unwrap());
-    assert!(validate_block_contents(&forged, after.height, true, block_reward(after.height)).is_err());
+    assert!(validate_block_contents(&forged, after.height, true, block_reward(after.height), None).is_err());
 }
 
 /// Fees still have to be claimed after issuance ends: an unclaimed fee would
@@ -541,12 +541,12 @@ fn fees_after_the_last_coin_still_need_a_coinbase() {
         .as_ref()
         .expect("a fee-paying block still pays the miner");
     cb.verify_sum(fee).expect("the coinbase claims the fees");
-    validate_block_contents(&template.batch, after.height, false, block_reward(after.height)).unwrap();
+    validate_block_contents(&template.batch, after.height, false, block_reward(after.height), None).unwrap();
 
     // Dropping the coinbase would burn the fee, and is rejected.
     let mut stripped = template.batch.clone();
     stripped.coinbase = None;
-    assert!(validate_block_contents(&stripped, after.height, true, block_reward(after.height)).is_err());
+    assert!(validate_block_contents(&stripped, after.height, true, block_reward(after.height), None).is_err());
 
     // The chain itself is unaffected at ordinary heights.
     chain.mine(&[tx], &alice.address()).unwrap();
@@ -955,16 +955,18 @@ fn registrations_are_verified_and_limited() {
         relayed.headers.len(),
         bond.midstate.as_ref().unwrap().headers.len()
     );
-    validate_block_contents(&block, height, false, block_reward(height)).unwrap();
+    let from = super::state::relay_start(&chain.state, &block);
+    assert!(from.is_some(), "the run builds on the relay");
+    validate_block_contents(&block, height, false, block_reward(height), from).unwrap();
     // A relayed header with a forged proof of work is caught with the
     // block's other proofs.
     let mut forged = block.clone();
     forged.relay.as_mut().unwrap().headers[5].nonce ^= 1;
-    assert!(validate_block_contents(&forged, height, false, block_reward(height)).is_err());
+    assert!(validate_block_contents(&forged, height, false, block_reward(height), from).is_err());
     // Two registrations in one block are refused outright.
     let mut two = block.clone();
     two.registrations.push(block.registrations[0].clone());
-    assert!(validate_block_contents(&two, height, true, block_reward(height)).is_err());
+    assert!(validate_block_contents(&two, height, true, block_reward(height), from).is_err());
 }
 
 /// Without the relay holding its header, a registration has nothing to be
@@ -1232,6 +1234,6 @@ fn past_the_switch_a_template_pays_an_over_cap_block_less() {
     assert!(tapered < scheduled, "an over-cap block should mint less");
 
     // The template paid exactly the tapered figure, and nothing else passes.
-    validate_block_contents(&batch, height, true, tapered).unwrap();
-    assert!(validate_block_contents(&batch, height, true, scheduled).is_err());
+    validate_block_contents(&batch, height, true, tapered, None).unwrap();
+    assert!(validate_block_contents(&batch, height, true, scheduled, None).is_err());
 }

@@ -79,6 +79,70 @@ pub fn verify_extension(midstate: [u8; 32], ext: &Extension, target: &[u8; 32]) 
     Ok(())
 }
 
+/// The proof of work of `nonce` over `midstate` under `algo`.
+pub fn create_extension_with(algo: PowAlgo, midstate: [u8; 32], nonce: u64) -> Extension {
+    match algo {
+        PowAlgo::Walk => Extension {
+            nonce,
+            final_hash: super::walk::walk_hash(&midstate, nonce),
+        },
+        PowAlgo::Blake3Chain => create_extension(midstate, nonce),
+    }
+}
+
+/// The proof of work midwimble block `height` carries ([`pow_algo_at`]).
+pub fn create_extension_at(height: u64, midstate: [u8; 32], nonce: u64) -> Extension {
+    create_extension_with(pow_algo_at(height), midstate, nonce)
+}
+
+/// [`verify_extension`] under `algo`.
+///
+/// # Formal Specification
+/// ```text
+///   post  result! = Ok(()) ⇔ ext?.final_hash < target?
+///                          ∧ create_extension_with(algo?, midstate?, ext?.nonce).final_hash = ext?.final_hash
+/// ```
+pub fn verify_extension_with(
+    algo: PowAlgo,
+    midstate: [u8; 32],
+    ext: &Extension,
+    target: &[u8; 32],
+) -> Result<()> {
+    if ext.final_hash >= *target {
+        bail!("Extension doesn't meet difficulty target");
+    }
+    if create_extension_with(algo, midstate, ext.nonce).final_hash != ext.final_hash {
+        bail!("Proof-of-work verification failed");
+    }
+    Ok(())
+}
+
+/// [`verify_extension`] for midwimble block `height`.
+pub fn verify_extension_at(
+    height: u64,
+    midstate: [u8; 32],
+    ext: &Extension,
+    target: &[u8; 32],
+) -> Result<()> {
+    verify_extension_with(pow_algo_at(height), midstate, ext, target)
+}
+
+/// How far from our tip an orphan's height is assumed to be, either way, by
+/// `auxpow::verify_pow_near`.
+pub const ORPHAN_POW_SLACK: u64 = 64;
+
+/// The algorithms a block within [`ORPHAN_POW_SLACK`] of `tip_height` may
+/// carry: one, or both across the switch to Midstate Walk.
+pub fn algos_near(tip_height: u64) -> Vec<PowAlgo> {
+    let low = pow_algo_at(tip_height.saturating_sub(ORPHAN_POW_SLACK));
+    let high = pow_algo_at(tip_height.saturating_add(ORPHAN_POW_SLACK));
+    if low == high {
+        vec![low]
+    } else {
+        vec![low, high]
+    }
+}
+
 /// Mine: try nonces until one produces a final_hash below target.
 /// Spawns one worker per available core, each trying independent nonces.
 /// Uses an AtomicBool to instantly abort if a peer solves the block first.
@@ -87,10 +151,34 @@ pub enum MiningResult {
     Share(Extension),
 }
 
+/// Nonces one worker tries per round: the SIMD width for the BLAKE3 chain,
+/// one for Midstate Walk (each attempt already has a core to itself).
+fn lanes_for(algo: PowAlgo) -> usize {
+    match algo {
+        PowAlgo::Walk => 1,
+        PowAlgo::Blake3Chain => crate::core::simd_mining::detected_level().lanes(),
+    }
+}
+
+/// `(nonce, final_hash)` for each of `nonces` under `algo`.
+fn attempt_batch(algo: PowAlgo, midstate: [u8; 32], nonces: &[u64]) -> Vec<(u64, [u8; 32])> {
+    match algo {
+        PowAlgo::Walk => nonces
+            .iter()
+            .map(|&n| (n, super::walk::walk_hash(&midstate, n)))
+            .collect(),
+        PowAlgo::Blake3Chain => crate::core::simd_mining::mine_batch(midstate, nonces),
+    }
+}
+
 /// Mine: try nonces until one produces a final_hash below target (or pool_target).
 /// Spawns one worker per available core, each trying independent nonces.
 /// Uses an AtomicBool to instantly abort if a peer solves the block first.
+///
+/// `algo` is the proof of work to grind: [`pow_algo_at`] of the block's
+/// height for midwimble's own blocks, midstate's for a merged-mined parent.
 pub fn mine_extension(
+    algo: PowAlgo,
     midstate: [u8; 32],
     target: [u8; 32],
     pool_target: Option<[u8; 32]>,
@@ -107,7 +195,7 @@ pub fn mine_extension(
     };
 
     if num_threads <= 1 {
-        return mine_extension_single(midstate, target, pool_target, cancel, hash_counter);
+        return mine_extension_single(algo, midstate, target, pool_target, cancel, hash_counter);
     }
 
     let found = Arc::new(AtomicBool::new(false));
@@ -120,7 +208,7 @@ pub fn mine_extension(
             let tx = tx.clone();
             let hash_counter = Arc::clone(&hash_counter);
             std::thread::spawn(move || {
-                let lanes = crate::core::simd_mining::detected_level().lanes();
+                let lanes = lanes_for(algo);
                 let mut attempts = 0u64;
                 loop {
                     if cancel.load(Ordering::Relaxed) || found.load(Ordering::Relaxed) {
@@ -137,7 +225,7 @@ pub fn mine_extension(
                     hash_counter.fetch_add(lanes as u64, Ordering::Relaxed);
 
                     //let results = crate::core::simd_mining::mine_batch(midstate, &nonces);
-                    let results = crate::core::simd_mining::mine_batch(midstate, &nonces[..lanes]);
+                    let results = attempt_batch(algo, midstate, &nonces[..lanes]);
                     for &(nonce, final_hash) in &results {
                         if final_hash < target {
                             found.store(true, Ordering::Relaxed);
@@ -205,13 +293,14 @@ pub fn mine_extension(
 
 /// Single-threaded fallback.
 fn mine_extension_single(
+    algo: PowAlgo,
     midstate: [u8; 32],
     target: [u8; 32],
     pool_target: Option<[u8; 32]>,
     cancel: Arc<AtomicBool>,
     hash_counter: Arc<std::sync::atomic::AtomicU64>,
 ) -> Option<MiningResult> {
-    let lanes = crate::core::simd_mining::detected_level().lanes();
+    let lanes = lanes_for(algo);
     let mut attempts = 0u64;
 
     loop {
@@ -231,8 +320,7 @@ fn mine_extension_single(
         attempts += lanes as u64;
         hash_counter.fetch_add(lanes as u64, Ordering::Relaxed);
 
-        // Pass the slice just like you did in the multi-threaded version
-        let results = crate::core::simd_mining::mine_batch(midstate, &nonces[..lanes]);
+        let results = attempt_batch(algo, midstate, &nonces[..lanes]);
 
         for &(nonce, final_hash) in &results {
             if final_hash < target {
@@ -400,7 +488,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let counter = Arc::new(std::sync::atomic::AtomicU64::new(0)); // <-- Dummy counter for test
 
-        let res = mine_extension(ms, target, None, 0, cancel, counter).unwrap();
+        let res = mine_extension(PowAlgo::Blake3Chain, ms, target, None, 0, cancel, counter).unwrap();
         let ext = match res {
             MiningResult::Block(e) => e,
             MiningResult::Share(_) => panic!("Should not return share"),

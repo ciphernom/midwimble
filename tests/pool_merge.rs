@@ -14,7 +14,8 @@ use midwimble::core::auxpow::bytes32;
 use midwimble::core::bond::{
     devnet_registration, est_midstate_height, MinerBond, MIN_REMAINING_BOND_LOCK,
 };
-use midwimble::core::extension::create_extension;
+use midwimble::core::extension::create_extension_with;
+use midwimble::core::types::PowAlgo;
 use midwimble::core::mw::WalletKeys;
 use midwimble::core::state::current_timestamp;
 use midwimble::core::types::{hash, GENESIS_TARGET};
@@ -81,6 +82,10 @@ async fn a_pool_mines_midwimble_with_its_midstate_search() {
             .expect("/merge/job");
         let commitment = hex32(&job["commitment"]);
         let target = hex32(&job["target"]);
+        // The proof of work the merged block must carry, which the midstate
+        // parent's must match.
+        let algo = PowAlgo::from_name(job["pow"].as_str().expect("the job names its proof of work"))
+            .expect("a known proof of work");
 
         // 2. Build the midstate coinbase the pool would build, with the
         //    commitment in one output's salt.
@@ -106,11 +111,12 @@ async fn a_pool_mines_midwimble_with_its_midstate_search() {
             .post("/block_template", &json!({ "coinbase": coinbase }))
             .expect("/block_template");
         let parent_mining_hash = bytes32(&tpl["mining_midstate"]).unwrap();
+        assert_eq!(PowAlgo::of_midstate_template(&tpl).unwrap(), algo);
 
         // 3. One search. A share that clears midwimble's target is a block.
         let (nonce, final_hash) = (0u64..)
             .find_map(|nonce| {
-                let ext = create_extension(parent_mining_hash, nonce);
+                let ext = create_extension_with(algo, parent_mining_hash, nonce);
                 (ext.final_hash < target).then_some((nonce, ext.final_hash))
             })
             .expect("a nonce below the target");
@@ -165,7 +171,7 @@ async fn a_pool_mines_midwimble_with_its_midstate_search() {
             let parent = bytes32(&tpl["mining_midstate"]).unwrap();
             let (nonce, final_hash) = (0u64..)
                 .find_map(|nonce| {
-                    let ext = create_extension(parent, nonce);
+                    let ext = create_extension_with(algo, parent, nonce);
                     (ext.final_hash < target).then_some((nonce, ext.final_hash))
                 })
                 .expect("a nonce below the target");

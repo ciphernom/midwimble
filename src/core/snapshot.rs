@@ -133,6 +133,7 @@ fn check_headers(checkpoint: &Checkpoint, headers: &[BatchHeader]) -> Result<()>
     }
     let bad = headers.par_iter().filter(|h| h.height > 0).find_any(|h| {
         verify_pow(
+            h.height,
             compute_header_hash(h),
             &h.extension,
             &h.target,

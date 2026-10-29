@@ -6,6 +6,7 @@
 
 use crate::core::extension::MiningResult;
 use crate::core::template::BlockTemplate;
+use crate::core::types::{pow_algo_at, PowAlgo};
 use crate::core::Batch;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use tokio::sync::mpsc;
 /// midstate's backend switch: GPU (when built with `gpu` and a device passes
 /// self-test) or the SIMD CPU miner.
 fn search(
+    algo: PowAlgo,
     mining_hash: [u8; 32],
     target: [u8; 32],
     threads: usize,
@@ -22,11 +24,11 @@ fn search(
 ) -> Option<MiningResult> {
     #[cfg(feature = "gpu")]
     {
-        crate::core::gpu_mining::mine(mining_hash, target, None, threads, cancel, counter)
+        crate::core::gpu_mining::mine(algo, mining_hash, target, None, threads, cancel, counter)
     }
     #[cfg(not(feature = "gpu"))]
     {
-        crate::core::extension::mine_extension(mining_hash, target, None, threads, cancel, counter)
+        crate::core::extension::mine_extension(algo, mining_hash, target, None, threads, cancel, counter)
     }
 }
 
@@ -74,8 +76,9 @@ impl Miner {
             .name(format!("miner-{job}"))
             .spawn(move || {
                 let target = template.batch.target;
+                let algo = pow_algo_at(template.height);
                 if let Some(MiningResult::Block(ext)) =
-                    search(template.mining_hash, target, threads, cancel, counter)
+                    search(algo, template.mining_hash, target, threads, cancel, counter)
                 {
                     let _ = tx.send(MinedBlock {
                         job,

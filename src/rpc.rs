@@ -821,6 +821,9 @@ async fn merge_job(
         "target": hex::encode(template.batch.target),
         "mining_hash": hex::encode(template.mining_hash),
         "height": template.height,
+        // The proof of work the merged block must carry: a pool merges only
+        // a job whose midstate block takes the same one.
+        "pow": crate::core::types::pow_algo_at(template.height).name(),
     });
     let mut jobs = merge_jobs().lock().map_err(|e| bad(e.to_string()))?;
     jobs.push_back((template.mining_hash, template));
@@ -1034,6 +1037,7 @@ async fn mining_template(
         .collect();
     Ok(Json(json!({
         "height": template.height,
+        "pow": crate::core::types::pow_algo_at(template.height).name(),
         "target": hex::encode(template.batch.target),
         "mining_hash": hex::encode(template.mining_hash),
         "reward": template.subsidy,

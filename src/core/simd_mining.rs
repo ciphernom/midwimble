@@ -403,22 +403,40 @@ pub fn verify_pow_batch(seeds: &[[u8; 32]]) -> Vec<[u8; 32]> {
     out
 }
 
-/// Checks many independent proof-of-work chains: `jobs[i]` is a chain's
-/// seed ([`pow_seed`]) and the final hash it must reach.
+/// One proof of work to check: the algorithm it was computed with, the hash
+/// and nonce it was computed over, and the final hash it claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PowJob {
+    pub algo: super::types::PowAlgo,
+    pub mining_hash: [u8; 32],
+    pub nonce: u64,
+    pub final_hash: [u8; 32],
+}
+
+impl PowJob {
+    /// Recomputes this one proof of work and compares.
+    pub fn holds(&self) -> bool {
+        super::extension::create_extension_with(self.algo, self.mining_hash, self.nonce).final_hash
+            == self.final_hash
+    }
+}
+
+/// Checks many independent proofs of work.
 ///
-/// Each chain costs a full extension, and claimed final hashes cost their
-/// sender nothing, so the order of work matters more than its speed. The
-/// first chain is checked alone (a forgery that fails there costs one
-/// extension, as checking one header always did); the rest are checked a piece
-/// at a time across SIMD lanes and threads, stopping after the first piece
-/// that holds a bad chain. Before each piece `proceed` is told its size, and
-/// returning `false` abandons the check.
+/// Each costs a full extension, and claimed final hashes cost their sender
+/// nothing, so the order of work matters more than its speed. The first job
+/// is checked alone (a forgery that fails there costs one extension, as
+/// checking one header always did); the rest are checked a piece at a time
+/// across threads, BLAKE3-chain jobs in SIMD lanes, stopping after the first
+/// piece that holds a bad one. Before each piece `proceed` is told its size,
+/// and returning `false` abandons the check.
 ///
-/// Returns the index of a bad chain, or [`PowCheck::Abandoned`].
-pub fn check_pow_chains_with(
-    jobs: &[([u8; 32], [u8; 32])],
+/// Returns the index of a bad job, or [`PowCheck::Abandoned`].
+pub fn check_pow_jobs_with(
+    jobs: &[PowJob],
     mut proceed: impl FnMut(usize) -> bool,
 ) -> Result<(), PowCheck> {
+    use super::types::PowAlgo;
     use rayon::prelude::*;
     let Some((first, rest)) = jobs.split_first() else {
         return Ok(());
@@ -426,7 +444,7 @@ pub fn check_pow_chains_with(
     if !proceed(1) {
         return Err(PowCheck::Abandoned);
     }
-    if iterate_scalar(&first.0) != first.1 {
+    if !first.holds() {
         return Err(PowCheck::Bad(0));
     }
     let lanes = detected_level().lanes().max(1);
@@ -435,33 +453,38 @@ pub fn check_pow_chains_with(
         if !proceed(chunk.len()) {
             return Err(PowCheck::Abandoned);
         }
-        let bad = chunk
+        let (chain, walk): (Vec<usize>, Vec<usize>) =
+            (0..chunk.len()).partition(|&i| chunk[i].algo == PowAlgo::Blake3Chain);
+        let bad = chain
             .par_chunks(lanes)
-            .enumerate()
-            .find_map_any(|(c, sub)| {
-                let seeds: Vec<[u8; 32]> = sub.iter().map(|j| j.0).collect();
+            .find_map_any(|idx| {
+                let seeds: Vec<[u8; 32]> = idx
+                    .iter()
+                    .map(|&i| pow_seed(&chunk[i].mining_hash, chunk[i].nonce))
+                    .collect();
                 verify_pow_batch(&seeds)
                     .into_iter()
-                    .zip(sub)
-                    .position(|(f, j)| f != j.1)
-                    .map(|k| 1 + p * piece + c * lanes + k)
-            });
+                    .zip(idx)
+                    .find(|(f, &i)| *f != chunk[i].final_hash)
+                    .map(|(_, &i)| i)
+            })
+            .or_else(|| walk.par_iter().find_map_any(|&i| (!chunk[i].holds()).then_some(i)));
         if let Some(i) = bad {
-            return Err(PowCheck::Bad(i));
+            return Err(PowCheck::Bad(1 + p * piece + i));
         }
     }
     Ok(())
 }
 
-/// [`check_pow_chains_with`] that always proceeds.
-pub fn check_pow_chains(jobs: &[([u8; 32], [u8; 32])]) -> Result<(), PowCheck> {
-    check_pow_chains_with(jobs, |_| true)
+/// [`check_pow_jobs_with`] that always proceeds.
+pub fn check_pow_jobs(jobs: &[PowJob]) -> Result<(), PowCheck> {
+    check_pow_jobs_with(jobs, |_| true)
 }
 
-/// Why [`check_pow_chains_with`] stopped.
+/// Why [`check_pow_jobs_with`] stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PowCheck {
-    /// The chain at this index does not reach its claimed final hash.
+    /// The job at this index does not reach its claimed final hash.
     Bad(usize),
     /// The caller's `proceed` asked to stop.
     Abandoned,
@@ -1578,35 +1601,50 @@ mod tests {
     use crate::core::types::{hash, hash_concat};
 
     #[test]
-    fn pow_chains_are_checked_and_the_bad_one_is_named() {
-        let jobs: Vec<([u8; 32], [u8; 32])> = (0..37u64)
+    fn pow_jobs_are_checked_and_the_bad_one_is_named() {
+        use crate::core::types::PowAlgo;
+        // Both algorithms, interleaved, as a run across the switch would not
+        // be but a mix of headers and their parents could.
+        let jobs: Vec<PowJob> = (0..37u64)
             .map(|i| {
-                let seed = pow_seed(&hash(&i.to_le_bytes()), i);
-                (seed, iterate_scalar(&seed))
+                let algo = if i % 3 == 1 { PowAlgo::Walk } else { PowAlgo::Blake3Chain };
+                let mining_hash = hash(&i.to_le_bytes());
+                PowJob {
+                    algo,
+                    mining_hash,
+                    nonce: i,
+                    final_hash: crate::core::extension::create_extension_with(algo, mining_hash, i)
+                        .final_hash,
+                }
             })
             .collect();
-        assert_eq!(check_pow_chains(&jobs), Ok(()));
-        assert_eq!(check_pow_chains(&[]), Ok(()));
+        assert_eq!(check_pow_jobs(&jobs), Ok(()));
+        assert_eq!(check_pow_jobs(&[]), Ok(()));
         for bad in [0usize, 1, 9, 36] {
             let mut forged = jobs.clone();
-            forged[bad].1[0] ^= 1;
-            assert_eq!(
-                check_pow_chains(&forged),
-                Err(PowCheck::Bad(bad)),
-                "bad {bad}"
-            );
+            forged[bad].final_hash[0] ^= 1;
+            assert_eq!(check_pow_jobs(&forged), Err(PowCheck::Bad(bad)), "bad {bad}");
         }
-        // A forged first chain is found before anything else is hashed.
+        // A job claiming the other algorithm fails, whichever way round.
+        for i in [1usize, 2] {
+            let mut swapped = jobs.clone();
+            swapped[i].algo = match swapped[i].algo {
+                PowAlgo::Walk => PowAlgo::Blake3Chain,
+                PowAlgo::Blake3Chain => PowAlgo::Walk,
+            };
+            assert_eq!(check_pow_jobs(&swapped), Err(PowCheck::Bad(i)), "swapped {i}");
+        }
+        // A forged first job is found before anything else is hashed.
         let mut first = jobs.clone();
-        first[0].1[0] ^= 1;
+        first[0].final_hash[0] ^= 1;
         let mut asked = Vec::new();
-        let r = check_pow_chains_with(&first, |n| {
+        let r = check_pow_jobs_with(&first, |n| {
             asked.push(n);
             true
         });
         assert_eq!((r, asked), (Err(PowCheck::Bad(0)), vec![1]));
         assert_eq!(
-            check_pow_chains_with(&jobs, |n| n == 1),
+            check_pow_jobs_with(&jobs, |n| n == 1),
             Err(PowCheck::Abandoned)
         );
     }

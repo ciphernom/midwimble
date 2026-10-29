@@ -42,15 +42,24 @@
 //! parent's header fields. A verifier recomputes the parent mining hash and
 //! the whole chain, and requires `final < midwimble target`.
 //!
+//! From [`WALK_ACTIVATION_HEIGHT`](super::types::WALK_ACTIVATION_HEIGHT) both
+//! native and merged blocks carry Midstate Walk instead
+//! ([`pow_algo_at`](super::types::pow_algo_at)): the parent's work counts
+//! only if it is the proof of work the midwimble block's height asks for. The
+//! parent's own height is unknowable here (the parent need not be valid on
+//! midstate), so it is the midwimble height that decides, and a parent mined
+//! with the other algorithm proves nothing.
+//!
 //! As with Bitcoin/Namecoin AuxPoW, the parent need not be valid on midstate;
 //! only its work counts, and only against midwimble's own target. An aux
 //! block's id is `H(parent_final ‖ aux_mining_hash)`, never the bare parent
 //! hash, so it can never be mistaken for the parent's own id.
 
-use super::extension::{create_extension, verify_extension};
-use super::simd_mining::pow_seed;
+use super::extension::{algos_near, create_extension_with, verify_extension_with};
+use super::simd_mining::PowJob;
 use super::types::{
-    hash, hash_concat, hash_domain, midstate_header_hash, Extension, NETWORK_MAGIC,
+    hash, hash_concat, hash_domain, midstate_header_hash, pow_algo_at, Extension, PowAlgo,
+    NETWORK_MAGIC,
 };
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
@@ -132,9 +141,14 @@ impl AuxPow {
         )
     }
 
-    /// Seed of the parent's hash chain (for batched SIMD verification).
-    pub fn pow_seed(&self, aux_mining_hash: &[u8; 32]) -> [u8; 32] {
-        pow_seed(&self.parent_mining_hash(aux_mining_hash), self.nonce)
+    /// The parent's proof of work under `algo`, for batched verification.
+    pub fn pow_job(&self, algo: PowAlgo, aux_mining_hash: &[u8; 32]) -> PowJob {
+        PowJob {
+            algo,
+            mining_hash: self.parent_mining_hash(aux_mining_hash),
+            nonce: self.nonce,
+            final_hash: self.final_hash,
+        }
     }
 
     pub fn block_id(&self, aux_mining_hash: &[u8; 32]) -> [u8; 32] {
@@ -164,24 +178,60 @@ impl AuxPow {
     }
 }
 
-/// Verifies a block's proof of work, native or merged.
+/// Verifies the proof of work of the block at `height`, native or merged,
+/// under the algorithm that height asks for ([`pow_algo_at`]).
 pub fn verify_pow(
+    height: u64,
+    mining_hash: [u8; 32],
+    extension: &Extension,
+    target: &[u8; 32],
+    aux: Option<&AuxPow>,
+) -> Result<()> {
+    verify_pow_with(pow_algo_at(height), mining_hash, extension, target, aux)
+}
+
+/// [`verify_pow`] under `algo`.
+pub fn verify_pow_with(
+    algo: PowAlgo,
     mining_hash: [u8; 32],
     extension: &Extension,
     target: &[u8; 32],
     aux: Option<&AuxPow>,
 ) -> Result<()> {
     match aux {
-        None => verify_extension(mining_hash, extension, target),
+        None => verify_extension_with(algo, mining_hash, extension, target),
         Some(a) => {
             a.check_claims(&mining_hash, extension, target)?;
-            let recomputed = create_extension(a.parent_mining_hash(&mining_hash), a.nonce);
+            let recomputed =
+                create_extension_with(algo, a.parent_mining_hash(&mining_hash), a.nonce);
             if recomputed.final_hash != a.final_hash {
                 bail!("merged-mining proof of work is invalid");
             }
             Ok(())
         }
     }
+}
+
+/// [`verify_pow`] for a block whose height is unknown (an orphan: its parent
+/// is not ours), but within `extension::ORPHAN_POW_SLACK` of `tip_height`:
+/// near the switch to Midstate Walk it passes under either algorithm. This
+/// only screens what a node holds on to; the block is checked at its real
+/// height when it is applied.
+pub fn verify_pow_near(
+    tip_height: u64,
+    mining_hash: [u8; 32],
+    extension: &Extension,
+    target: &[u8; 32],
+    aux: Option<&AuxPow>,
+) -> Result<()> {
+    let mut last = None;
+    for algo in algos_near(tip_height) {
+        match verify_pow_with(algo, mining_hash, extension, target, aux) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.expect("at least one algorithm is in force"))
 }
 
 // ── Building proofs from a midstate template ────────────────────────────────
@@ -407,9 +457,17 @@ mod tests {
         Value::Array(b.iter().map(|x| Value::from(*x)).collect())
     }
 
+    /// A midwimble height below the switch to Midstate Walk in every build.
+    const CHAIN_HEIGHT: u64 = 1;
+
     /// A parent whose proof of work we can find quickly: the aux target is
     /// the ceiling, and `fast-mining` (or patience) does the rest.
     fn solved(aux_hash: &[u8; 32], target: [u8; 32]) -> AuxPow {
+        solved_with(PowAlgo::Blake3Chain, aux_hash, target)
+    }
+
+    /// [`solved`] with the parent's work done under `algo`.
+    fn solved_with(algo: PowAlgo, aux_hash: &[u8; 32], target: [u8; 32]) -> AuxPow {
         let parent = ParentTemplate {
             pre_commit_midstate: [7; 32],
             commit_address: [1; 32],
@@ -424,7 +482,7 @@ mod tests {
         let mining = parent.proof(0, [0; 32]).parent_mining_hash(aux_hash);
         let mut nonce = 0;
         loop {
-            let ext = create_extension(mining, nonce);
+            let ext = create_extension_with(algo, mining, nonce);
             if ext.final_hash < target {
                 return parent.proof(nonce, ext.final_hash);
             }
@@ -441,7 +499,7 @@ mod tests {
             nonce: 0,
             final_hash: aux.block_id(&aux_hash),
         };
-        verify_pow(aux_hash, &ext, &target, Some(&aux)).unwrap();
+        verify_pow(CHAIN_HEIGHT, aux_hash, &ext, &target, Some(&aux)).unwrap();
 
         // Same proof, different block: the commitment no longer matches.
         let other = [8u8; 32];
@@ -449,10 +507,11 @@ mod tests {
             nonce: 0,
             final_hash: aux.block_id(&other),
         };
-        assert!(verify_pow(other, &ext_other, &target, Some(&aux)).is_err());
+        assert!(verify_pow(CHAIN_HEIGHT, other, &ext_other, &target, Some(&aux)).is_err());
 
         // Wrong id, wrong nonce, tampered fields: all rejected.
         assert!(verify_pow(
+            CHAIN_HEIGHT,
             aux_hash,
             &Extension {
                 nonce: 0,
@@ -463,6 +522,7 @@ mod tests {
         )
         .is_err());
         assert!(verify_pow(
+            CHAIN_HEIGHT,
             aux_hash,
             &Extension {
                 nonce: 1,
@@ -478,10 +538,11 @@ mod tests {
             nonce: 0,
             final_hash: tampered.block_id(&aux_hash),
         };
-        assert!(verify_pow(aux_hash, &ext_t, &target, Some(&tampered)).is_err());
+        assert!(verify_pow(CHAIN_HEIGHT, aux_hash, &ext_t, &target, Some(&tampered)).is_err());
         let mut long = aux.clone();
         long.coinbase_after = vec![[0; 32]; MAX_COINBASE_AFTER + 1];
         assert!(verify_pow(
+            CHAIN_HEIGHT,
             aux_hash,
             &Extension {
                 nonce: 0,
@@ -503,7 +564,32 @@ mod tests {
         };
         let mut strict = [0u8; 32];
         strict[31] = 1;
-        assert!(verify_pow(aux_hash, &ext, &strict, Some(&aux)).is_err());
+        assert!(verify_pow(CHAIN_HEIGHT, aux_hash, &ext, &strict, Some(&aux)).is_err());
+    }
+
+    /// From the switch to Midstate Walk the parent's work must be a Walk,
+    /// and below it the BLAKE3 chain: the same proof counts on one side
+    /// only, and an orphan near the switch is screened under both.
+    #[test]
+    fn merged_work_must_be_the_algorithm_the_height_asks_for() {
+        use crate::core::types::WALK_ACTIVATION_HEIGHT as SWITCH;
+        let aux_hash = [0x5au8; 32];
+        let target = [0xff; 32];
+        for (algo, at, other) in [
+            (PowAlgo::Blake3Chain, SWITCH - 1, SWITCH),
+            (PowAlgo::Walk, SWITCH, SWITCH - 1),
+        ] {
+            let aux = solved_with(algo, &aux_hash, target);
+            let ext = Extension {
+                nonce: 0,
+                final_hash: aux.block_id(&aux_hash),
+            };
+            verify_pow(at, aux_hash, &ext, &target, Some(&aux)).unwrap();
+            assert!(verify_pow(other, aux_hash, &ext, &target, Some(&aux)).is_err());
+            verify_pow_near(SWITCH, aux_hash, &ext, &target, Some(&aux)).unwrap();
+            let job = aux.pow_job(algo, &aux_hash);
+            assert!(job.holds());
+        }
     }
 
     #[test]
@@ -611,7 +697,7 @@ mod tests {
             for_a.proof(0, [0; 32]).parent_mining_hash(&aux_a),
             "both proofs describe the same parent header"
         );
-        let ext = create_extension(mining, 0);
+        let ext = create_extension_with(PowAlgo::Blake3Chain, mining, 0);
         let (proof_a, proof_b) = (
             for_a.proof(0, ext.final_hash),
             for_b.proof(0, ext.final_hash),
@@ -620,8 +706,8 @@ mod tests {
             nonce: 0,
             final_hash: p.block_id(aux),
         };
-        verify_pow(aux_b, &id(&aux_b, &proof_b), &target, Some(&proof_b)).unwrap();
-        let err = verify_pow(aux_a, &id(&aux_a, &proof_a), &target, Some(&proof_a)).unwrap_err();
+        verify_pow(CHAIN_HEIGHT, aux_b, &id(&aux_b, &proof_b), &target, Some(&proof_b)).unwrap();
+        let err = verify_pow(CHAIN_HEIGHT, aux_a, &id(&aux_a, &proof_a), &target, Some(&proof_a)).unwrap_err();
         assert!(err.to_string().contains("last output"), "{err}");
     }
 }

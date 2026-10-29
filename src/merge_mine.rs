@@ -18,6 +18,11 @@
 //!    Often both.
 //! 5. Start over whenever either chain's tip moves.
 //!
+//! Each chain says which proof of work its next block takes (the templates'
+//! `pow` fields: the BLAKE3 chain, or Midstate Walk once that chain has
+//! switched). One search serves both only when they agree; around the switch,
+//! while they do not, the miner mines midstate alone.
+//!
 //! Every midstate coinbase output is appended to a JSONL log (address, value,
 //! salt, coin id): midstate coins can only be spent by someone who knows their
 //! salt, so keep that file.
@@ -25,7 +30,7 @@
 use crate::core::auxpow::{bytes32, merge_commitment, midstate_coin_id, ParentTemplate};
 use crate::core::extension::MiningResult;
 use crate::core::mw::StealthAddress;
-use crate::core::types::hash_domain;
+use crate::core::types::{hash_domain, PowAlgo};
 use crate::rpc::{template_from_hex, RpcClient};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -118,6 +123,21 @@ struct Round {
     midstate_height: u64,
     midstate_tip: String,
     coinbase: Vec<Value>,
+    /// The proof of work midstate's block takes, which the search does.
+    pow: PowAlgo,
+    /// Whether midwimble's block takes the same one, so the search can
+    /// also find it.
+    merged: bool,
+}
+
+/// The proof of work a midwimble template's block takes. A node that
+/// predates Midstate Walk does not say, and wants the BLAKE3 chain.
+fn midwimble_pow(tpl: &Value) -> Result<PowAlgo> {
+    match tpl.get("pow").and_then(Value::as_str) {
+        None => Ok(PowAlgo::Blake3Chain),
+        Some(name) => PowAlgo::from_name(name)
+            .ok_or_else(|| anyhow!("midwimble asks for an unknown proof of work: {name}")),
+    }
 }
 
 fn prepare(
@@ -163,6 +183,8 @@ fn prepare(
         })
         .collect();
     let resp = ms.post("/block_template", &json!({ "coinbase": coinbase }))?;
+    let pow = PowAlgo::of_midstate_template(&resp)?;
+    let merged = pow == midwimble_pow(&tpl)?;
     let parent_mining_hash = hex32(&resp["mining_midstate"])?;
     let midstate_target = hex32(&resp["target"])?;
     let midstate_batch = resp["batch_template"].clone();
@@ -186,10 +208,13 @@ fn prepare(
             .unwrap_or_default()
             .to_string(),
         coinbase,
+        pow,
+        merged,
     })
 }
 
 fn search(
+    algo: PowAlgo,
     mining_hash: [u8; 32],
     target: [u8; 32],
     threads: usize,
@@ -198,11 +223,11 @@ fn search(
 ) -> Option<MiningResult> {
     #[cfg(feature = "gpu")]
     {
-        crate::core::gpu_mining::mine(mining_hash, target, None, threads, cancel, counter)
+        crate::core::gpu_mining::mine(algo, mining_hash, target, None, threads, cancel, counter)
     }
     #[cfg(not(feature = "gpu"))]
     {
-        crate::core::extension::mine_extension(mining_hash, target, None, threads, cancel, counter)
+        crate::core::extension::mine_extension(algo, mining_hash, target, None, threads, cancel, counter)
     }
 }
 
@@ -303,8 +328,20 @@ pub fn run(cfg: MergeMineConfig, stop: Arc<AtomicBool>, stats: Arc<MergeStats>) 
             })
         };
 
-        let easier = round.midstate_target.max(round.midwimble_target);
+        if !round.merged {
+            tracing::warn!(
+                "merge-mine: midstate's next block takes the {} proof of work and midwimble's \
+                 the other; mining midstate alone until both chains have switched",
+                round.pow.name()
+            );
+        }
+        let easier = if round.merged {
+            round.midstate_target.max(round.midwimble_target)
+        } else {
+            round.midstate_target
+        };
         let found = search(
+            round.pow,
             round.parent_mining_hash,
             easier,
             cfg.threads,
@@ -342,7 +379,7 @@ pub fn run(cfg: MergeMineConfig, stop: Arc<AtomicBool>, stats: Arc<MergeStats>) 
             }
         }
 
-        if ext.final_hash < round.midwimble_target {
+        if round.merged && ext.final_hash < round.midwimble_target {
             let proof = round.parent.proof(ext.nonce, ext.final_hash);
             let sealed = template_from_hex(&round.midwimble_template, round.aux_mining_hash)?
                 .seal_aux(proof);
@@ -378,6 +415,18 @@ pub fn run(cfg: MergeMineConfig, stop: Arc<AtomicBool>, stats: Arc<MergeStats>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn templates_say_which_proof_of_work_they_take() {
+        assert_eq!(midwimble_pow(&json!({})).unwrap(), PowAlgo::Blake3Chain);
+        assert_eq!(midwimble_pow(&json!({ "pow": "walk" })).unwrap(), PowAlgo::Walk);
+        assert!(midwimble_pow(&json!({ "pow": "scrypt" })).is_err());
+        assert_eq!(PowAlgo::of_midstate_template(&json!({})).unwrap(), PowAlgo::Blake3Chain);
+        assert_eq!(
+            PowAlgo::of_midstate_template(&json!({ "pow": "walk" })).unwrap(),
+            PowAlgo::Walk
+        );
+    }
 
     #[test]
     fn decomposition_matches_midstate() {

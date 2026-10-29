@@ -1650,14 +1650,18 @@ pub fn backend() -> Backend {
 ///
 /// ```ignore
 /// // before:
-/// crate::core::extension::mine_extension(mining_hash, target, pool_target, threads, cancel, hash_counter)
+/// crate::core::extension::mine_extension(algo, mining_hash, target, pool_target, threads, cancel, hash_counter)
 /// // after:
-/// crate::core::gpu_mining::mine(mining_hash, target, pool_target, threads, cancel, hash_counter)
+/// crate::core::gpu_mining::mine(algo, mining_hash, target, pool_target, threads, cancel, hash_counter)
 /// ```
 ///
 /// `threads` is forwarded to the CPU path and ignored by the GPU path (the GPU
 /// is the parallelism). `MINER_DISABLE_GPU=1` also forces CPU regardless.
+///
+/// The GPU kernel computes the BLAKE3 chain only: Midstate Walk is mined on
+/// the CPU whatever the backend.
 pub fn mine(
+    algo: crate::core::types::PowAlgo,
     midstate: [u8; 32],
     target: [u8; 32],
     pool_target: Option<[u8; 32]>,
@@ -1665,6 +1669,15 @@ pub fn mine(
     cancel: Arc<AtomicBool>,
     hash_counter: Arc<AtomicU64>,
 ) -> Option<MiningResult> {
+    if algo == crate::core::types::PowAlgo::Walk {
+        if backend() == Backend::Gpu {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!("GPU backend requested, but Midstate Walk is CPU-only; mining on CPU")
+            });
+        }
+        return mine_extension(algo, midstate, target, pool_target, threads, cancel, hash_counter);
+    }
     let want_gpu = backend() != Backend::Cpu;
     if want_gpu {
         // Fans out across every self-tested device; falls through to CPU if none.
@@ -1675,5 +1688,5 @@ pub fn mine(
             tracing::warn!("GPU backend requested but no usable GPU; mining on CPU");
         }
     }
-    mine_extension(midstate, target, pool_target, threads, cancel, hash_counter)
+    mine_extension(algo, midstate, target, pool_target, threads, cancel, hash_counter)
 }

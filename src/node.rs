@@ -38,7 +38,7 @@
 //! * **Mining** on a dedicated thread, restarted on every tip or pool change.
 
 use crate::anchor::{load_records, load_records_from, AnchorRecord};
-use crate::core::auxpow::verify_pow;
+use crate::core::auxpow::verify_pow_near;
 use crate::core::filter::CompactFilter;
 use crate::core::mw::{Context, StealthAddress, Transaction};
 use crate::core::relay::{MidstateHeaders, RelayFeed};
@@ -1489,9 +1489,14 @@ impl Node {
             }
             self.orphan_checking.insert(hash);
             let tx = self.internal_tx.clone();
+            // Its height is unknown (its parent is not ours): near the switch
+            // to Midstate Walk it is screened under both algorithms, and
+            // checked properly at its real height if it is ever applied.
+            let tip_height = self.state.height;
             tokio::task::spawn_blocking(move || {
                 let mining_hash = compute_header_hash(&batch.header());
-                let pow_ok = verify_pow(
+                let pow_ok = verify_pow_near(
+                    tip_height,
                     mining_hash,
                     &batch.extension,
                     &batch.target,
@@ -2821,6 +2826,15 @@ impl Node {
             for (batch, header) in chunk.batches.into_iter().zip(chunk.headers) {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     error = Some("sync session ended".into());
+                    break;
+                }
+                // The header's proof of work was checked under the algorithm
+                // its height selects; the block must apply at that height.
+                if header.height != state.height {
+                    error = Some(format!(
+                        "header {} would apply at height {}",
+                        header.height, state.height
+                    ));
                     break;
                 }
                 if let Err(e) = apply_batch_skip_pow(

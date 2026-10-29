@@ -397,7 +397,16 @@ fn gpu_info() -> Result<()> {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let target = [0xffu8; 32];
         let start = std::time::Instant::now();
-        let found = gpu_mining::mine([7u8; 32], target, None, 1, cancel, counter.clone());
+        // The GPU kernel is the BLAKE3 chain's; Midstate Walk is CPU-only.
+        let found = gpu_mining::mine(
+            midwimble::core::types::PowAlgo::Blake3Chain,
+            [7u8; 32],
+            target,
+            None,
+            1,
+            cancel,
+            counter.clone(),
+        );
         out!(
             "mined a trivial target in {:?} ({} extension attempts); result valid: {}",
             start.elapsed(),

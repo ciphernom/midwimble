@@ -67,8 +67,10 @@
 //! * Worker threads serve connections that have already submitted a valid
 //!   share first. Unproven connections, which is all an attacker without
 //!   hashrate can have, share a bounded slice of the workers.
-//! * Workers verify shares in SIMD batches ([`verify_pow_batch`]), several
-//!   times the throughput of verifying them one at a time.
+//! * Workers verify BLAKE3-chain shares in SIMD batches ([`verify_pow_batch`]),
+//!   several times the throughput of verifying them one at a time, and
+//!   Midstate Walk shares (from `WALK_ACTIVATION_HEIGHT`) one per worker:
+//!   each takes milliseconds rather than tens of them.
 //! * A share that fails verification bans its IPv4 address or IPv6 /64, for a
 //!   minute the first time and four times longer for each repeat within a day.
 //!   A correct miner never sends one: it checks the hash before submitting.
@@ -100,7 +102,7 @@
 use crate::core::extension::MiningResult;
 use crate::core::mw::{Coinbase, StealthAddress, ViewKey};
 use crate::core::simd_mining::{detected_level, pow_seed, verify_pow_batch};
-use crate::core::types::Extension;
+use crate::core::types::{pow_algo_at, Extension, PowAlgo};
 use crate::core::types::{
     compute_header_hash, hash_concat, hash_domain, registrations_hash, Batch, BatchHeader,
 };
@@ -138,6 +140,10 @@ const OWNERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("owners");
 /// What it takes to recompute each job's copies' mining hashes, by job id
 /// ([`JobProof`], bincode), for as long as its shares can be paid.
 const JOB_PROOFS: TableDefinition<u64, &[u8]> = TableDefinition::new("job_proofs");
+/// The height each job mines, by job id, kept with its proof: it decides
+/// the proof of work of the job's shares, which spot checks recompute.
+/// Jobs from before this table predate Midstate Walk.
+const JOB_HEIGHTS: TableDefinition<u64, u64> = TableDefinition::new("job_heights");
 /// Blocks the pool found, by hash: a JSON record for `/pool/stats`.
 const FOUND: TableDefinition<&[u8], &str> = TableDefinition::new("found_blocks");
 
@@ -754,6 +760,9 @@ impl WindowSnapshot {
             "share": hex::encode(bincode::serialize(share.as_ref())?),
             "path": tree.path(index).iter().map(node_json).collect::<Vec<_>>(),
             "job_proof": hex::encode(bincode::serialize(&proof)?),
+            // The job's height, which picks the share's proof of work. Null
+            // for a job recorded before heights were (before Midstate Walk).
+            "height": load_job_height(db, share.job_id)?,
         }))
     }
 }
@@ -898,18 +907,29 @@ fn prune_db(
         .retain_in(..first_kept, |_, _| false)?;
     txn.open_table(JOB_PROOFS)?
         .retain_in(..first_job, |_, _| false)?;
+    txn.open_table(JOB_HEIGHTS)?
+        .retain_in(..first_job, |_, _| false)?;
     txn.open_table(OWNERS)?
         .retain(|id, _| <OwnerId>::try_from(id).is_ok_and(|id| owners.contains(&id)))?;
     txn.commit()?;
     Ok(())
 }
 
-fn store_job_proof(db: &Database, job_id: u64, proof: &JobProof) -> Result<()> {
+fn store_job_proof(db: &Database, job_id: u64, height: u64, proof: &JobProof) -> Result<()> {
     let txn = db.begin_write()?;
     txn.open_table(JOB_PROOFS)?
         .insert(job_id, bincode::serialize(proof)?.as_slice())?;
+    txn.open_table(JOB_HEIGHTS)?.insert(job_id, height)?;
     txn.commit()?;
     Ok(())
+}
+
+/// The height job `job_id` mines, if it was recorded.
+fn load_job_height(db: &Database, job_id: u64) -> Result<Option<u64>> {
+    let txn = db.begin_read()?;
+    let table = txn.open_table(JOB_HEIGHTS)?;
+    let height = table.get(job_id)?.map(|v| v.value());
+    Ok(height)
 }
 
 fn load_job_proof(db: &Database, job_id: u64) -> Result<JobProof> {
@@ -1149,7 +1169,9 @@ impl<R: AsyncRead + Unpin> LineReader<R> {
 
 /// One share's proof of work to recompute.
 struct VerifyTask {
-    seed: [u8; 32],
+    algo: PowAlgo,
+    mining_hash: [u8; 32],
+    nonce: u64,
     proven: bool,
     done: oneshot::Sender<[u8; 32]>,
 }
@@ -1222,12 +1244,25 @@ impl Verifier {
         Self { shared }
     }
 
-    /// Queues `seed` and returns the final hash of its proof of work.
-    async fn verify(&self, seed: [u8; 32], proven: bool) -> Result<[u8; 32]> {
+    /// Queues the proof of work of `nonce` over `mining_hash` under `algo`
+    /// and returns its final hash.
+    async fn verify(
+        &self,
+        algo: PowAlgo,
+        mining_hash: [u8; 32],
+        nonce: u64,
+        proven: bool,
+    ) -> Result<[u8; 32]> {
         let (done, result) = oneshot::channel();
         {
             let mut queues = self.shared.queues.lock().expect("verifier lock");
-            let task = VerifyTask { seed, proven, done };
+            let task = VerifyTask {
+                algo,
+                mining_hash,
+                nonce,
+                proven,
+                done,
+            };
             if proven {
                 queues.proven.push_back(task);
             } else {
@@ -1251,16 +1286,29 @@ fn verify_worker(shared: &VerifierShared, lanes: usize) {
                 queues = shared.ready.wait(queues).expect("verifier lock");
             }
         };
-        let mut seeds: Vec<[u8; 32]> = batch.iter().map(|t| t.seed).collect();
-        // Three or more shares verify faster as one full SIMD batch, padded
-        // with throwaway seeds, than one after another.
-        if seeds.len() >= 3 && seeds.len() < lanes {
-            seeds.resize(lanes, [0u8; 32]);
-        }
-        let finals = verify_pow_batch(&seeds);
         let unproven = batch.iter().filter(|t| !t.proven).count();
-        for (task, final_hash) in batch.into_iter().zip(finals) {
-            let _ = task.done.send(final_hash);
+        let (chain, walk): (Vec<VerifyTask>, Vec<VerifyTask>) = batch
+            .into_iter()
+            .partition(|t| t.algo == PowAlgo::Blake3Chain);
+        if !chain.is_empty() {
+            let mut seeds: Vec<[u8; 32]> = chain
+                .iter()
+                .map(|t| pow_seed(&t.mining_hash, t.nonce))
+                .collect();
+            // Three or more shares verify faster as one full SIMD batch, padded
+            // with throwaway seeds, than one after another.
+            if seeds.len() >= 3 && seeds.len() < lanes {
+                seeds.resize(lanes, [0u8; 32]);
+            }
+            let finals = verify_pow_batch(&seeds);
+            for (task, final_hash) in chain.into_iter().zip(finals) {
+                let _ = task.done.send(final_hash);
+            }
+        }
+        for task in walk {
+            let _ = task
+                .done
+                .send(crate::core::walk::walk_hash(&task.mining_hash, task.nonce));
         }
         if unproven > 0 {
             shared
@@ -1405,6 +1453,7 @@ fn open_db(path: &std::path::Path) -> Result<(Database, ShareLog, u64)> {
         txn.open_table(SHARE_RECORDS)?;
         txn.open_table(OWNERS)?;
         txn.open_table(JOB_PROOFS)?;
+        txn.open_table(JOB_HEIGHTS)?;
         txn.open_table(FOUND)?;
     }
     txn.commit()?;
@@ -1744,8 +1793,9 @@ async fn job_loop(state: Arc<PoolState>) {
                 // proof, for as long as the share can be paid.
                 if let Some(proof) = JobProof::of(&job.batch, job.paying.root, job.next.root) {
                     let st = state.clone();
+                    let height = job.height;
                     let stored = tokio::task::spawn_blocking(move || {
-                        store_job_proof(&st.db, job_id, &proof)
+                        store_job_proof(&st.db, job_id, height, &proof)
                     })
                     .await;
                     if let Ok(Err(e)) | Err(e) = stored.map_err(anyhow::Error::from) {
@@ -2134,8 +2184,11 @@ async fn process_share(
         Ok(share) => share,
         Err(outcome) => return Ok(outcome),
     };
-    let seed = pow_seed(&share.variant.mining_hash, nonce);
-    let final_hash = state.verifier.verify(seed, proven).await?;
+    let algo = pow_algo_at(share.job.height);
+    let final_hash = state
+        .verifier
+        .verify(algo, share.variant.mining_hash, nonce, proven)
+        .await?;
     finish_share(&state, share, final_hash).await
 }
 
@@ -2812,7 +2865,18 @@ pub fn check_window_chain(last: Option<&AuditedJob>, job: &AuditedJob) -> Result
 /// twice, fails a check that lands on the padding, and a check lands on any
 /// part of the window in proportion to its weight. Each check recomputes one
 /// share's proof of work.
-pub fn verify_sample(window: &Window, at: u128, sample: &Value) -> Result<()> {
+///
+/// The share's proof of work is the one its job's height asks for
+/// ([`pow_algo_at`]). `known_height` gives the heights of jobs this miner
+/// audited itself, which the pool's stated height must match; for any other
+/// job the pool's word is taken (a job without one predates job heights, and
+/// so Midstate Walk).
+pub fn verify_sample(
+    window: &Window,
+    at: u128,
+    sample: &Value,
+    known_height: impl Fn(u64) -> Option<u64>,
+) -> Result<()> {
     let (owner, offset) = window
         .locate(at)
         .ok_or_else(|| anyhow!("the sampled point lies beyond the window"))?;
@@ -2863,7 +2927,18 @@ pub fn verify_sample(window: &Window, at: u128, sample: &Value) -> Result<()> {
             || anyhow!("the pool answered a spot check without a job proof"),
         )?)?)?;
     let mining_hash = proof.mining_hash(&owner.id, share.auth.as_ref());
-    let final_hash = crate::core::extension::create_extension(mining_hash, share.nonce).final_hash;
+    let claimed = sample.get("height").and_then(Value::as_u64);
+    let height = match (known_height(share.job_id), claimed) {
+        (Some(known), Some(claimed)) if known != claimed => bail!(
+            "the pool says job {} mined height {claimed}, but it mined {known}",
+            share.job_id
+        ),
+        (Some(known), _) => known,
+        (None, Some(claimed)) => claimed,
+        (None, None) => 0,
+    };
+    let final_hash =
+        crate::core::extension::create_extension_at(height, mining_hash, share.nonce).final_hash;
     if final_hash != share.final_hash {
         bail!("the sampled share is not proof of work on its owner's copy of a job");
     }
@@ -2963,6 +3038,7 @@ pub struct PoolMinerStats {
 }
 
 fn search(
+    algo: PowAlgo,
     mining_hash: [u8; 32],
     target: [u8; 32],
     share: [u8; 32],
@@ -2972,11 +3048,12 @@ fn search(
 ) -> Option<MiningResult> {
     #[cfg(feature = "gpu")]
     {
-        crate::core::gpu_mining::mine(mining_hash, target, Some(share), threads, cancel, counter)
+        crate::core::gpu_mining::mine(algo, mining_hash, target, Some(share), threads, cancel, counter)
     }
     #[cfg(not(feature = "gpu"))]
     {
         crate::core::extension::mine_extension(
+            algo,
             mining_hash,
             target,
             Some(share),
@@ -3028,6 +3105,9 @@ pub async fn run_pool_miner_with_fee_percent(
     let mut job_bits: VecDeque<(u64, u32)> = VecDeque::new();
     let mut submitted: HashMap<u64, u32> = HashMap::new();
     let mut last_audit: Option<AuditedJob> = None;
+    // The height each recent job we audited mines, which decides its
+    // shares' proof of work in spot checks.
+    let mut audited_heights: VecDeque<(u64, u64)> = VecDeque::new();
     // Spot checks run beside mining, once for each newly paid window.
     let (spot_tx, mut spot_rx) = tokio::sync::mpsc::channel::<Result<usize>>(4);
     let mut last_checked: Option<[u8; 32]> = None;
@@ -3116,6 +3196,10 @@ pub async fn run_pool_miner_with_fee_percent(
                     }
                 };
                 stats.audits_passed.fetch_add(1, Ordering::Relaxed);
+                audited_heights.push_back((job_id, audited.height));
+                while audited_heights.len() > 256 {
+                    audited_heights.pop_front();
+                }
                 // Shares before the paid window are behind later windows too,
                 // unless blocks get easier and windows longer; forgetting
                 // them then only makes the check above more lenient.
@@ -3127,6 +3211,7 @@ pub async fn run_pool_miner_with_fee_percent(
                     last_checked = Some(audited.window_root);
                     let (api2, window, checks, tx) =
                         (api.clone(), audited.window.clone(), cfg.spot_checks, spot_tx.clone());
+                    let heights: HashMap<u64, u64> = audited_heights.iter().copied().collect();
                     tokio::task::spawn_blocking(move || {
                         let client = RpcClient::new(api2);
                         let checked = (0..checks).try_fold(0usize, |done, _| -> Result<usize> {
@@ -3136,19 +3221,22 @@ pub async fn run_pool_miner_with_fee_percent(
                             if let Some(e) = sample.get("error") {
                                 bail!("the pool refused a spot check: {e}");
                             }
-                            verify_sample(&window, at, &sample)?;
+                            verify_sample(&window, at, &sample, |job| heights.get(&job).copied())?;
                             Ok(done + 1)
                         });
                         let _ = tx.blocking_send(checked);
                     });
                 }
+                // The audit checked the job pays the reward at its height, which
+                // also decides the proof of work to grind.
+                let algo = pow_algo_at(audited.height);
                 last_audit = Some(audited);
 
                 cancel = Arc::new(AtomicBool::new(false));
                 let (c, tx, threads, counter) = (cancel.clone(), share_tx.clone(), cfg.threads, stats.hashes.clone());
                 std::thread::spawn(move || {
                     while !c.load(Ordering::Relaxed) {
-                        match search(mining_hash, network_target, share_target, threads, c.clone(), counter.clone()) {
+                        match search(algo, mining_hash, network_target, share_target, threads, c.clone(), counter.clone()) {
                             Some(MiningResult::Block(ext)) | Some(MiningResult::Share(ext)) => {
                                 if tx.blocking_send((job_id, ext.nonce)).is_err() {
                                     break;
@@ -3326,7 +3414,9 @@ mod tests {
 
     fn task(proven: bool) -> VerifyTask {
         VerifyTask {
-            seed: [0; 32],
+            algo: PowAlgo::Blake3Chain,
+            mining_hash: [0; 32],
+            nonce: 0,
             proven,
             done: oneshot::channel().0,
         }
@@ -3859,7 +3949,7 @@ mod tests {
         *state.current.write().await = Some(test_job(2, &[]));
         let final_hash = state
             .verifier
-            .verify(pow_seed(&share.job.mining_hash, 5), true)
+            .verify(PowAlgo::Blake3Chain, share.job.mining_hash, 5, true)
             .await
             .unwrap();
         assert!(matches!(
@@ -3882,13 +3972,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(dir.path(), 0);
         let mining_hash = [3u8; 32];
+        // Both algorithms at once, as around the switch to Midstate Walk.
+        let algo = |nonce: u64| {
+            if nonce % 3 == 0 {
+                PowAlgo::Walk
+            } else {
+                PowAlgo::Blake3Chain
+            }
+        };
         let checks: Vec<_> = (0..11u64)
             .map(|nonce| {
                 let st = state.clone();
                 tokio::spawn(async move {
                     let got = st
                         .verifier
-                        .verify(pow_seed(&mining_hash, nonce), false)
+                        .verify(algo(nonce), mining_hash, nonce, false)
                         .await;
                     (nonce, got.unwrap())
                 })
@@ -3896,8 +3994,9 @@ mod tests {
             .collect();
         for check in checks {
             let (nonce, got) = check.await.unwrap();
-            let want = crate::core::extension::create_extension(mining_hash, nonce).final_hash;
-            assert_eq!(got, want);
+            let want = crate::core::extension::create_extension_with(algo(nonce), mining_hash, nonce)
+                .final_hash;
+            assert_eq!(got, want, "nonce {nonce}");
         }
     }
 
@@ -4102,6 +4201,16 @@ mod tests {
     /// Shares mined on `proof`'s copies: one per `(owner, weight)`, each
     /// meeting `bits` plus its weight's extra bits.
     fn mined_shares(proof: &JobProof, wanted: &[(OwnerId, u64)], bits: u32) -> Vec<ShareRecord> {
+        mined_shares_at(1, proof, wanted, bits)
+    }
+
+    /// [`mined_shares`] for a job at `height`, under its proof of work.
+    fn mined_shares_at(
+        height: u64,
+        proof: &JobProof,
+        wanted: &[(OwnerId, u64)],
+        bits: u32,
+    ) -> Vec<ShareRecord> {
         let mut nonce = 0u64;
         wanted
             .iter()
@@ -4112,7 +4221,8 @@ mod tests {
                 loop {
                     nonce += 1;
                     let final_hash =
-                        crate::core::extension::create_extension(mining_hash, nonce).final_hash;
+                        crate::core::extension::create_extension_at(height, mining_hash, nonce)
+                            .final_hash;
                     if final_hash < target {
                         return ShareRecord {
                             seq: seq as u64,
@@ -4165,9 +4275,42 @@ mod tests {
         (0..snapshot.window.total())
             .filter(|at| {
                 let sample = snapshot.sample(db, *at).unwrap();
-                verify_sample(&snapshot.window, *at, &sample).is_err()
+                verify_sample(&snapshot.window, *at, &sample, |_| None).is_err()
             })
             .count() as u128
+    }
+
+    /// Shares of a job past the switch to Midstate Walk are Walk work: spot
+    /// checks recompute them as such from the job's height, and catch a pool
+    /// misstating the height of a job the miner audited.
+    #[test]
+    fn spot_checks_follow_the_jobs_proof_of_work() {
+        use crate::core::types::WALK_ACTIVATION_HEIGHT as SWITCH;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _, _) = open_db(&dir.path().join("pool.redb")).unwrap();
+        let proof = JobProof::of(&paying_batch(), [1; 32], [2; 32]).unwrap();
+        store_job_proof(&db, 7, SWITCH, &proof).unwrap();
+        let (a, b) = (id(1), id(2));
+        let bits = 2;
+        let real = mined_shares_at(SWITCH, &proof, &[(a, 1), (b, 2), (a, 1)], bits);
+        let window = WindowSnapshot::new(
+            0,
+            3,
+            bits,
+            real.iter().cloned().map(Arc::new).collect(),
+            HashMap::new(),
+        );
+        assert_eq!(failing_points(&db, &window), 0);
+        let sample = window.sample(&db, 0).unwrap();
+        assert_eq!(sample["height"], json!(SWITCH));
+        // We audited job 7 ourselves: the pool's height must agree.
+        verify_sample(&window.window, 0, &sample, |job| (job == 7).then_some(SWITCH)).unwrap();
+        let mut lied = sample.clone();
+        lied["height"] = json!(SWITCH - 1);
+        assert!(verify_sample(&window.window, 0, &lied, |job| (job == 7).then_some(SWITCH)).is_err());
+        // Without our own record, a pool claiming a pre-switch height for
+        // Walk work does not get it checked as BLAKE3-chain work.
+        assert!(verify_sample(&window.window, 0, &lied, |_| None).is_err());
     }
 
     #[test]
@@ -4175,7 +4318,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db, _, _) = open_db(&dir.path().join("pool.redb")).unwrap();
         let proof = JobProof::of(&paying_batch(), [1; 32], [2; 32]).unwrap();
-        store_job_proof(&db, 7, &proof).unwrap();
+        store_job_proof(&db, 7, 1, &proof).unwrap();
         let (a, b) = (id(1), id(2));
         let bits = 2;
         let real = mined_shares(&proof, &[(a, 1), (a, 4), (b, 2), (a, 1), (b, 1)], bits);
@@ -4192,10 +4335,10 @@ mod tests {
         assert_eq!(failing_points(&db, &honest), 0);
         let sample = honest.sample(&db, 3).unwrap();
         // A reply for the wrong point, or doctored, fails.
-        assert!(verify_sample(&honest.window, 8, &sample).is_err());
+        assert!(verify_sample(&honest.window, 8, &sample, |_| None).is_err());
         let mut doctored = sample.clone();
         doctored["index"] = json!((sample["index"].as_u64().unwrap() + 1) % 3);
-        assert!(verify_sample(&honest.window, 3, &doctored).is_err());
+        assert!(verify_sample(&honest.window, 3, &doctored, |_| None).is_err());
 
         let of = |owner: OwnerId| -> Vec<ShareRecord> {
             let mut list: Vec<ShareRecord> =
@@ -4233,7 +4376,8 @@ mod tests {
         let lighter = (0..snapshot.window.total())
             .step_by(1 << 16)
             .filter(|at| {
-                verify_sample(&snapshot.window, *at, &snapshot.sample(&db, *at).unwrap()).is_err()
+                verify_sample(&snapshot.window, *at, &snapshot.sample(&db, *at).unwrap(), |_| None)
+                    .is_err()
             })
             .count();
         assert!(lighter >= 15, "{lighter}");
