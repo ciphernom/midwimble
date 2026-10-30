@@ -121,7 +121,75 @@ pub fn chain_constants() -> String {
         "fast_mining": cfg!(feature = "fast-mining"),
         // The relay minimum fee rate, in base units per unit of weight.
         "min_fee_rate": types::MIN_FEE_PER_WEIGHT,
+        // Where each chain switches to Midstate Walk, for the miner's countdown.
+        "walk_activation_height": types::WALK_ACTIVATION_HEIGHT,
+        "midstate_walk_activation_height": types::MIDSTATE_WALK_ACTIVATION_HEIGHT,
     }))
+}
+
+// ── Mining ──────────────────────────────────────────────────────────────────
+//
+// The page mines for a merge-mining pool: its shares are midstate shares, and
+// one that also beats midwimble's target is a midwimble block as well. So the
+// search takes the pool's job as it comes (`pow`, `mining_midstate` and the
+// share `target`) and hashes exactly as midstate does, which is also what
+// midwimble checks a merged block's work with.
+
+fn pow_algo(name: &str) -> Result<midwimble::core::types::PowAlgo, JsError> {
+    midwimble::core::types::PowAlgo::from_name(name)
+        .ok_or_else(|| JsError::new(&format!("unknown proof of work: {name}")))
+}
+
+/// Searches `4 × iterations` nonces from `start_nonce` for the first whose
+/// proof-of-work hash under `pow` ("blake3-chain" or "walk") over
+/// `midstate_hex` is below `target_hex`; `undefined` if none is. A
+/// BLAKE3-chain attempt is a million hashes, run four at a time with
+/// WebAssembly SIMD; a Midstate Walk attempt takes a few milliseconds.
+#[wasm_bindgen]
+pub fn search_nonces_pow(
+    pow: &str,
+    midstate_hex: &str,
+    target_hex: &str,
+    start_nonce: u64,
+    iterations: u32,
+) -> Result<Option<u64>, JsError> {
+    use midwimble::core::types::PowAlgo;
+    let algo = pow_algo(pow)?;
+    let midstate = hex32(midstate_hex, "the mining hash")?;
+    let target = hex32(target_hex, "the target")?;
+    let found = match algo {
+        PowAlgo::Blake3Chain => (0..iterations as u64).find_map(|i| {
+            let base = start_nonce.wrapping_add(i * 4);
+            let nonces = [0, 1, 2, 3].map(|k| base.wrapping_add(k));
+            midwimble::core::simd_mining::create_extensions_4way(midstate, nonces)
+                .into_iter()
+                .find(|(_, hash)| *hash < target)
+                .map(|(nonce, _)| nonce)
+        }),
+        PowAlgo::Walk => (0..iterations as u64 * 4)
+            .map(|i| start_nonce.wrapping_add(i))
+            .find(|&nonce| midwimble::core::walk::walk_hash(&midstate, nonce) < target),
+    };
+    Ok(found)
+}
+
+/// The proof-of-work hash (hex) of `nonce` over `midstate_hex` under `pow`,
+/// to check this build against known answers.
+#[wasm_bindgen]
+pub fn pow_hash(pow: &str, midstate_hex: &str, nonce: u64) -> Result<String, JsError> {
+    let ext = midwimble::core::extension::create_extension_with(
+        pow_algo(pow)?,
+        hex32(midstate_hex, "the mining hash")?,
+        nonce,
+    );
+    Ok(hex::encode(ext.final_hash))
+}
+
+/// What block `height` mints under the schedule, in base units, before any
+/// bond's cap or fees: the miner's estimate when a pool doesn't say.
+#[wasm_bindgen]
+pub fn block_reward(height: f64) -> Result<f64, JsError> {
+    Ok(midwimble::core::types::block_reward(whole(height, "a height")?) as f64)
 }
 
 // ── Files ───────────────────────────────────────────────────────────────────

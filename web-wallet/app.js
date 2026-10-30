@@ -7,6 +7,9 @@
 // rendered as text, never as HTML.
 
 import { qrSvg } from './qr.js';
+import {
+    Miner, DEFAULT_POOL, DEFAULT_THREADS, DEFAULT_EFFORT, MAX_THREADS, EFFORTS, restOf, poolBase, expectedAttempts,
+} from './mining.js';
 
 const COIN = 100_000_000;
 const KEY = {
@@ -38,6 +41,11 @@ const DEFAULTS = Object.freeze({
     feeLevel: 1,           // times the relay minimum; 0: the custom rate
     feeRate: 0,            // the custom rate, base units per weight
     coinControl: false,    // choose the coins each payment spends
+    mineThreads: 0,        // mining threads; 0: what suits this device
+    mineEffort: 0,         // 1 light, 2 medium, 3 full; 0: what suits this device
+    minePauseOnBattery: true, // pause mining off the charger below 20%
+    minePool: '',          // the mining pool; '': the default one
+    mineMidstate: '',      // a midstate address paid the midstate part of shares
 });
 const WORKER_KEYS = new Set(['wholeBlocks', 'decoys', 'decoyWindow', 'scanPerRequest', 'fetchAhead',
     'watchMempool', 'mempoolSecs', 'rebroadcastSecs', 'feeLevel', 'feeRate']);
@@ -60,6 +68,9 @@ const app = {
     draft: { to: '', amount: '', coins: [] }, // the payment being written
     sent: null,        // the payment just sent, for its receipt
     phrase: null,      // the recovery phrase while it is shown
+    after: null,       // where to go once the wallet opens, if not home
+    mineOnOpen: false, // start mining once the wallet just made has an address
+    reward: null,      // { height, units }: what a midwimble block mints there
 };
 
 function loadSettings() {
@@ -214,6 +225,7 @@ const ICONS = {
     left: ['M15 5l-7 7 7 7'],
     wallet: ['r3,6,18,14,3', 'M3 10h18', 'M16 15h2'],
     install: ['M12 3v12', 'M7 10l5 5 5-5', 'M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4'],
+    pick: ['M10.5 3.5Q19 5 20.5 13.5', 'M4 20L16.5 7.5'],
 };
 function icon(name) {
     const s = svgEl('svg', { viewBox: '0 0 24 24', 'aria-hidden': 'true', class: 'icon' });
@@ -439,16 +451,30 @@ worker.onmessage = (e) => {
             app.flow = null;
             app.state = null;
             worker.postMessage({ type: 'settings', settings: workerSettings() });
+            // No wallet here (any more): nothing to mine for.
+            if (!m.hasWallet) { miner.stop(); app.after = null; }
+            // A link to #/mine opens the miner: on a first visit, the one-tap
+            // setup; with a locked wallet, the Mine screen once it opens.
+            if (deepMine) {
+                deepMine = false;
+                if (!m.hasWallet) { if (routePath() === 'mine') render(false); else location.hash = '#/mine'; return; }
+                app.after = '#/mine';
+            }
             goHome();
             return;
-        case 'unlocked':
+        case 'unlocked': {
             app.phase = 'wallet';
             app.hasWallet = true;
             app.flow = null;
             app.keygen = { done: 0, total: 0 };
             lastUse = Date.now();
-            goHome();
+            const after = app.after;
+            app.after = null;
+            if (!after) goHome();
+            else if (location.hash === after) render(false);
+            else location.hash = after;
             return;
+        }
         case 'locked':
             app.phase = app.hasWallet ? 'unlock' : 'welcome';
             app.state = null;
@@ -458,6 +484,11 @@ worker.onmessage = (e) => {
             return;
         case 'state':
             app.state = m.state;
+            // The wallet made by "Mine in your browser" has its address now.
+            if (app.mineOnOpen && app.state && app.state.address) {
+                app.mineOnOpen = false;
+                startMining();
+            }
             update();
             return;
         case 'keygen':
@@ -636,7 +667,7 @@ const $content = h('main', { class: 'content' });
 $app.append($top, h('div', { class: 'shell' }, $side, $content));
 
 /** The sections a wide screen lists down the side. */
-const SECTIONS = [['', 'Wallet', 'wallet'], ['activity', 'Activity', 'clock'], ['send', 'Send', 'up'], ['receive', 'Receive', 'down'], ['settings', 'Settings', null]];
+const SECTIONS = [['', 'Wallet', 'wallet'], ['activity', 'Activity', 'clock'], ['send', 'Send', 'up'], ['receive', 'Receive', 'down'], ['mine', 'Mine', 'pick'], ['settings', 'Settings', null]];
 function drawSide(path) {
     const top = path.split('/')[0];
     const watchOnly = app.state && app.state.watchOnly;
@@ -645,6 +676,8 @@ function drawSide(path) {
 }
 
 const routePath = () => decodeURI((location.hash.match(/^#\/?(.*)$/) || [])[1] || '').replace(/\/+$/, '');
+/** Opened by a link to #/mine (read once, at boot). */
+let deepMine = routePath() === 'mine';
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
 
 let current = null; // { path, sc, el }
@@ -671,12 +704,14 @@ let topKey = null;
 function drawTop() {
     const open = app.phase === 'wallet';
     const net = open ? netSummary() : null;
-    const key = JSON.stringify([open, net]);
+    const mining = open && miner.state.on;
+    const key = JSON.stringify([open, net, mining]);
     if (key === topKey) return;
     topKey = key;
     fill($top,
         h('a', { class: 'brand', href: '#/' }, h('img', { src: 'logo.svg', alt: '' }), h('b', null, 'Midwimble')),
         open ? h('div', { class: 'top-actions' },
+            mining ? h('a', { class: 'status-pill mining', href: '#/mine', title: 'Mining', 'aria-label': 'Mining' }, icon('pick'), h('span', { class: 'pill-label' }, 'Mining')) : null,
             h('a', { class: 'status-pill', href: '#/settings/network', title: 'Network' }, h('span', { class: 'dot ' + net.cls }), net.text),
             h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Lock', title: 'Lock', onclick: () => ask('lock').catch(() => {}) }, icon('lock')),
             h('a', { class: 'icon-btn top-settings', href: '#/settings', 'aria-label': 'Settings', title: 'Settings' }, gearIcon())) : null);
@@ -724,6 +759,7 @@ function screenFor(path) {
         const net = /^network(?:\/(.*))?$/.exec(path);
         if (net) return networkRoute(net[1] || '', '#/network', ['Back', '#/']);
         if (app.phase === 'welcome') {
+            if (path === 'mine') return mineStartScreen();
             if (path === 'create' || path.startsWith('create/')) return createScreen(path);
             if (path === 'restore') return restoreScreen();
             if (path === 'watch') return watchScreen();
@@ -739,6 +775,9 @@ function screenFor(path) {
     if (path === 'send/coins') return coinPickerScreen();
     if (path === 'send/done') return sentScreen();
     if (path === 'receive') return receiveScreen();
+    if (path === 'mine') return mineScreen();
+    if (path === 'mine/pool') return minePoolScreen();
+    if (path === 'mine/midstate') return mineMidstateScreen();
     if (path === 'settings') return settingsScreen();
     if (path === 'settings/backup') return backupScreen();
     if (path === 'settings/backup/phrase') return phraseScreen();
@@ -783,6 +822,8 @@ function welcomeScreen() {
             logo(),
             h('h1', null, 'Midwimble'),
             h('p', null, 'A private wallet that lives in this browser. Your keys never leave it.'),
+            h('a', { class: 'mine-cta', href: '#/mine' }, h('span', { class: 'tile orange' }, icon('pick')),
+                h('span', { class: 'grow' }, h('b', null, 'Mine midwimble in your browser'), h('small', null, 'One tap to start. Nothing to install.'))),
             h('div', { class: 'stack-buttons' },
                 h('a', { class: 'btn primary', href: '#/create' }, 'Create new wallet'),
                 h('a', { class: 'btn secondary', href: '#/restore' }, 'Restore with recovery phrase'),
@@ -815,15 +856,29 @@ function lockScreen() {
         }
     };
     pw.addEventListener('input', () => { err.textContent = ''; });
+    // Mining needs only the address, so it carries on while the wallet is
+    // locked (auto-lock would otherwise stop every miner who walks away).
+    const miningDot = h('span', { class: 'dot' });
+    const miningText = h('span');
+    const mining = h('div', { class: 'locked-mining' }, miningDot, miningText,
+        h('button', { class: 'quiet', type: 'button', onclick: () => miner.stop() }, 'Stop'));
+    const drawMining = () => {
+        const m = miner.state;
+        mining.hidden = !m.on;
+        miningDot.className = 'dot ' + (m.phase === 'mining' ? 'ok' : 'busy');
+        miningText.textContent = m.phase === 'mining' ? `Still mining: ${rateText(m.rate)}` : 'Still mining';
+    };
+    drawMining();
     card = h('form', { class: 'center-card', onsubmit: unlock },
         logo(),
         h('h1', null, 'Welcome back'),
         h('p', null, 'Your wallet is locked.'),
         h('div', { class: 'stack-buttons' }, pw, err, go),
+        mining,
         h('div', { class: 'quiet-links' },
             h('button', { class: 'quiet', type: 'button', onclick: forgotPassword }, 'Forgot your password?'),
             h('a', { class: 'quiet', href: '#/network' }, networkName())));
-    return { bare: true, els: [card], focus() { pw.focus(); } };
+    return { bare: true, els: [card], focus() { pw.focus(); }, update: drawMining };
 }
 
 async function forgotPassword() {
@@ -1160,6 +1215,7 @@ function activityRow(e) {
 function homeScreen() {
     const balance = balanceView();
     const recent = h('div');
+    const mining = mineCard();
     let lastKey = null;
     return {
         wide: true,
@@ -1169,9 +1225,11 @@ function homeScreen() {
                     ? h('span', { class: 'pill' }, 'Watch-only')
                     : h('a', { class: 'btn primary', href: '#/send' }, icon('up'), 'Send'),
                 h('a', { class: 'btn secondary', href: '#/receive' }, icon('down'), 'Receive'))),
+            mining.el,
             recent],
         update() {
             balance.draw();
+            mining.draw();
             const s = app.state;
             if (!s) return;
             const items = s.history.slice(0, 5);
@@ -1690,9 +1748,347 @@ function receiveScreen() {
     };
 }
 
+// ── mining ──────────────────────────────────────────────────────────────────
+//
+// mining.js does the work; these are its screens. Mining goes on whatever
+// screen is open, and while the wallet is locked: it needs only the address.
+
+const miner = new Miner({ onChange: () => update() });
+
+function mineOptions() {
+    return {
+        address: app.state.address,
+        midstate: settings.mineMidstate,
+        pool: settings.minePool || DEFAULT_POOL,
+        threads: settings.mineThreads || DEFAULT_THREADS,
+        rest: restOf(settings.mineEffort || DEFAULT_EFFORT),
+        pauseOnBattery: settings.minePauseOnBattery,
+    };
+}
+
+function startMining() {
+    if (app.state && app.state.address) miner.start(mineOptions());
+}
+
+function rateText(r) {
+    if (!(r > 0)) return '0 attempts/s';
+    const n = r >= 10_000 ? (r / 1000).toFixed(1) + 'k' : r >= 100 ? Math.round(r).toLocaleString() : r.toFixed(1);
+    return `${n} attempts/s`;
+}
+
+const POW_NAMES = { walk: 'Midstate Walk', 'blake3-chain': 'BLAKE3 chain' };
+
+/** About `units` in coins, to three significant figures: for estimates. */
+function aboutCoins(units) {
+    const c = units / COIN;
+    if (!(c > 0)) return '0';
+    if (c < 1e-8) return 'under 0.00000001';
+    const digits = Math.min(8, Math.max(0, 2 - Math.floor(Math.log10(c))));
+    return Number(c.toFixed(digits)).toLocaleString(undefined, { maximumFractionDigits: digits });
+}
+
+/** What the pool's midwimble block mints: as the pool says, or else the
+ *  schedule's figure at its height (asked of the wallet worker once). */
+let rewardAsked = 0;
+function blockReward(mw) {
+    if (mw && mw.reward > 0) return mw.reward;
+    const height = (mw && mw.height) || (app.state && app.state.tip) || 0;
+    if (!height) return 0;
+    if (app.reward && app.reward.height === height) return app.reward.units;
+    if (rewardAsked !== height) {
+        rewardAsked = height;
+        ask('block-reward', { height }).then(r => { app.reward = { height, units: r.units }; update(); }, () => {});
+    }
+    return app.reward ? app.reward.units : 0;
+}
+
+/** What the pool keeps of a midwimble block, in percent: its midwimble fee,
+ *  where it has one of its own. */
+function mwFee(t) {
+    const mw = t && t.midwimble;
+    const fee = Number(mw && mw.fee_percent != null ? mw.fee_percent : t && t.midwimble_fee_percent != null ? t.midwimble_fee_percent : t && t.pool_fee_percent);
+    return Math.min(100, Math.max(0, fee || 0));
+}
+
+/** Midwimble a day at the current speed, after the pool's fee, while the
+ *  pool's jobs make midwimble blocks; null when there is nothing to go on. */
+function perDay(m) {
+    const t = m.template;
+    const mw = t && t.midwimble;
+    if (!(m.rate > 0) || !mw || !mw.active || !mw.target) return null;
+    const attempts = expectedAttempts(mw.target);
+    const reward = blockReward(mw);
+    if (!(attempts > 0) || !(reward > 0)) return null;
+    return m.rate * 86400 / attempts * reward * (1 - mwFee(t) / 100);
+}
+
+/** How far off Midstate Walk is on this chain, while it is ahead. */
+function walkAhead() {
+    const C = app.constants || {};
+    const at = C.walk_activation_height;
+    const mw = miner.state.template && miner.state.template.midwimble;
+    const tip = Math.max((app.state && app.state.tip) || 0, (mw && mw.height) || 0);
+    if (!at || !tip || tip >= at) return null;
+    const blocks = at - tip;
+    const secs = blocks * (C.target_block_time || 60);
+    return { at, blocks, days: Math.max(1, Math.round(secs / 86400)), date: new Date(Date.now() + secs * 1000) };
+}
+
+async function shareMining() {
+    const url = `${location.origin}${location.pathname}#/mine`;
+    const text = 'Mine midwimble in your browser: one tap to start, nothing to install.';
+    if (navigator.share) {
+        try { await navigator.share({ title: 'Mine midwimble', text, url }); return; }
+        catch (e) { if (e && e.name === 'AbortError') return; }
+    }
+    copyText(url, 'Mining link');
+}
+
+const poolHost = url => { try { return new URL(url).host; } catch (_) { return url; } };
+
+/** Home's way into mining, saying how it goes. */
+function mineCard() {
+    const sub = h('span', { class: 'sub' });
+    const value = h('span', { class: 'value' });
+    const el = group(h('a', { class: 'row link', href: '#/mine' }, tile('orange', 'pick'),
+        h('span', { class: 'grow' }, 'Mining', sub), value));
+    let last = null;
+    function draw() {
+        const m = miner.state;
+        const key = JSON.stringify([m.on, m.phase, m.note, Math.round(m.rate), m.accepted]);
+        if (key === last) return;
+        last = key;
+        if (!m.on) {
+            sub.textContent = 'Earn midwimble with this device’s spare power';
+            value.textContent = 'Off';
+            return;
+        }
+        value.textContent = { mining: 'On', paused: 'Paused', error: 'Stopped' }[m.phase] || 'Starting';
+        sub.textContent = m.phase === 'mining'
+            ? `${rateText(m.rate)} · ${num(m.accepted)} share${m.accepted === 1 ? '' : 's'}`
+            : m.note || 'Connecting to the pool…';
+    }
+    return { el, draw };
+}
+
+function mineScreen() {
+    const dot = h('span', { class: 'dot' });
+    const status = h('span');
+    const rate = h('span', { class: 'num' });
+    const algo = h('div', { class: 'algo' });
+    const toggle = h('button', { class: 'btn', type: 'button', onclick: () => { if (miner.state.on) miner.stop(); else startMining(); } });
+    const notes = h('div');
+    const stats = h('div');
+    const threadOptions = [...new Set([1, 2, 4, 8, 16, DEFAULT_THREADS, MAX_THREADS])]
+        .filter(n => n <= MAX_THREADS).sort((a, b) => a - b);
+    const battery = h('div', { hidden: !miner.hasBattery() },
+        rowWith('Pause on low battery', switchEl(settings.minePauseOnBattery, v => { set('minePauseOnBattery', v); miner.setPauseOnBattery(v); }, 'Pause on low battery'),
+            'Below 20% and off the charger'));
+    let last = null;
+    let lastOn = null;
+    const C = app.constants || {};
+    return {
+        title: 'Mine',
+        back: ['Wallet', '#/'],
+        els: [
+            h('div', { class: 'mine-hero' },
+                h('div', { class: 'status-line' }, dot, status),
+                h('div', { class: 'rate' }, rate, h('span', { class: 'unit' }, 'attempts/s')),
+                algo,
+                toggle),
+            notes,
+            stats,
+            title('Settings'),
+            group(
+                rowWith('Threads', segmented(threadOptions.map(n => [n, String(n)]), settings.mineThreads || DEFAULT_THREADS,
+                    n => { set('mineThreads', n); miner.setThreads(n); })),
+                rowWith('Effort', segmented(EFFORTS.map(([v, label]) => [v, label]), settings.mineEffort || DEFAULT_EFFORT,
+                    v => { set('mineEffort', v); miner.setRest(restOf(v)); })),
+                battery,
+                linkRow('Pool', '#/mine/pool', { value: poolHost(settings.minePool || DEFAULT_POOL) }),
+                linkRow('Midstate payouts', '#/mine/midstate', { value: settings.mineMidstate ? shortAddr(settings.mineMidstate) : 'Pool keeps them' })),
+            note('Light rests each thread as long as it works, Medium half as long, Full not at all. Phones start on Light and two threads, so they stay cool.'),
+            h('div', { class: 'stack-buttons' }, h('button', { class: 'btn secondary', type: 'button', onclick: shareMining }, icon('share'), 'Invite someone to mine')),
+            title('How it works'),
+            group(textRow('The pool mines midstate and midwimble together, with the same work. Every share this browser finds counts toward the pool’s next midwimble block, and each block the pool finds pays its miners by their shares, straight to this wallet. Payouts show up as Mined in Activity and can be spent after ',
+                C.coinbase_maturity ? `${num(C.coinbase_maturity)} blocks` : 'they mature', '.')),
+        ],
+        update() {
+            const m = miner.state;
+            const t = m.template;
+            const mw = t && t.midwimble;
+            const ahead = walkAhead();
+            const pd = perDay(m);
+            const mined = app.state ? app.state.history.filter(e => e.kind === 'mined') : [];
+            const key = JSON.stringify([m.on, m.phase, m.note, Math.round(m.rate * 10), m.threads, m.accepted, m.rejected, m.stale,
+                m.blocks, m.score, m.midstateScore, Math.floor((Date.now() - m.lastShare) / 30_000), t && t.job_id, mw, ahead && ahead.blocks,
+                pd && pd.toPrecision(3), mined.length, settings.fullDecimals, miner.hasBattery()]);
+            if (key === last) return;
+            last = key;
+            battery.hidden = !miner.hasBattery();
+
+            const on = m.on;
+            dot.className = 'dot ' + (!on ? '' : m.phase === 'mining' ? 'ok' : m.phase === 'error' ? 'bad' : 'busy');
+            status.textContent = !on ? 'Not mining'
+                : { starting: 'Connecting to the pool…', mining: 'Mining', waiting: 'Waiting for the pool', paused: 'Paused', error: 'Stopped' }[m.phase] || 'Mining';
+            rate.textContent = on && m.rate > 0 ? rateText(m.rate).replace(/ attempts\/s$/, '') : '—';
+            const threads = `${m.threads} thread${m.threads === 1 ? '' : 's'}`;
+            algo.textContent = on && t ? `${POW_NAMES[t.pow] || t.pow || 'BLAKE3 chain'} · ${threads}` : on ? threads : 'Uses this device’s spare power. Stop any time.';
+            // Redrawn only when it changes, so a press is never lost to an update.
+            if (on !== lastOn) {
+                lastOn = on;
+                toggle.className = 'btn ' + (on ? 'secondary' : 'primary');
+                fill(toggle, on ? 'Stop mining' : [icon('pick'), 'Start mining']);
+            }
+
+            const ns = [];
+            if (on && m.note) ns.push(note(m.note));
+            if (on && mw && !mw.active) {
+                ns.push(note('Merged mining is paused', mw.note ? `: ${capital(mw.note)}` : '. ',
+                    ' Your shares still count: the pool’s next midwimble block pays them.'));
+            }
+            if (ahead) {
+                const when = ahead.date.toLocaleDateString([], { day: 'numeric', month: 'short' });
+                ns.push(h('div', { class: 'walk-ahead' }, h('b', null, `Midstate Walk starts at block ${num(ahead.at)}`),
+                    `, ${num(ahead.blocks)} blocks from now (about ${ahead.days} day${ahead.days === 1 ? '' : 's'}, around ${when}). `,
+                    'It is the new proof of work, and a browser runs it almost as fast as a native miner, so a browser’s share of the pool grows sharply then. ',
+                    'Until it starts you can mine, but a browser earns very little next to today’s GPU miners. Merged mining pauses for a few hours around the switch.'));
+            }
+            fill(notes, ns);
+            if (on && m.note && m.phase === 'error') notes.firstChild.classList.add('bad');
+
+            const rows = [];
+            if (on) {
+                const parts = [];
+                if (m.lastShare) parts.push(`last one ${ago((Date.now() - m.lastShare) / 1000)}`);
+                if (m.stale) parts.push(`${num(m.stale)} too late`);
+                if (m.rejected) parts.push(`${num(m.rejected)} refused`);
+                rows.push(infoRow('Shares', num(m.accepted), { sub: parts.length ? capital(parts.join(', ')).replace(/\.$/, '') : 'Sent to the pool as they are found' }));
+                if (m.blocks) rows.push(infoRow('Blocks found', num(m.blocks), { sub: 'Shares that were a whole block too' }));
+            }
+            if (on && mw) {
+                const score = m.score || 0;
+                const share = mw.total_score > 0 ? score / mw.total_score : 0;
+                rows.push(infoRow('Pool score', mw.total_score ? `${num(score)} of ${num(mw.total_score)}` : num(score),
+                    { sub: `Your part of the pool’s next midwimble block: ${(share * 100).toFixed(share >= 0.01 ? 1 : 3)}%` }));
+            }
+            if (on) {
+                rows.push(infoRow('Estimate', pd != null ? `≈ ${aboutCoins(pd)}${unit() ? ' ' + unit() : ''} a day` : '—',
+                    { sub: pd != null ? `At this speed, after the pool’s ${mwFee(t)}% fee` : mw && !mw.active ? 'Back once merged mining resumes' : 'Once the pool has sent a job' }));
+            }
+            if (on && m.midstate) {
+                rows.push(infoRow('Midstate part', m.midstateScore != null ? `${num(m.midstateScore)} shares` : '—', { sub: `Paid to ${shortAddr(m.midstate)} from the pool’s midstate blocks` }));
+            }
+            if (mined.length) {
+                const total = mined.reduce((sum, e) => sum + e.value, 0);
+                rows.push(linkRow('Earned', '#/activity', { value: withUnit(total), sub: `${num(mined.length)} payout${mined.length === 1 ? '' : 's'} from mining` }));
+            }
+            fill(stats, rows.length ? [title(on ? 'This session' : 'Mining so far'), group(...rows)] : null);
+        },
+    };
+}
+
+function minePoolScreen() {
+    const input = h('input', { type: 'url', inputmode: 'url', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false',
+        placeholder: DEFAULT_POOL, 'aria-label': 'Pool address', value: settings.minePool || DEFAULT_POOL });
+    const err = note();
+    err.classList.add('bad');
+    const save = (value) => {
+        const base = poolBase(value) || DEFAULT_POOL;
+        const plainOk = location.protocol === 'http:' && /^http:\/\/\S+$/i.test(base);
+        if (!/^https:\/\/\S+$/i.test(base) && !plainOk) {
+            err.textContent = 'Use the pool’s https:// address: this page can’t reach a pool over plain http.';
+            return;
+        }
+        set('minePool', base === DEFAULT_POOL ? '' : base);
+        if (miner.state.on) startMining();
+        location.hash = '#/mine';
+    };
+    input.addEventListener('input', () => { err.textContent = ''; });
+    const form = h('form', { onsubmit: (e) => { e.preventDefault(); save(input.value); } },
+        group(h('label', { class: 'row stacked' }, h('span', { class: 'label' }, 'Pool address'), input)),
+        note('A pool that merge-mines midwimble, by its web address. The default is ', h('span', { class: 'mono' }, DEFAULT_POOL), '.'),
+        err,
+        h('div', { class: 'stack-buttons' },
+            h('button', { class: 'btn primary', type: 'submit' }, 'Save'),
+            h('button', { class: 'btn secondary', type: 'button', onclick: () => save(DEFAULT_POOL) }, 'Use the default pool')));
+    return { title: 'Pool', back: ['Mine', '#/mine'], els: [form], focus: () => input.focus() };
+}
+
+function mineMidstateScreen() {
+    const input = textArea({ rows: 2, placeholder: 'Optional', 'aria-label': 'Midstate address' }, settings.mineMidstate);
+    const err = note();
+    err.classList.add('bad');
+    const save = (value) => {
+        const a = value.trim().toLowerCase();
+        if (a && !/^[0-9a-f]{64}([0-9a-f]{8})?$/.test(a)) {
+            err.textContent = 'That isn’t a midstate address. One is 64 or 72 hexadecimal characters.';
+            return;
+        }
+        set('mineMidstate', a);
+        if (miner.state.on) startMining();
+        location.hash = '#/mine';
+    };
+    input.addEventListener('input', () => { err.textContent = ''; });
+    const form = h('form', { onsubmit: (e) => { e.preventDefault(); save(input.value); } },
+        group(h('label', { class: 'row stacked' }, h('span', { class: 'label' }, 'Midstate address'), input)),
+        note('Every share is midstate work too, and the pool pays that part in midstate. Give it a midstate address to be paid it; without one, the pool keeps it.'),
+        note('It must be a reusable (MSS) address, such as the one midstate’s web wallet mines to, or one from ', h('span', { class: 'mono' }, 'midstate wallet generate-mss'), '. Payouts to a one-time address are lost.'),
+        err,
+        h('div', { class: 'stack-buttons' },
+            h('button', { class: 'btn primary', type: 'submit' }, 'Save'),
+            settings.mineMidstate ? h('button', { class: 'btn secondary', type: 'button', onclick: () => save('') }, 'Let the pool keep it') : null));
+    return { title: 'Midstate payouts', back: ['Mine', '#/mine'], els: [form], focus: () => input.focus() };
+}
+
+/** "Mine in your browser" before there is a wallet: the 24 words, a
+ *  password, and one button that makes the wallet and starts mining. */
+function mineStartScreen() {
+    if (!app.flow || app.flow.kind !== 'mine') app.flow = { kind: 'mine', phrase: null, wrote: false };
+    const f = app.flow;
+    if (!f.phrase) {
+        ask('new-phrase').then(r => { if (app.flow === f) { f.phrase = r.phrase; render(false); } }, e => ok('Can’t start', errOf(e)));
+        return { title: 'Mine in your browser', left: cancelButton(), els: [h('div', { class: 'empty-note' }, spinner())] };
+    }
+    const words = f.phrase.split(' ');
+    const pw = h('input', { type: 'password', autocomplete: 'new-password', placeholder: 'At least 8 characters', 'aria-label': 'Password' });
+    const err = note();
+    err.classList.add('bad');
+    const go = h('button', { class: 'btn primary', type: 'submit', disabled: true }, icon('pick'), 'Start mining');
+    const ready = () => { go.disabled = !(f.wrote && pw.value.length >= 8); };
+    pw.addEventListener('input', () => { err.textContent = ''; ready(); });
+    const form = h('form', { onsubmit: async (e) => {
+        e.preventDefault();
+        if (pw.value.length < 8) { err.textContent = 'Use a password of at least 8 characters.'; return; }
+        go.disabled = true;
+        fill(go, spinner(), 'Making your wallet…');
+        app.mineOnOpen = true;
+        app.after = '#/mine';
+        try {
+            await ask('create', { phrase: f.phrase, password: pw.value });
+        } catch (x) {
+            app.mineOnOpen = false;
+            app.after = null;
+            err.textContent = errOf(x);
+            fill(go, icon('pick'), 'Start mining');
+            ready();
+        }
+    } },
+    note('Mining earns midwimble with this device’s spare power, through a pool that mines midstate and midwimble together. First, a wallet for what you earn. These 24 words are that wallet: write them on paper, in order, and keep it safe. Anyone who has them can spend what it holds.'),
+    h('div', { class: 'paper' }, words.map((w, i) => h('span', null, h('i', null, i + 1), w))),
+    group(rowWith('I wrote them down', switchEl(!!f.wrote, (v) => { f.wrote = v; ready(); }, 'I wrote them down')),
+        h('label', { class: 'row field' }, h('span', { class: 'label' }, 'Password'), pw)),
+    note('The password unlocks the wallet in this browser. If you forget it, the 24 words still work.'),
+    err,
+    h('div', { class: 'stack-buttons' }, go),
+    keygenBox(),
+    h('div', { class: 'quiet-links' }, h('a', { class: 'quiet', href: '#/create' }, 'Make a wallet without mining')));
+    return { title: 'Mine in your browser', left: cancelButton(), els: [form] };
+}
+
 // ── settings ────────────────────────────────────────────────────────────────
 
-const AUTOLOCK = [[0, 'Never'], [1, '1 minute'], [5, '5 minutes'], [15, '15 minutes'], [60, '1 hour'], [240, '4 hours']];
+const AUTOLOCK =[[0, 'Never'], [1, '1 minute'], [5, '5 minutes'], [15, '15 minutes'], [60, '1 hour'], [240, '4 hours']];
 const autoLockLabel = () => (AUTOLOCK.find(([v]) => v === settings.autoLock) || [0, `${settings.autoLock} minutes`])[1];
 function feeLabel() {
     if (settings.feeLevel === 0) return 'Custom';
@@ -1709,6 +2105,7 @@ function settingsScreen() {
         els: [install, group(
             linkRow('Backup', '#/settings/backup', { tile: tile('green', 'backup') }),
             linkRow('Security', '#/settings/security', { tile: tile('gray', 'lock'), value: autoLockLabel() })),
+        group(linkRow('Mining', '#/mine', { tile: tile('orange', 'pick'), value: miner.state.on ? 'On' : 'Off' })),
         group(
             h('a', { class: 'row link', href: '#/settings/network' }, tile('blue', 'globe'), h('span', { class: 'grow' }, 'Network'), h('span', { class: 'value' }, netValue)),
             linkRow('Privacy', '#/settings/privacy', { tile: tile('purple', 'eye'), value: settings.wholeBlocks ? 'Every block' : 'Standard' }),
@@ -2163,6 +2560,7 @@ function holdTab(steal) {
         // Another tab took the wallet over.
         worker.terminate();
         if (lc) lc.stop();
+        miner.stop();
         app.phase = 'elsewhere';
         app.state = null;
         started = true;

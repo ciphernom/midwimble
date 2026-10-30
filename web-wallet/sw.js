@@ -12,10 +12,10 @@
 // refetches every file (new WebAssembly included, with `cache: 'reload'` so
 // the browser's HTTP cache is bypassed), drops the old cache and tells the
 // page a new version is live.
-const VERSION = '6';
+const VERSION = '7';
 const CACHE = 'midwimble-wallet-' + VERSION;
 const FILES = [
-    './', 'index.html', 'app.js', 'worker.js', 'keygen.js', 'qr.js', 'qr_scan.js', 'wallet.css', 'logo.svg',
+    './', 'index.html', 'app.js', 'worker.js', 'keygen.js', 'mining.js', 'miner.js', 'qr.js', 'qr_scan.js', 'wallet.css', 'logo.svg',
     'config.json', 'light_client.bundle.js', 'qr_reader.bundle.js', 'manifest.webmanifest',
     'pkg/midwimble_web_wallet.js', 'pkg/midwimble_web_wallet_bg.wasm',
     'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-512.png', 'icons/apple-touch-icon.png',

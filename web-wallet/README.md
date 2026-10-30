@@ -49,6 +49,8 @@ HTTPS gateway, no certificate authority.
   not spendable until a block confirms it; one that leaves the mempool
   unconfirmed disappears again. Its own payments, change included, are not
   income.
+- **Mines in the browser** through a pool that merge-mines midwimble with
+  midstate (below), paid straight to the wallet's address.
 - Keys never leave the page's wallet worker. The nodes learn which coins are
   the wallet's only from the payments sent through them, and from which
   blocks it fetches whole (above).
@@ -69,6 +71,43 @@ Settings, kept in this browser:
 | Privacy | downloading every block whole; how many decoy blocks come with each one fetched (0 to 8) and from how many around it; spreading block requests over the nodes |
 | Sending | the fee: the relay minimum, twice it, five times it, or a rate of your own; choosing the coins each payment spends |
 | Advanced | block numbers, hashes and commitments, and all eight decimal places; scan data per request and blocks fetched ahead; watching the mempool and how often, and how often payments are sent again; the coins; the view key; rescanning; diagnostics, to copy as JSON; resetting every setting |
+
+### Mining
+
+Mine (`#/mine`) mines midwimble with the device's spare power. Midwimble is
+merge-mined: a pool mining midstate commits each job to a midwimble block
+too, and a share that beats midwimble's target is that block. Each block the
+pool finds pays its miners by the shares each sent since the last
+(midstate's `pools.md`, "Merge-Mine Midwimble"). So the wallet mines the
+pool's jobs (midstate shares) for its own midwimble address, over HTTPS
+(`/api/template`, `/api/submit`), by default at
+`https://rpc.cypherpunk.gold/pool`. Payouts arrive as Mined in Activity.
+
+- **One tap.** The welcome card, and any link to `#/mine`, offers "Mine
+  midwimble in your browser": the 24 words, a password and one button that
+  makes the wallet and starts mining. With a wallet already here, `#/mine`
+  opens Mine once it is unlocked.
+- **The work.** `miner.js` threads search nonces in the wallet's WebAssembly
+  (`search_nonces_pow`): the BLAKE3 chain four at a time with SIMD (about 23
+  attempts a second a thread), and Midstate Walk from its activation (about
+  270). They follow the proof of work each job names, so they switch when the
+  pool does. Before then, a countdown to block 86,400 says what changes.
+- **The numbers.** Attempts a second; shares sent, late and refused; the
+  wallet's score at the pool out of the total, which is its part of the
+  pool's next midwimble block; and an estimate a day at this speed, after the
+  pool's fee, from the midwimble target and reward the pool's job carries.
+  When merged mining is paused (between midwimble's switch to Walk and
+  midstate's, or when the pool's midwimble node is down), the page says why;
+  shares still count.
+- **Settings.** Threads (phones start on two), effort (Light rests each
+  thread as long as it works, Medium half as long, Full not at all; phones
+  start on Light), pausing below 20% battery off the charger (resuming once
+  charging or above 30%), the pool, and a midstate address for the midstate
+  part of each share, which the pool keeps when none is given. It must be a
+  reusable (MSS) address.
+- It keeps going while the wallet is locked (it needs only the address), and
+  stops when the wallet is forgotten or another tab takes it over. "Invite
+  someone to mine" shares the `#/mine` link.
 
 On a wide screen the sections are listed down the side, and the balance
 and its buttons, or the QR code and the address, sit side by side. Its
@@ -136,6 +175,8 @@ cargo test        # real fast-mining chains, and wallet files to and from the CL
 | `src/lib.rs` | its JavaScript bindings |
 | `worker.js` | runs the wallet off the page's thread; storage (IndexedDB), syncing, sending |
 | `keygen.js` | helper workers that build the recovery key in parallel |
+| `mining.js` | browser mining: the pool client, the mining threads, the battery |
+| `miner.js` | one mining thread, searching nonces in the wallet's WebAssembly |
 | `app.js`, `index.html`, `wallet.css` | the page |
 | `light_client.js` | the WebRTC light client and its pool of nodes (bundled into `light_client.bundle.js`) |
 | `qr.js` | a QR encoder, so the page loads nothing from anywhere else |

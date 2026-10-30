@@ -954,6 +954,28 @@ export function block_id(block_hex) {
 }
 
 /**
+ * What block `height` mints under the schedule, in base units, before any
+ * bond's cap or fees: the miner's estimate when a pool doesn't say.
+ * @param {number} height
+ * @returns {number}
+ */
+export function block_reward(height) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        wasm.block_reward(retptr, height);
+        var r0 = getDataViewMemory0().getFloat64(retptr + 8 * 0, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        if (r3) {
+            throw takeObject(r2);
+        }
+        return r0;
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
  * Chain constants the page needs, as JSON.
  * @returns {string}
  */
@@ -1207,6 +1229,43 @@ export function parse_amount(coins) {
 }
 
 /**
+ * The proof-of-work hash (hex) of `nonce` over `midstate_hex` under `pow`,
+ * to check this build against known answers.
+ * @param {string} pow
+ * @param {string} midstate_hex
+ * @param {bigint} nonce
+ * @returns {string}
+ */
+export function pow_hash(pow, midstate_hex, nonce) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(pow, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(midstate_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.pow_hash(retptr, ptr0, len0, ptr1, len1, nonce);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr3 = r0;
+        var len3 = r1;
+        if (r3) {
+            ptr3 = 0; len3 = 0;
+            throw takeObject(r2);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred4_0, deferred4_1, 1);
+    }
+}
+
+/**
  * Leaves `start..start + count` of the recovery key's tree, 32 bytes each.
  * @param {Uint8Array} master_seed
  * @param {number} start
@@ -1289,6 +1348,42 @@ export function recovery_root(leaves) {
     } finally {
         wasm.__wbindgen_add_to_stack_pointer(16);
         wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * Searches `4 × iterations` nonces from `start_nonce` for the first whose
+ * proof-of-work hash under `pow` ("blake3-chain" or "walk") over
+ * `midstate_hex` is below `target_hex`; `undefined` if none is. A
+ * BLAKE3-chain attempt is a million hashes, run four at a time with
+ * WebAssembly SIMD; a Midstate Walk attempt takes a few milliseconds.
+ * @param {string} pow
+ * @param {string} midstate_hex
+ * @param {string} target_hex
+ * @param {bigint} start_nonce
+ * @param {number} iterations
+ * @returns {bigint | undefined}
+ */
+export function search_nonces_pow(pow, midstate_hex, target_hex, start_nonce, iterations) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-32);
+        const ptr0 = passStringToWasm0(pow, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(midstate_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(target_hex, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+        const len2 = WASM_VECTOR_LEN;
+        wasm.search_nonces_pow(retptr, ptr0, len0, ptr1, len1, ptr2, len2, start_nonce, iterations);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r2 = getDataViewMemory0().getBigInt64(retptr + 8 * 1, true);
+        var r4 = getDataViewMemory0().getInt32(retptr + 4 * 4, true);
+        var r5 = getDataViewMemory0().getInt32(retptr + 4 * 5, true);
+        if (r5) {
+            throw takeObject(r4);
+        }
+        return r0 === 0 ? undefined : BigInt.asUintN(64, r2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(32);
     }
 }
 

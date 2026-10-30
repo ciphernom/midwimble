@@ -82,6 +82,8 @@ async fn a_pool_mines_midwimble_with_its_midstate_search() {
             .expect("/merge/job");
         let commitment = hex32(&job["commitment"]);
         let target = hex32(&job["target"]);
+        // What the block mints, which pools pass on to browser miners.
+        assert!(job["reward"].as_u64().is_some_and(|r| r > 0), "{job}");
         // The proof of work the merged block must carry, which the midstate
         // parent's must match.
         let algo = PowAlgo::from_name(job["pow"].as_str().expect("the job names its proof of work"))

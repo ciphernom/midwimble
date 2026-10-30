@@ -837,6 +837,12 @@ const handlers = {
         return {};
     },
 
+    /** What block `height` mints under the schedule, for the miner's
+     *  estimate when the pool doesn't say. */
+    'block-reward'({ height }) {
+        return { units: typeof mw.block_reward === 'function' ? mw.block_reward(Math.max(0, Math.floor(Number(height) || 0))) : 0 };
+    },
+
     'cancel-keygen'() {
         dropKeygen();
     },

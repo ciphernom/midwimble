@@ -54,13 +54,16 @@ Two endpoints on the midwimble node, and no new process:
 ```json
 { "payouts": [ { "address": "mw1…", "weight": 41 }, … ] }
 → { "commitment": "<32 bytes hex>", "target": "<32 bytes hex>",
-    "mining_hash": "<32 bytes hex>", "height": 1234 }
+    "mining_hash": "<32 bytes hex>", "height": 1234,
+    "reward": 23932616, "pow": "blake3-chain" }
 ```
 
 The node builds a midwimble template paying those addresses in those
 proportions, signs it with the bond that has the most quota left, caches it,
 and returns the commitment to plant plus the target a share must beat to be a
-midwimble block.
+midwimble block. `reward` is what that block mints, subsidy plus fees, in base
+units; midstate's pool passes it on to browser miners, which estimate their
+earnings with it. `pow` is the proof of work the block takes.
 
 **`POST /merge/found`** — the pool found one.
 

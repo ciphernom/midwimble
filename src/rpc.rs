@@ -821,6 +821,9 @@ async fn merge_job(
         "target": hex::encode(template.batch.target),
         "mining_hash": hex::encode(template.mining_hash),
         "height": template.height,
+        // What the block mints, subsidy plus fees: pools pass it on to
+        // browser miners, which estimate their earnings with it.
+        "reward": template.subsidy.saturating_add(template.fees),
         // The proof of work the merged block must carry: a pool merges only
         // a job whose midstate block takes the same one.
         "pow": crate::core::types::pow_algo_at(template.height).name(),
