@@ -164,6 +164,11 @@ jobs:
 
           { [ "$pre" = 1 ] && echo "Release candidate **${TAG}** of midwimble." || echo "Release **${TAG}** of midwimble."
             echo
+            # What changed, when the release commit has docs/releases/<tag>.md.
+            if [ -f "docs/releases/${TAG}.md" ]; then
+              cat "docs/releases/${TAG}.md"
+              echo
+            fi
             echo "Built \`--release --features webrtc,gpu\` from commit \`${GITHUB_SHA}\`. Each archive holds one \`midwimble\` binary — node, wallet, pool, merged miner and anchoring — with LICENSE and README."
             echo
             echo "| Download | Platform |"

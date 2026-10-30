@@ -440,7 +440,7 @@
             <tr><th scope="row">Premine</th><td><!-- CONFIRM: OK to state "no premine, no sale" outright? Verified: all issuance is block rewards (types.rs emission). -->None. Every coin is a block reward.</td></tr>
             <tr><th scope="row">Block time</th><td>60 seconds (target)</td></tr>
             <tr><th scope="row">Difficulty</th><td>ASERT, 4-hour half-life, anchored to genesis</td></tr>
-            <tr><th scope="row">Proof of work</th><td>Sequential BLAKE3, 1,000,000 iterations (same as Midstate)</td></tr>
+            <tr><th scope="row">Proof of work</th><td>Sequential BLAKE3, 1,000,000 iterations, until block 86,400; Midstate Walk from then on (as on Midstate, which switches at its block 420,000)</td></tr>
             <tr><th scope="row">Merge-mining</th><td>With Midstate. Proofs about 220 bytes; no Midstate changes.</td></tr>
             <tr><th scope="row">Mining requirement</th><td>A bond locked on Midstate: 128 gMDS (2<sup>37</sup> units) with 30 days of lock left, from 31 Oct 2026</td></tr>
             <tr><th scope="row">Block reward</th><td>Ramps up over the first 30 days, then 0.23932616 per block</td></tr>

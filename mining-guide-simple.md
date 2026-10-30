@@ -4,6 +4,8 @@ midwimble is a privacy chain. it's merge-mined with midstate and anchored to it.
 
 this guide is about how to mine it, and nothing else. it isn't advice on whether you should.
 
+**heads up: from block 86,400 (around mid-december 2026) the proof of work is midstate walk.** it runs on cpu cores, and a raspberry pi 5 is the smallest machine that mines it well. gpus stop helping: `--backend gpu` mines it on the cpu. run release v1.2-DIMEBAG or later before then. midstate makes the same switch a few hours later, at its block 420,000, and merged mining pauses in between.
+
 ---
 
 ## which one are you?
