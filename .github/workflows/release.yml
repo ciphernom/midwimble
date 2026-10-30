@@ -61,9 +61,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Ubuntu 24.04, not ubuntu-latest: a binary needs at least the
+          # glibc it was built against, and ubuntu-latest moved to 26.04
+          # (glibc 2.43), whose binaries stop on Debian 13 and Ubuntu 24.04
+          # with "version `GLIBC_2.43' not found". v1.2-DIMEBAG's x86-64 one
+          # did. "Check the glibc it needs" below keeps it at 2.39.
           - label: Linux x86-64
             target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - label: Linux ARM64 (Raspberry Pi 3/4/5, 64-bit)
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
@@ -98,6 +103,22 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked --features webrtc,gpu --bin midwimble --target ${{ matrix.target }}
+
+      # A binary built against a newer glibc than a machine has stops at once
+      # there. This fails the build instead, if a runner image ever brings a
+      # newer one again.
+      - name: Check the glibc it needs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          MAX=2.39
+          bin="target/${{ matrix.target }}/release/midwimble"
+          need=$( { readelf -W --dyn-syms "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' || true; } | sed 's/GLIBC_//' | sort -uV | tail -n 1)
+          echo "$bin needs glibc ${need:-(none)}"
+          if [ -n "$need" ] && [ "$(printf '%s\n%s\n' "$need" "$MAX" | sort -V | tail -n 1)" != "$MAX" ]; then
+            echo "::error::$bin needs glibc $need, newer than $MAX: it won't start on Debian 13, Ubuntu 24.04 or Raspberry Pi OS"
+            exit 1
+          fi
 
       # Hand the raw binary to the release job, which packages every platform
       # the same way on one runner. Artifact downloads do not keep the Unix

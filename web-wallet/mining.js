@@ -268,11 +268,11 @@ export class Miner {
             if (fresh || first) await this.fit();
         } catch (e) {
             if (e instanceof Refused) {
-                // A pool from before midstate v6.0.0 wants a midstate address
+                // A pool from before midstate v6.0.1 wants a midstate address
                 // from every miner, and says so as an invalid one.
                 const old = !s.midstate && /^Invalid address/i.test(errOf(e));
                 this.fail(old
-                    ? 'This pool doesn’t take miners paid only in midwimble yet (it needs midstate v6.0.0). Give it a midstate address under Midstate payouts, or try again later.'
+                    ? 'This pool doesn’t take miners paid only in midwimble yet (it needs midstate v6.0.1). Give it a midstate address under Midstate payouts, or try again later.'
                     : errOf(e));
             } else if (s.on) {
                 // The pool or the network is down: keep on the last job, which
