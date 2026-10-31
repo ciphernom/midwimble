@@ -40,7 +40,7 @@ use super::anchor::HeaderLink;
 use super::auxpow::midstate_coin_id;
 use super::mmr::{verify_utxo_proof, UtxoAccumulator, UtxoProof};
 use super::mw::crypto::{schnorr_sign, schnorr_verify, SchnorrSig};
-use super::relay::{MidstateHeaders, Relay};
+use super::relay::{window_left, MidstateHeaders, Relay};
 use super::state::calculate_work;
 use super::types::{
     compute_header_hash, fold_unsigned, hash, hash_concat, hash_domain, Batch, BatchHeader,
@@ -609,6 +609,81 @@ impl BondRegistration {
             proven_height: height,
             proven_hash: header.hash,
         })
+    }
+
+    /// Whether this registration has gone stale on `relay`: its header has
+    /// left the window (or is the root, which nothing is proven against), or
+    /// a heavier midstate branch has put another header at its height. More
+    /// relaying cannot help then; the bond needs a fresh proof, and since its
+    /// coin cannot be spent before its lock height, a fresh proof against a
+    /// newer header registers it just as well. A header the relay has not
+    /// reached yet is not stale. Tooling only: consensus asks
+    /// [`BondRegistration::verify`].
+    pub fn proof_is_stale(&self, relay: &Relay) -> bool {
+        let height = self.proof.midstate_height;
+        if height > relay.tip().height {
+            return false;
+        }
+        match relay.get(height) {
+            Some(e) if !e.is_root() => self.proof.verify(&e.state_root).is_err(),
+            _ => true,
+        }
+    }
+}
+
+// ── A proof's shelf life (tooling, not consensus) ──────────────────────────
+
+/// About how many midstate headers above a proof's header bury it for a
+/// registration in a block at `midwimble_target`, if each carries
+/// `header_work`: never fewer than [`REGISTRATION_MIN_HEADERS`].
+///
+/// That is `1440 × share` headers, `share` being midwimble's work per block
+/// over midstate's: an hour while midwimble's difficulty is under 1/24 of
+/// midstate's, a day at parity, and the whole relay window
+/// ([`RELAY_WINDOW`](super::relay::RELAY_WINDOW)) at twice midstate's, past
+/// which no proof can register at all. A proof can register from its burial
+/// until its header leaves the window: for the window less this many headers.
+pub fn burial_headers(midwimble_target: &[u8; 32], header_work: u128) -> u64 {
+    let per = header_work.min(registration_cap(midwimble_target)).max(1);
+    u64::try_from(registration_work(midwimble_target).div_ceil(per)).unwrap_or(u64::MAX)
+}
+
+/// Headers of the relay window a held proof must have left for `midwimble
+/// bond register` to keep it rather than take a fresh one: an hour.
+///
+/// "Less left than a fresh proof's burial" looks like the natural rule and is
+/// wrong: from parity on, a proof can register for a day or less after its
+/// day of burial, so that rule would discard every proof as soon as it was
+/// buried, and the take-the-proof-then-collect-its-burial runs would never
+/// finish. A proof with more than an hour left is still a live chance, and
+/// `--fresh-proof` trades it for a fresh one on request.
+pub const PROOF_REFRESH_MARGIN: u64 = 60;
+
+/// Where a proof held in a bond file stands, with midstate's chain at `tip`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeldProof {
+    /// Its header stays in the relay's window for `left` more headers.
+    Live { left: u64 },
+    /// Its header leaves the window within [`PROOF_REFRESH_MARGIN`] headers:
+    /// too soon to count on.
+    Expiring { left: u64 },
+    /// Its header has left the window: no block can carry it any more.
+    Expired,
+}
+
+impl HeldProof {
+    /// Judges a proof taken at midstate height `proof_height`.
+    pub fn at(proof_height: u64, tip: u64) -> Self {
+        match window_left(proof_height, tip) {
+            None => Self::Expired,
+            Some(left) if left < PROOF_REFRESH_MARGIN => Self::Expiring { left },
+            Some(left) => Self::Live { left },
+        }
+    }
+
+    /// Whether to take a fresh proof instead of keeping this one.
+    pub fn needs_refresh(self) -> bool {
+        !matches!(self, Self::Live { .. })
     }
 }
 
@@ -2747,6 +2822,103 @@ mod tests {
             let mut forged = reg.clone();
             forged.proof.coin.value *= 2;
             assert!(forged.verify(&relay, &MW_TARGET).is_err());
+        }
+
+        /// A proof goes stale only when relaying more cannot help it: its
+        /// header is not the relay's at its height, has left the window, or
+        /// is the root. Buried or not, a header the relay holds is live, and
+        /// so is one the relay has yet to reach.
+        #[test]
+        fn a_proof_is_stale_only_once_its_header_is_gone() {
+            let (relay, reg, _) = relayed(5);
+            assert!(!reg.proof_is_stale(&relay), "relayed, not yet buried");
+            let (relay, reg, _) = relayed(60);
+            assert!(!reg.proof_is_stale(&relay), "relayed and buried");
+            let mut ahead = reg.clone();
+            ahead.proof.midstate_height = relay.tip().height + 1;
+            assert!(!ahead.proof_is_stale(&relay), "not reached yet");
+            // Another header at its height, as a heavier branch leaves it.
+            let mut replaced = reg.clone();
+            replaced.proof.roots.chain_mmr = [7; 32];
+            assert!(replaced.proof_is_stale(&relay));
+            let mut below = reg.clone();
+            below.proof.midstate_height = relay.base().height - 1;
+            assert!(below.proof_is_stale(&relay), "below the window");
+            let mut at_root = reg;
+            at_root.proof.midstate_height = relay.base().height;
+            assert!(at_root.proof_is_stale(&relay));
+        }
+    }
+}
+
+#[cfg(test)]
+mod shelf_life_tests {
+    use super::*;
+    use crate::core::relay::RELAY_WINDOW;
+    use crate::core::types::GENESIS_TARGET;
+
+    /// The burial is a day of midwimble's work counted in midstate headers:
+    /// an hour while midstate's headers are much heavier than midwimble's
+    /// blocks, `1440 × share` headers above that, a day at parity, and the
+    /// whole window at twice midstate's difficulty, where nothing registers.
+    #[test]
+    fn the_burial_is_a_day_of_midwimbles_work_in_midstate_headers() {
+        let t = GENESIS_TARGET;
+        let w = calculate_work(&t);
+        assert_eq!(burial_headers(&t, w * 100), REGISTRATION_MIN_HEADERS as u64);
+        assert_eq!(burial_headers(&t, w * 24), REGISTRATION_MIN_HEADERS as u64);
+        assert_eq!(burial_headers(&t, w * 4), 360, "a quarter share: six hours");
+        assert_eq!(burial_headers(&t, w), 1440, "parity: a day");
+        assert!(burial_headers(&t, w / 2) >= RELAY_WINDOW, "never, at twice");
+        assert_eq!(
+            burial_headers(&t, 0) as u128,
+            registration_work(&t),
+            "no work never divides by zero"
+        );
+    }
+
+    #[test]
+    fn a_held_proof_is_kept_until_an_hour_before_its_header_leaves() {
+        let h = 400_000;
+        let live = |left| HeldProof::Live { left };
+        assert_eq!(HeldProof::at(h, h), live(RELAY_WINDOW));
+        assert_eq!(HeldProof::at(h, h - 5), live(RELAY_WINDOW + 5));
+        let last_hour = h + RELAY_WINDOW - PROOF_REFRESH_MARGIN;
+        assert_eq!(HeldProof::at(h, last_hour), live(PROOF_REFRESH_MARGIN));
+        assert_eq!(
+            HeldProof::at(h, last_hour + 1),
+            HeldProof::Expiring {
+                left: PROOF_REFRESH_MARGIN - 1
+            }
+        );
+        // The window's lowest entry can still register; one past it cannot.
+        assert_eq!(
+            HeldProof::at(h, h + RELAY_WINDOW),
+            HeldProof::Expiring { left: 0 }
+        );
+        assert_eq!(HeldProof::at(h, h + RELAY_WINDOW + 1), HeldProof::Expired);
+        assert_eq!(HeldProof::at(h, u64::MAX), HeldProof::Expired);
+        assert!(!HeldProof::at(h, h + 100).needs_refresh());
+        assert!(HeldProof::at(h, last_hour + 1).needs_refresh());
+        assert!(HeldProof::at(h, h + RELAY_WINDOW + 1).needs_refresh());
+    }
+
+    /// `bond register` runs once to take a proof and again once it is buried
+    /// with a quarter to spare. The second run must keep the proof, or the
+    /// two runs would chase each other for ever, and it does from a tiny
+    /// share to past parity.
+    #[test]
+    fn a_proof_just_buried_is_kept() {
+        let t = GENESIS_TARGET;
+        let w = calculate_work(&t);
+        let h = 400_000;
+        for header_work in [w * 100, w * 4, w * 2, w, w * 4 / 5] {
+            let burial = burial_headers(&t, header_work);
+            let second_run = h + burial + burial / 4;
+            assert!(
+                !HeldProof::at(h, second_run).needs_refresh(),
+                "a burial of {burial} headers"
+            );
         }
     }
 }

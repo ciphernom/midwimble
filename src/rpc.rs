@@ -281,6 +281,11 @@ async fn relay(AxState(node): AxState<NodeHandle>) -> Json<Value> {
         "entries": state.relay.len(),
         "registration_work": crate::core::bond::registration_work(&state.target).to_string(),
         "registration_cap": crate::core::bond::registration_cap(&state.target).to_string(),
+        // About how many relayed headers bury a proof now, judged by the
+        // tip's work; a proof can register for `relay_window` less this.
+        "burial_headers": (!tip.is_root())
+            .then(|| crate::core::bond::burial_headers(&state.target, tip.work)),
+        "relay_window": crate::core::relay::RELAY_WINDOW,
         "feed_tip_height": feed.tip_height(),
         "would_relay": feed.next_for(&state.relay).map_or(0, |r| r.headers.len()),
     }))

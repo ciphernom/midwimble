@@ -913,6 +913,60 @@ fn unregistered_and_short_locked_bonds_cannot_mine() {
     assert!(err.to_string().contains("not eligible"), "{err}");
 }
 
+/// A producer whose own registration cannot go in its block, while another
+/// bond can sign, is told which fix applies: a proof whose header the relay
+/// no longer holds needs taking afresh (`midwimble bond register` does that),
+/// one the relay has yet to bury needs relaying, and one the chain's rules
+/// refuse is reported as such, not as a relay problem.
+#[test]
+fn a_producer_is_told_why_its_registration_waits() {
+    let mut chain = TestChain::new();
+    let payout = TestWallet::new().address();
+    let mut bonds = bonded_miners(
+        &chain,
+        &[
+            (b"lasting", locked_long()),
+            (b"stale", locked_long()),
+            (b"early", locked_long()),
+            (b"far", locked_long()),
+        ],
+    );
+    let lasting = bonds.remove(0);
+    chain
+        .apply(chain.make_bonded_block(&lasting, &payout).unwrap())
+        .unwrap();
+    let relay = chain.state.relay.clone();
+
+    // Another header at the proof's height, as a heavier midstate branch
+    // leaves it.
+    let mut stale = bonds.remove(0);
+    stale.registration.as_mut().unwrap().proof.roots.chain_mmr = [7; 32];
+    assert!(stale.registration.as_ref().unwrap().proof_is_stale(&relay));
+    let err = chain.make_bonded_block(&stale, &payout).unwrap_err();
+    let err = err.to_string();
+    assert!(err.contains("can no longer verify"), "{err}");
+    assert!(err.contains("re-run `midwimble bond register`"), "{err}");
+
+    // A header the relay has not reached yet: relaying, not a fresh proof.
+    let mut early = bonds.remove(0);
+    early.registration.as_mut().unwrap().proof.midstate_height = relay.tip().height + 10;
+    early.midstate = None;
+    assert!(!early.registration.as_ref().unwrap().proof_is_stale(&relay));
+    let err = chain.make_bonded_block(&early, &payout).unwrap_err();
+    assert!(err.to_string().contains("does not verify yet"), "{err}");
+
+    // Locked past the registration horizon: a rule, not the relay.
+    let mut far = bonds.remove(0);
+    let r = far.registration.as_mut().unwrap();
+    r.proof.coin.script.bonded_until =
+        est_midstate_height(now()) + super::bond::MAX_BOND_HORIZON + 10_000;
+    far.bond_id = r.bond_id();
+    let err = chain.make_bonded_block(&far, &payout).unwrap_err();
+    let err = err.to_string();
+    assert!(err.contains("cannot be registered now"), "{err}");
+    assert!(!err.contains("relay"), "{err}");
+}
+
 #[test]
 fn the_signature_binds_the_whole_block() {
     let mut chain = TestChain::new();

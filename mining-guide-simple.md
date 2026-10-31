@@ -135,6 +135,8 @@ it builds, checks you're on the real chain, then walks you through locking and r
    ```
    the first run takes a proof. then wait: a day of midwimble's work has to be buried above it (the docs say an hour or more of midstate blocks). run the same command again. when it prints `Ready:`, you're done.
 
+   the bond lands on chain in the first block your node mines, but a proof only works for about two days (less at high difficulty; the command prints how long). if your node finds no block in that time, its log says the registration "can no longer verify". nothing is lost, the coin is still locked: run the same command again (it takes a fresh proof by itself), wait for the burial, and restart the node.
+
 6. **mine.**
    ```
    midwimble node --mining-bond bond.json --mine-to <your midwimble address> \

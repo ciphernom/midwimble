@@ -13,7 +13,7 @@ use super::bond::{
 use super::extension::create_extension_at;
 use super::mw::{build_coinbase_with, PayoutReceipt, StealthAddress, Transaction};
 use super::relay::{
-    MidstateHeaders, RelayFeed, RelayHeaders, RELAY_MAX_FUTURE, RELAY_WEIGHT_PER_HEADER,
+    MidstateHeaders, Relay, RelayFeed, RelayHeaders, RELAY_MAX_FUTURE, RELAY_WEIGHT_PER_HEADER,
 };
 use super::state::{apply_body, current_timestamp, min_next_timestamp, validate_block_contents};
 use super::types::*;
@@ -107,6 +107,36 @@ pub fn rebind(
 
 /// Block weight kept free for a registration when choosing what to relay.
 const REGISTRATION_ROOM: u64 = 256;
+
+/// What a producer hears when its own bond's registration fails against
+/// `relay` with `e`: a proof gone stale needs taking afresh (and `e`, which
+/// may say to relay the header, is beside the point), while one the relay has
+/// not yet buried needs headers relayed above it.
+fn registration_not_ready(
+    registration: &BondRegistration,
+    relay: &Relay,
+    e: anyhow::Error,
+) -> anyhow::Error {
+    if registration.proof_is_stale(relay) {
+        anyhow!(
+            "the mining bond's registration can no longer verify: its proof is against midstate \
+             height {}, and the relay (midstate heights {}..={}) no longer holds that header. The \
+             bond coin is still locked, so a fresh proof registers it: re-run `midwimble bond \
+             register`, which takes a new proof when the old one has gone stale, then restart the \
+             node with the updated bond file",
+            registration.proof.midstate_height,
+            relay.base().height,
+            relay.tip().height
+        )
+    } else {
+        anyhow!(
+            "the mining bond's registration does not verify yet ({e:#}): the relay must hold its \
+             midstate header under a day of midwimble's work. Run the node with --midstate-rpc, \
+             or re-run `midwimble bond register` so the bond file carries the headers, then \
+             restart the node"
+        )
+    }
+}
 
 /// The midstate headers a block on `state` timestamped `timestamp` should
 /// relay, in at most `room` headers: what the producer's feed, or else its
@@ -393,27 +423,23 @@ pub fn build_template_relayed(
             // bond that cannot sign now never can again.
             Some(registration) if !registration.eligible_at(timestamp) => retired = true,
             Some(registration) => {
+                let relay = &state_after_relay.relay;
                 let ready = crate::core::bond::precheck_registrations(
                     &state_after_relay.bonds,
                     std::slice::from_ref(registration),
                     &state.target,
                     timestamp,
                 )
+                .map_err(|e| anyhow!("the mining bond cannot be registered now: {e:#}"))
                 .and_then(|()| {
                     registration
-                        .verify(&state_after_relay.relay, &state.target)
+                        .verify(relay, &state.target)
                         .map(|_| ())
+                        .map_err(|e| registration_not_ready(registration, relay, e))
                 });
                 match ready {
                     Ok(()) => registrations.push(registration.clone()),
-                    Err(e) => {
-                        not_ready = Some(anyhow!(
-                            "the mining bond's registration does not verify yet ({e:#}): the \
-                             relay must hold its midstate header under a day of work. Run the \
-                             node with --midstate-rpc, or re-run `midwimble bond register` so the \
-                             bond file carries the headers"
-                        ))
-                    }
+                    Err(e) => not_ready = Some(e),
                 }
             }
             None => {

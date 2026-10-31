@@ -484,7 +484,9 @@ enum BondCmd {
     /// Register a funded bond. The first run takes a proof against midstate's
     /// tip; run it again once a day of midstate work is buried above it. The
     /// bond file then carries the proof and the midstate headers the chain's
-    /// relay needs to check it.
+    /// relay needs to check it. A proof can register only while its header
+    /// is in the relay's two-day window: once it has left (or is within an
+    /// hour of leaving), running this again takes a fresh one.
     Register {
         #[arg(long)]
         file: PathBuf,
@@ -506,12 +508,17 @@ enum BondCmd {
         /// genesis's midstate anchor are used.
         #[arg(long)]
         midwimble_rpc: Option<String>,
+        /// Take a fresh proof even though the bond file holds one that can
+        /// still register.
+        #[arg(long)]
+        fresh_proof: bool,
     },
 }
 
 fn bond_command(cmd: BondCmd) -> Result<()> {
     use midwimble::core::auxpow::bytes32;
     use midwimble::core::bond::*;
+    use midwimble::core::relay::{window_left, RELAY_WINDOW};
     use midwimble::core::state::calculate_work;
     use midwimble::core::types::GENESIS_TARGET;
     let read =
@@ -604,6 +611,7 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
             salt,
             midstate_rpc,
             midwimble_rpc,
+            fresh_proof,
         } => {
             let mut f = read(&file)?;
             let coin = BondCoin {
@@ -636,17 +644,77 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
                 out!("{warning}");
             }
             let midstate = RpcClient::new(midstate_rpc);
+            let anchor = midwimble::core::types::MIDSTATE_BLOCK_HEIGHT;
 
-            // 1. The proof, taken once, against midstate's tip.
-            let proof = match &f.proof {
-                Some(p) if p.coin == coin => {
-                    out!(
-                        "✓ proof already taken at midstate height {}",
-                        p.midstate_height
-                    );
-                    p.clone()
+            // Where the chain is: its target, and how far its midstate relay
+            // has got. Before launch, the genesis target and the genesis's
+            // midstate anchor.
+            let (target, relay_tip) = match &midwimble_rpc {
+                Some(addr) => {
+                    let mw = RpcClient::new(addr.clone());
+                    let target = bytes32(&mw.get("/state")?["target"])?;
+                    let tip = mw.get("/relay")?["tip_height"]
+                        .as_u64()
+                        .ok_or_else(|| anyhow!("the midwimble node has no relay: upgrade it"))?;
+                    (target, tip)
                 }
-                _ => {
+                None => (GENESIS_TARGET, anchor),
+            };
+            // The relay follows midstate's chain, so a proof's place in the
+            // relay's window is judged at midstate's tip: the relay is there,
+            // or will be once a block relays it. Midstate's `/state` height
+            // counts blocks, so its tip is one below.
+            let midstate_tip = midstate.height()?.saturating_sub(1);
+            let tip = midstate_tip.max(relay_tip);
+
+            // 1. The proof, against midstate's tip. One already taken is kept
+            //    while it can still register; once it cannot, a fresh one is
+            //    taken. The coin cannot be spent before its lock height, so a
+            //    proof against a newer header proves it just as well.
+            let held = f.proof.clone().filter(|p| p.coin == coin);
+            // Why the held proof cannot be kept, if it cannot.
+            let stale = match &held {
+                None => None,
+                Some(_) if fresh_proof => Some("--fresh-proof asks for a new one".to_string()),
+                Some(p) if p.midstate_height <= anchor => Some(format!(
+                    "it is not above the chain's midstate anchor ({anchor})"
+                )),
+                Some(p) => match HeldProof::at(p.midstate_height, tip) {
+                    HeldProof::Expired => Some(format!(
+                        "its header has left the relay's window (midstate is at {tip})"
+                    )),
+                    HeldProof::Expiring { left } => Some(format!(
+                        "its header leaves the relay's window within {left} midstate blocks"
+                    )),
+                    // Midstate may have reorganised under it since.
+                    HeldProof::Live { .. } if p.midstate_height <= midstate_tip => {
+                        match midstate_header(&midstate, p.midstate_height)? {
+                            Some(h) if p.verify(&h.state_root).is_err() => {
+                                Some("midstate's header at that height has changed".to_string())
+                            }
+                            _ => None,
+                        }
+                    }
+                    HeldProof::Live { .. } => None,
+                },
+            };
+            let proof = match (held, stale) {
+                (Some(p), None) => {
+                    out!(
+                        "✓ proof already taken at midstate height {}: it can register for about \
+                         {} more hours",
+                        p.midstate_height,
+                        window_left(p.midstate_height, tip).unwrap_or(0) / 60
+                    );
+                    p
+                }
+                (held, stale) => {
+                    if let (Some(p), Some(why)) = (held, stale) {
+                        out!(
+                            "the proof taken at midstate height {}: {why}. Taking a fresh one",
+                            p.midstate_height
+                        );
+                    }
                     let v =
                         midstate.get(&format!("/utxo_proof/{}", hex::encode(coin.coin_id())))?;
                     let p = bond_proof_from_json(coin, &v)?;
@@ -673,20 +741,7 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
             //    relay is past it) through a day of work above the proof, plus
             //    a margin. Before launch the relay starts at the genesis's
             //    midstate anchor.
-            let (target, relay_tip) = match &midwimble_rpc {
-                Some(addr) => {
-                    let mw = RpcClient::new(addr.clone());
-                    let target = bytes32(&mw.get("/state")?["target"])?;
-                    let tip = mw.get("/relay")?["tip_height"]
-                        .as_u64()
-                        .ok_or_else(|| anyhow!("the midwimble node has no relay: upgrade it"))?;
-                    (target, tip)
-                }
-                None => (
-                    GENESIS_TARGET,
-                    midwimble::core::types::MIDSTATE_BLOCK_HEIGHT,
-                ),
-            };
+            //
             // The chain prices a new bond off its own difficulty from
             // `BOND_RETARGET_FROM` (`core::bond::registration_min_bond`), so
             // what the offline check above asked may be short of what this
@@ -702,13 +757,11 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
                     bond_units(asked)
                 );
             }
-            if proof.midstate_height <= midwimble::core::types::MIDSTATE_BLOCK_HEIGHT {
+            if proof.midstate_height <= anchor {
                 anyhow::bail!(
-                    "the proof (midstate height {}) is not above the chain's midstate anchor ({}): \
-                     delete the proof from {} and run this again",
-                    proof.midstate_height,
-                    midwimble::core::types::MIDSTATE_BLOCK_HEIGHT,
-                    file.display()
+                    "the proof (midstate height {}) is not above the chain's midstate anchor \
+                     ({anchor}): midstate's node is behind it. Let it sync, then run this again",
+                    proof.midstate_height
                 );
             }
             let start = (relay_tip + 1).min(proof.midstate_height);
@@ -770,24 +823,53 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
                 "✓ the proof rebuilds its header's state root: bond {}",
                 hex::encode(registration.bond_id())
             );
+            // A proof can register from its burial until its header leaves
+            // the relay's window.
+            let height = registration.proof.midstate_height;
+            let burial = burial_headers(
+                &target,
+                calculate_work(&run.headers[(height - run.start) as usize].target),
+            );
+            if burial >= RELAY_WINDOW {
+                out!(
+                    "warning: at this chain's difficulty a proof needs about {burial} midstate blocks \
+                     of burial, and the relay keeps only {RELAY_WINDOW}: no bond can register until \
+                     midwimble's difficulty is below twice midstate's"
+                );
+            }
+            let until = format!(
+                "The bond registers in the first block mined with this file before the relay \
+                 passes midstate height {} (about {} hours from now). If none is by then, run \
+                 this again for a fresh proof. Restart the node to pick up the file.",
+                height + RELAY_WINDOW,
+                window_left(height, tip).unwrap_or(0) / 60
+            );
             let full = run.headers.len() >= max;
             f.registration = Some(registration);
             f.midstate_headers = Some(run);
             write(&file, &f)?;
             if credited < goal {
                 if credited < required {
-                    if full {
+                    if full && burial < max as u64 {
                         out!(
                             "One block relays at most {max} midstate headers, and the chain's relay is \
                              further behind this proof than that. Start a node with --midstate-rpc so \
                              the relay catches up, then run this again with --midwimble-rpc."
                         );
+                    } else if full {
+                        out!(
+                            "At this chain's difficulty the burial is more midstate headers than one \
+                             block relays ({max}): run the node with --midstate-rpc, and the bond \
+                             registers once the relay holds them."
+                        );
                     } else {
                         out!(
-                            "Not buried deep enough yet: run this again later (within a day of the proof), \
-                             or let a node relaying midstate (--midstate-rpc) bury it, then mine."
+                            "Not buried deep enough yet (about {burial} midstate blocks above the proof \
+                             are needed): run this again later, or let a node relaying midstate \
+                             (--midstate-rpc) bury it, then mine."
                         );
                     }
+                    out!("{until}");
                     return Ok(());
                 }
                 out!("Buried, but with less than the 25% margin: if midwimble's difficulty rises, run this again.");
@@ -796,9 +878,23 @@ fn bond_command(cmd: BondCmd) -> Result<()> {
                 "Ready: midwimble node --mining-bond {} --mine-to <address>",
                 file.display()
             );
+            out!("{until}");
         }
     }
     Ok(())
+}
+
+/// Midstate's header at `height`, or `None` if its node is not that far yet.
+fn midstate_header(
+    midstate: &RpcClient,
+    height: u64,
+) -> Result<Option<midwimble::core::anchor::HeaderLink>> {
+    let v = midstate.get(&format!("/headers/{height}/1"))?;
+    v["headers"]
+        .as_array()
+        .and_then(|headers| headers.first())
+        .map(|h| midwimble::core::bond::header_link_from_json(h).map(|(link, _)| link))
+        .transpose()
 }
 
 /// A bond size for people: whole gMDS (2^30 units) where it is that.

@@ -67,6 +67,13 @@ pub const RELAY_WINDOW: u64 = 2 * 24 * 60;
 /// differ, while a fake branch cannot claim time that has not passed.
 pub const RELAY_MAX_FUTURE: u64 = 2 * MAX_FUTURE_BLOCK_TIME;
 
+/// How many more headers can be relayed above a relay tip at `tip` before the
+/// header at `height` leaves the window; `None` once it has. Tooling asks this
+/// of midstate's own tip, where the relay is or soon will be.
+pub fn window_left(height: u64, tip: u64) -> Option<u64> {
+    height.saturating_add(RELAY_WINDOW).checked_sub(tip)
+}
+
 /// Midstate's genesis target and time, which its difficulty rule (the same
 /// ASERT as midwimble's, anchored at midstate's genesis) is computed from.
 #[cfg(not(feature = "fast-mining"))]
@@ -937,6 +944,32 @@ mod tests {
             relay.clone().extend(&from_old, LATER).is_err(),
             "the root is out of the window"
         );
+    }
+
+    /// `window_left` says what the relay does: a header is kept exactly while
+    /// it has headers left, and leaves with the next one relayed after zero.
+    #[test]
+    fn window_left_is_what_the_relay_keeps() {
+        let mut relay = Relay::genesis();
+        let first = RelayEntry::root().height + 1;
+        let last = first + RELAY_WINDOW + 3;
+        while relay.tip().height < last {
+            let n = MAX_RELAY_HEADERS_PER_BLOCK.min((last - relay.tip().height) as usize);
+            let r = run(relay.tip(), n, 7);
+            relay.extend(&r, LATER).unwrap();
+            let tip = relay.tip().height;
+            for h in first..=tip {
+                assert_eq!(
+                    window_left(h, tip).is_some(),
+                    relay.get(h).is_some(),
+                    "height {h} with the tip at {tip}"
+                );
+            }
+        }
+        let (base, tip) = (relay.base().height, relay.tip().height);
+        assert_eq!(window_left(base, tip), Some(0));
+        assert_eq!(window_left(base - 1, tip), None);
+        assert_eq!(window_left(tip, tip), Some(RELAY_WINDOW));
     }
 
     #[test]

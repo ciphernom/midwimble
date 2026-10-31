@@ -93,6 +93,22 @@ A block may carry the registration for its own miner's bond, which is how the
 first block after launch gets mined. The same block relays the midstate
 headers the registration needs.
 
+Consensus does not ask who carries a registration: any block may carry any
+one that verifies, one a block. Carrying only the producer's own bond and its
+co-bonds is template policy. A bond only ever signs its own producer's blocks,
+and the first of them can carry its registration, so registering any earlier
+would spare the producer only the chore of keeping its proof fresh (below).
+
+**A proof's shelf life.** A proof can register only from its burial until its
+header leaves the relay's window: `RELAY_WINDOW` (2,880 headers) less the
+burial, about 47 hours while midwimble's difficulty is a small share of
+midstate's and a day at parity (see "How much work a registration needs"). A
+small producer may find no block in that time. Its bond is not lost: the coin
+stays locked on midstate, so a proof against a newer header registers it just
+as well. `midwimble bond register` takes a fresh proof whenever the bond file's
+has left the window or is within an hour of leaving it (`--fresh-proof` forces
+one), and the node's error says when that is what a registration needs.
+
 ### The midstate relay
 
 Proof of work on a bond's header is not enough on its own: anyone can mine a
@@ -342,6 +358,14 @@ of midstate's whole network. An honest burial is correspondingly about
 relay holds anyway. To demand a full midstate day instead, scale
 `REGISTRATION_WORK_BLOCKS` by `1 / share`.
 
+The burial comes out of the same 2,880-header window the proof's header must
+stay in, so a proof can register for `2880 − burial` headers
+(`bond::burial_headers`): 2,820 (47 hours) while the 60-header floor binds,
+2,520 at a 25% share, 1,440 (a day) at parity. Once midwimble's difficulty is
+twice midstate's the burial is the whole window and no bond can register; the
+bond retarget's second step (`MAX_BOND_DOUBLINGS`) is priced for a midwimble
+busier than that. `midwimble bond register` warns when it gets there.
+
 ## Privacy
 
 Every block becomes attributable to a persistent bonded identity with visible
@@ -412,12 +436,18 @@ midwimble bond register --file bond.json --owner-pk <key> --until <height> \
 #   node; before launch, the genesis's anchor) through the burial, verifies
 #   every link and proof of work, and writes the registration and the
 #   headers into bond.json
+#   any run: keeps the proof while its header can still register, and takes a
+#   fresh one once it has left the relay's window, is within an hour of
+#   leaving, or midstate has reorganised under it (--fresh-proof forces one).
+#   It prints how long the proof can register for. Restart the node to pick
+#   up a rewritten bond.json.
 
 midwimble node --mining-bond bond.json --mine-to <payout address> \
     --midstate-rpc 127.0.0.1:8545
 #   --midstate-rpc: relay midstate's headers in the blocks this node mines.
 #   Every producer should: registrations, its own included, need them.
-#   `GET /relay` on the node's RPC shows the relay and what it would relay.
+#   `GET /relay` on the node's RPC shows the relay and what it would relay,
+#   and how many headers a proof's burial takes now (`burial_headers`).
 
 # Once midstate reaches the lock height, spend the bond back to yourself:
 midstate wallet spend-script --coin <bond coin id> --bytecode <script from `bond address`> \
