@@ -110,6 +110,7 @@ pub fn router_with(node: NodeHandle, options: &RpcOptions, index: SharedIndex) -
         .route("/explorer/network", get(crate::explorer::network))
         .route("/explorer/bonds", get(crate::explorer::bonds))
         .route("/explorer/bond/{id}", get(crate::explorer::bond))
+        .route("/explorer/burn", get(crate::explorer::burn::burn))
         .route("/explorer/search/{q}", get(crate::explorer::search))
         .layer(axum::Extension(index))
         .layer(axum::middleware::from_fn_with_state(
@@ -143,6 +144,7 @@ pub fn explorer_router(node: NodeHandle, index: SharedIndex) -> Router {
         .route("/explorer/network", get(crate::explorer::network))
         .route("/explorer/bonds", get(crate::explorer::bonds))
         .route("/explorer/bond/{id}", get(crate::explorer::bond))
+        .route("/explorer/burn", get(crate::explorer::burn::burn))
         .route("/explorer/search/{q}", get(crate::explorer::search))
         .layer(axum::Extension(index))
         .with_state(node)

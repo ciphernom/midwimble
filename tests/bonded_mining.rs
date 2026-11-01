@@ -515,3 +515,239 @@ async fn sync_follows_the_heavier_chain_not_the_one_with_more_work() {
     assert_eq!(on_b.tip(), heavy_tip);
     assert_eq!(on_b.handle.info().sync_stats.sessions, 0);
 }
+
+/// The burn tracker adds up, end to end. Once a second bond is registered,
+/// one bond signs every block, so it runs past its cap (half the window) and
+/// its blocks mint `cap / n` of their subsidy. Every figure the explorer's
+/// own listener publishes -- the banner's total, the leaderboard in each
+/// period, the per-day and per-1,000-block series, the bond page -- equals a
+/// manual sum of the withheld values `/explorer/blocks` lists block by block,
+/// and that sum equals the schedule less the supply `/state` reports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_burn_tracker_adds_up_to_the_coinbases() {
+    use midwimble::core::bond::EARLY_BONDS_UNTIL;
+    use midwimble::core::types::{block_reward, issued_before, MAX_SUPPLY};
+    use serde_json::Value;
+    use std::collections::HashMap;
+    assert!(
+        current_timestamp() >= EARLY_BONDS_UNTIL,
+        "the taper applies from the mainnet switch"
+    );
+
+    let secrets =
+        [b"burner".as_slice(), b"bystander"].map(|s| Scalar::from_bytes_mod_order(hash(s)));
+    let until = est_midstate_height(current_timestamp()) + MIN_REMAINING_BOND_LOCK + 10_000;
+    let specs: Vec<([u8; 32], u64, [u8; 32])> = secrets
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            (
+                RistrettoPoint::mul_base(s).compress().to_bytes(),
+                until,
+                hash(&[i as u8, 0xb5]),
+            )
+        })
+        .collect();
+    let (registrations, headers) = devnet_registrations(&specs, &GENESIS_TARGET);
+    let bonds: Vec<MinerBond> = registrations
+        .into_iter()
+        .zip(secrets)
+        .map(|(registration, secret)| MinerBond {
+            secret,
+            bond_id: registration.bond_id(),
+            registration: Some(registration),
+            midstate: Some(headers.clone()),
+            co_bonds: vec![],
+        })
+        .collect();
+    let (burner, bystander) = (bonds[0].clone(), bonds[1].clone());
+
+    // The bystander's producer registers its bond, then stops mining.
+    let quiet = start(Some(bystander.clone()), vec![]).await;
+    wait_until("the bystander's bond to register", 60, || {
+        quiet.handle.state().bonds.contains_key(&bystander.bond_id)
+    })
+    .await;
+    quiet.handle.set_mining(None);
+    // The burner's producer then signs every block. Two eligible bonds share
+    // the 16-block test window at 8 each, and it goes past that.
+    let busy = start(Some(burner.clone()), vec![quiet.dial_addr().await]).await;
+    let tapered = |n: &TestNode| {
+        let storage = n.handle.storage();
+        (1..n.height())
+            .filter(|&h| {
+                storage
+                    .subsidy_at(h)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|m| m < block_reward(h))
+            })
+            .count()
+    };
+    wait_until("a run of over-cap blocks", 120, || tapered(&busy) >= 12).await;
+    busy.handle.set_mining(None);
+    let mut last = busy.height();
+    loop {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        if busy.height() == last {
+            break;
+        }
+        last = busy.height();
+    }
+
+    // Everything as a reader of the published explorer would see it.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(midwimble::rpc::serve_explorer_on(
+        busy.handle.clone(),
+        listener,
+        Default::default(),
+    ));
+    let id = hex::encode(burner.bond_id);
+    let path = format!("/explorer/bond/{id}");
+    let (state, blocks, burn, bond) = tokio::task::spawn_blocking(move || {
+        let client = midwimble::rpc::RpcClient::new(addr);
+        let state = client.get("/state").unwrap();
+        let tip = state["height"].as_u64().unwrap();
+        let mut blocks: Vec<Value> = Vec::new();
+        let mut before = tip;
+        while before > 0 {
+            let page = client
+                .get(&format!("/explorer/blocks?count=200&before={before}"))
+                .unwrap();
+            let listed = page["blocks"].as_array().unwrap().clone();
+            before = listed.last().unwrap()["height"].as_u64().unwrap();
+            blocks.extend(listed);
+        }
+        (
+            state,
+            blocks,
+            client.get("/explorer/burn").unwrap(),
+            client.get(&path).unwrap(),
+        )
+    })
+    .await
+    .unwrap();
+
+    // The manual sum: every block stamped from the switch, as each
+    // coinbase's withheld figure lists it.
+    let n = |v: &Value| v.as_u64().unwrap();
+    let mut counted: Vec<&Value> = blocks
+        .iter()
+        .filter(|b| n(&b["timestamp"]) >= EARLY_BONDS_UNTIL)
+        .collect();
+    counted.sort_by_key(|b| n(&b["height"]));
+    #[derive(Default, Debug, PartialEq)]
+    struct Sum {
+        blocks: u64,
+        tapered: u64,
+        scheduled: u64,
+        minted: u64,
+        withheld: u64,
+    }
+    let add = |s: &mut Sum, b: &Value| {
+        let withheld = n(&b["withheld"]);
+        s.blocks += 1;
+        s.tapered += u64::from(withheld > 0);
+        s.scheduled += n(&b["reward"]);
+        s.minted += n(&b["minted"]);
+        s.withheld += withheld;
+    };
+    let mut total = Sum::default();
+    let mut by_bond: HashMap<String, Sum> = HashMap::new();
+    let (mut streak, mut longest) = (0u64, 0u64);
+    for b in &counted {
+        assert_eq!(n(&b["minted"]) + n(&b["withheld"]), n(&b["reward"]));
+        add(&mut total, b);
+        if let Some(miner) = b["miner"].as_str() {
+            add(by_bond.entry(miner.to_string()).or_default(), b);
+            if miner == id {
+                streak = if n(&b["withheld"]) > 0 { streak + 1 } else { 0 };
+                longest = longest.max(streak);
+            }
+        } else {
+            assert_eq!(n(&b["withheld"]), 0, "an unsigned block is never tapered");
+        }
+    }
+    let height = n(&state["height"]);
+    let supply = n(&state["supply"]);
+    assert!(total.tapered >= 12, "{total:?}");
+    assert_eq!(
+        total.withheld,
+        issued_before(height) - supply,
+        "the coinbases' withheld figures are what the supply is short of the schedule"
+    );
+
+    // The banner, the network totals and the check.
+    assert_eq!(burn["complete"], true);
+    assert_eq!(burn["burned_source"], "blocks");
+    assert_eq!(n(&burn["burned"]), total.withheld);
+    assert_eq!(n(&burn["consensus"]["withheld"]), total.withheld);
+    assert_eq!(burn["consensus"]["matches"], true);
+    assert_eq!(
+        n(&burn["effective_max_supply"]),
+        MAX_SUPPLY - total.withheld
+    );
+    assert_eq!(n(&burn["supply"]), supply);
+    let tally = |t: &Value| Sum {
+        blocks: n(&t["blocks"]),
+        tapered: n(&t["tapered"]),
+        scheduled: n(&t["scheduled"]),
+        minted: n(&t["minted"]),
+        withheld: n(&t["withheld"]),
+    };
+    // The test chain is minutes old, so the day and the week are all of it.
+    for period in ["all", "week", "day"] {
+        let p = &burn["periods"][period];
+        assert_eq!(tally(p), total, "{period}");
+        assert_eq!(n(&p["bonds_withheld"]), total.withheld, "{period}");
+        assert_eq!(n(&p["unknown"]), 0);
+    }
+
+    // The leaderboard: each bond's row is its manual sum, the rows add up to
+    // the network total, and the burner is ranked first with its streak.
+    let rows = burn["bonds"].as_array().unwrap();
+    for period in ["all", "week", "day"] {
+        let sum: u64 = rows.iter().map(|b| n(&b[period]["withheld"])).sum();
+        assert_eq!(sum, total.withheld, "{period}");
+    }
+    for b in rows {
+        let key = b["bond_id"].as_str().unwrap();
+        let expected = by_bond.remove(key).unwrap_or_default();
+        assert_eq!(tally(&b["all"]), expected, "bond {key}");
+    }
+    assert!(by_bond.is_empty(), "every signer is on the leaderboard");
+    let top = &rows[0];
+    assert_eq!(top["bond_id"], id.as_str());
+    assert_eq!(top["all"]["rank"], 1);
+    assert_eq!(top["day"]["rank"], 1);
+    assert_eq!(n(&top["streak"]), streak);
+    assert_eq!(n(&top["longest_streak"]), longest);
+
+    // The series add up to the same total.
+    for series in ["days", "kblocks"] {
+        let buckets = burn["series"][series].as_array().unwrap();
+        let sum: u64 = buckets.iter().map(|b| n(&b["withheld"])).sum();
+        let blocks: u64 = buckets.iter().map(|b| n(&b["blocks"])).sum();
+        assert_eq!((sum, blocks), (total.withheld, total.blocks), "{series}");
+    }
+
+    // The bond page carries the same row.
+    let page = &bond["burn"];
+    assert_eq!(page["bond"], *top);
+    assert_eq!(page["periods"], burn["periods"]);
+
+    eprintln!(
+        "burn check: {} blocks from height {} to {}, {} over cap; withheld {} = schedule {} - supply {}; burner {} withheld {} (rank 1, streak {})",
+        total.blocks,
+        n(&counted[0]["height"]),
+        n(&counted[counted.len() - 1]["height"]),
+        total.tapered,
+        total.withheld,
+        issued_before(height),
+        supply,
+        &id[..12],
+        n(&top["all"]["withheld"]),
+        streak
+    );
+}

@@ -29,7 +29,7 @@
   .brand:hover { text-decoration: none; }
   .brand img { width: 30px; height: 30px; border-radius: 50%; }
   .brand b { font: 600 14px var(--sans); letter-spacing: .18em; text-transform: uppercase; }
-  nav { display: flex; gap: 14px; font-size: 12px; letter-spacing: .08em; }
+  nav { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; letter-spacing: .08em; }
   form { flex: 1; display: flex; min-width: 240px; }
   form input {
     flex: 1; background: var(--panel); color: var(--text); border: 1px solid var(--line);
@@ -130,6 +130,34 @@
   .flow { display: flex; align-items: stretch; gap: 0; flex-wrap: wrap; padding: 18px 20px; }
   .flow .step { flex: 1; min-width: 200px; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; background: var(--panel2); }
   .flow .arrow { align-self: center; padding: 0 12px; color: var(--muted); font-size: 18px; }
+  /* burn tracker */
+  .banner { padding: 18px 20px 14px; font: 600 19px/1.5 var(--sans); letter-spacing: .01em; border-bottom: 1px solid var(--line); }
+  .banner b { color: var(--amber); font-weight: 700; }
+  .banner .sub { display: block; margin-top: 4px; font: 500 12px/1.6 var(--mono); color: var(--muted); }
+  .banner .why { display: inline-block; margin-top: 6px; font: 500 12px/1.6 var(--mono); }
+  .toggle { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+  .toggle button { background: transparent; color: var(--muted); border: 1px solid var(--line); border-radius: 999px;
+    padding: 2px 11px; font: 600 11px var(--mono); letter-spacing: .06em; cursor: pointer; }
+  .toggle button:hover { color: var(--text); }
+  .toggle button.on { color: var(--text); border-color: var(--lilac); background: rgba(167, 139, 250, .12); }
+  .flame { display: inline-block; vertical-align: middle; width: 120px; height: 6px; border-radius: 999px; overflow: hidden; background: rgba(245, 196, 81, .1); }
+  .flame span { display: block; height: 100%; background: linear-gradient(90deg, #f5c451, #ff8a3d, #ff4d4d); }
+  .tag.fire { color: #ffb36b; border-color: rgba(255, 138, 61, .5); background: rgba(255, 120, 40, .08); margin: 0 0 0 8px; }
+  .rank { font-weight: 700; color: var(--lilac); }
+  .hot { color: var(--amber); }
+  .tagline { color: var(--muted); font-size: 11px; }
+  th.sort { cursor: pointer; user-select: none; }
+  th.sort:hover { color: var(--text); }
+  .chart.tall svg { height: 170px; }
+  .cell .sub { color: var(--muted); font-size: 12px; line-height: 1.5; margin-top: 2px; }
+  @media (max-width: 640px) {
+    .lb th, .lb td { padding-left: 10px; padding-right: 10px; }
+    .tag.fire .word { display: none; }
+    .flame { width: 64px; }
+  }
+  .explain { padding: 4px 20px 8px; }
+  .explain p { margin: 10px 0; max-width: 880px; white-space: normal; }
+  .explain b { color: var(--lilac); font-weight: 600; }
   footer { padding: 18px 20px 34px; color: var(--muted); font-size: 11px; text-align: center; letter-spacing: .05em; }
   @media (max-width: 640px) { dl { grid-template-columns: 1fr; } dt { border-bottom: 0; padding-bottom: 0; } }
 </style>
@@ -138,7 +166,7 @@
 <header>
   <div class="bar-top">
     <a class="brand" href="#/"><img src="/logo.svg" alt=""><b>Midwimble</b></a>
-    <nav><a href="#/">overview</a><a href="#/blocks">blocks</a><a href="#/bonds">bonds</a><a href="#/mempool">mempool</a><a href="#/privacy">privacy</a><a href="#/network">network</a></nav>
+    <nav><a href="#/">overview</a><a href="#/blocks">blocks</a><a href="#/bonds">bonds</a><a href="#/burn">burn</a><a href="#/mempool">mempool</a><a href="#/privacy">privacy</a><a href="#/network">network</a></nav>
     <form id="search" autocomplete="off">
       <input id="q" placeholder="height, block hash, output commitment, kernel or bond id" spellcheck="false">
       <button>find</button>
@@ -149,7 +177,7 @@
 <main id="view"><div class="empty">loading…</div></main>
 <footer>
   Served by this node from its own copy of the chain. JSON: <a href="/state">/state</a>,
-  /explorer/{blocks, block/…, output/…, kernel/…, bonds, bond/…, search/…}.
+  /explorer/{blocks, block/…, output/…, kernel/…, bonds, bond/…, burn, search/…}.
 </footer>
 <script>
 "use strict";
@@ -979,6 +1007,7 @@ async function bondPage(m) {
       cell("window", num(b.window.filled) + " of " + num(b.window.size) + " blocks", true),
       cell("blocks signed", num(b.blocks_signed)),
       cell("last signed", b.last_signed != null ? link("block", b.last_signed, num(b.last_signed)) : "—", true))),
+    ...[bondBurn(b.burn)].filter(Boolean),
     section("Bond", null, dl([
       ["bond id (midstate coin)", full(b.bond_id)],
       ["mining key", b.mining_key ? full(b.mining_key) : "—"],
@@ -1110,6 +1139,291 @@ async function networkPage() {
   schedule(networkPage, 15000);
 }
 
+// ---------- burn tracker ---------------------------------------------------
+// What the over-cap taper kept from being minted since the mainnet switch.
+// Every number comes from /explorer/burn, which sums the same withheld figure
+// each coinbase shows (the block's scheduled subsidy less what consensus let
+// it mint) and checks the total against the chain's own supply accounting.
+// Nothing here re-derives the taper.
+const PERIODS = [["all", "all-time"], ["day", "last 24h"], ["week", "last 7 days"]];
+let burnPeriod = "all", burnSeries = "days";
+const burnSort = { key: "withheld", dir: -1 };
+const pct = (x, d = 1) => x == null || !isFinite(x) ? "—" : (x * 100).toFixed(d) + "%";
+const ratio = (a, b) => b ? a / b : null;
+const mdw = units => coins(units) + " MDW";
+const utcDay = ts => new Date(ts * 1000).toISOString().slice(0, 10);
+// A cell whose value is a figure and whose words go on a line of their own,
+// so the explorer's break-anywhere rule for hashes never splits them.
+function stat(k, v, sub) {
+  const c = cell(k, v);
+  if (sub) c.appendChild(h("div", { class: "sub" }, sub));
+  return c;
+}
+
+// One light line per tier of how much of a bond's scheduled subsidy was
+// withheld. Factual, never a judgement of whoever runs it: a bond is a
+// pseudonymous midstate coin, and burning is within the rules.
+function burnTier(f) {
+  if (!f) return "minting in full";
+  if (f >= 0.75) return "a bonfire for scarcity";
+  if (f >= 0.5) return "donating to scarcity";
+  if (f >= 0.25) return "running hot";
+  if (f >= 0.1) return "warming up";
+  return "a wisp of smoke";
+}
+function flame(f) {
+  const span = h("span");
+  span.style.width = Math.min(100, f > 0 ? Math.max(2, f * 100) : 0) + "%";
+  return h("span", { class: "flame", title: pct(f) + " of the scheduled subsidy withheld" }, span);
+}
+const topBurner = t => t.rank === 1 && t.withheld > 0
+  ? h("span", { class: "tag fire", title: "Top Burner: most MDW withheld in this period" }, "🔥", h("span", { class: "word" }, " Top Burner"))
+  : null;
+function mintedPct(t) {
+  const m = ratio(t.minted, t.scheduled);
+  return m == null ? h("span", { class: "dim" }, "—") : h("span", { class: m < 1 ? "hot" : null, style: m < 1 ? null : "color: var(--green)" }, pct(m));
+}
+function toggle(options, current, choose) {
+  return h("span", { class: "toggle" }, options.map(([k, text]) =>
+    h("button", { class: k === current ? "on" : null, onclick: () => choose(k) }, text)));
+}
+const toWhy = ev => {
+  ev.preventDefault();
+  const why = document.getElementById("why");
+  if (why) why.scrollIntoView({ behavior: "smooth" });
+};
+
+function burnBanner(r) {
+  const check = !r.complete
+    ? "from the chain's own supply accounting: this node does not hold a record of every block since the switch"
+    : r.consensus.matches
+      ? "✓ every coinbase since the switch adds up to exactly what the chain's supply accounting says is missing"
+      : "⚠ the coinbases and the chain's supply accounting disagree — see the check below";
+  return h("div", { class: "banner" },
+    h("b", null, mdw(r.burned)), " burned so far. Effective max supply now ", h("b", null, mdw(r.effective_max_supply)), ".",
+    h("span", { class: "sub" }, check),
+    h("a", { class: "why", href: "#/burn", onclick: toWhy },
+      "Why over-cap bonds burn: each bond gets an equal capped share, and adding bonds is the honest way to a bigger one →"));
+}
+
+// The headline: bonds ranked by what they withheld in the chosen period.
+function leaderboard(r) {
+  const body = h("div"), aside = h("span");
+  const draw = () => {
+    aside.replaceChildren(toggle(PERIODS, burnPeriod, p => { burnPeriod = p; draw(); }));
+    const net = r.periods[burnPeriod];
+    const ranked = r.bonds.filter(b => b[burnPeriod].rank != null)
+      .sort((a, b) => a[burnPeriod].rank - b[burnPeriod].rank);
+    if (!ranked.length) {
+      body.replaceChildren(h("div", { class: "empty" }, r.active
+        ? "No bond signed a block in this period."
+        : "The taper starts at the mainnet switch, " + utc(r.switch) + ". Nothing has been withheld yet."));
+      return;
+    }
+    const rows = ranked.map(b => {
+      const t = b[burnPeriod], f = ratio(t.withheld, t.scheduled) || 0;
+      return [
+        h("span", { class: "rank" }, "#" + t.rank),
+        h("span", null, link("bond", b.bond_id, short(b.bond_id, 14)), topBurner(t)),
+        h("span", { class: t.withheld ? "hot" : "dim" }, coins(t.withheld)),
+        h("span", null, flame(f), "  ", h("span", { class: f ? "hot" : "dim" }, pct(f)), "  ", h("span", { class: "tagline" }, burnTier(f))),
+        mintedPct(t),
+        pct(ratio(t.blocks, net.blocks)),
+        b.streak
+          ? h("span", { class: "hot", title: "its last " + num(b.streak) + " blocks in a row went over cap · longest run " + num(b.longest_streak) }, "🔥 " + num(b.streak))
+          : h("span", { class: "dim", title: "longest run " + num(b.longest_streak) }, "—"),
+      ];
+    });
+    body.replaceChildren(
+      h("div", { class: "lb" }, table(["#", "bond", "burned · MDW", "burn", "minted", "signed", "streak"], rows, [2, 4, 5, 6])),
+      h("div", { class: "note" },
+        "Ranked by MDW withheld and never minted, " + (burnPeriod === "all" ? "since the mainnet switch" : "in the " + PERIODS.find(([k]) => k === burnPeriod)[1] + " of blocks up to the tip") + ". ",
+        "These add up to the network's " + coins(net.withheld) + " for the period" + (net.bonds_withheld === net.withheld ? " exactly" : " — ⚠ they do not") + ". ",
+        "Burn is the share of a bond's scheduled subsidy the taper withheld, minted is the rest, signed is its share of all blocks in the period, and a streak is how many of its latest blocks in a row went over cap. ",
+        "Bonds are pseudonymous: an id is a midstate coin, nothing more."));
+  };
+  draw();
+  return section("Burn leaderboard", aside, burnBanner(r), body);
+}
+
+function burnTotals(r) {
+  const all = r.periods.all;
+  const burned = cell("burned since the switch", coins(r.burned));
+  burned.appendChild(meter(ratio(all.withheld, all.scheduled) || 0, true));
+  const supply = cell("current supply", coins(r.supply));
+  supply.appendChild(meter(r.supply / r.max_supply));
+  const check = !r.complete
+    ? stat("check", h("span", { class: "dim" }, "partial"),
+        "block records from " + (r.indexed_from != null ? num(r.indexed_from) : "—") + "; the total is the chain's own")
+    : r.consensus.matches
+      ? stat("check", h("span", { style: "color: var(--green)" }, "✓ adds up"), "coinbases = schedule − supply")
+      : stat("check", h("span", { class: "hot" }, "⚠ mismatch"),
+          "coinbases " + coins(all.withheld) + " ≠ schedule − supply " + coins(r.consensus.withheld));
+  return h("div", { class: "grid" },
+    burned,
+    stat("effective max supply", coins(r.effective_max_supply), "1,000,000 less what was burned"),
+    supply,
+    stat("withheld of issuance", pct(ratio(r.burned, r.scheduled_to_date), 2), "of " + coins(r.scheduled_to_date) + " scheduled to date"),
+    stat("minted since the switch", coins(all.minted), "of " + coins(all.scheduled) + " scheduled"),
+    stat("withheld since the switch", pct(ratio(all.withheld, all.scheduled)), "of the scheduled subsidy"),
+    stat("over-cap blocks", num(all.tapered), "of " + num(all.blocks) + " since the switch"),
+    check);
+}
+
+// Minted and withheld per bucket, stacked: the bar's height is what the
+// schedule offered, the flame part is what was never minted.
+// At least 14 slots, filled from the left, so the first days of a series are
+// bars rather than one wall-to-wall block, and the chart grows as they come.
+function stackChart(buckets, label) {
+  const W = 600, H = 170, max = Math.max(1, ...buckets.map(b => b.minted + b.withheld));
+  const bw = W / Math.max(buckets.length, 14), gap = Math.min(8, bw * 0.18);
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none" });
+  buckets.forEach((b, i) => {
+    const mh = (b.minted / max) * (H - 4), wh = (b.withheld / max) * (H - 4);
+    const x = i * bw + gap / 2, w = Math.max(1, bw - gap);
+    const g = svg("g");
+    g.appendChild(svg("rect", { x, y: H - mh, width: w, height: Math.max(0, mh), fill: "#8b5cf6", opacity: .85 }));
+    if (wh > 0) g.appendChild(svg("rect", { x, y: H - mh - wh, width: w, height: wh, fill: "#ff8a3d", opacity: .9 }));
+    g.appendChild(svg("title")).textContent = label(b);
+    s.appendChild(g);
+  });
+  return s;
+}
+
+function burnChart(r) {
+  const body = h("div"), aside = h("span");
+  const draw = () => {
+    aside.replaceChildren(toggle([["days", "per day"], ["kblocks", "per 1,000 blocks"]], burnSeries, k => { burnSeries = k; draw(); }));
+    const buckets = r.series[burnSeries];
+    if (!buckets.length) {
+      body.replaceChildren(h("div", { class: "empty" }, "Nothing to chart before the mainnet switch."));
+      return;
+    }
+    const name = b => burnSeries === "days" ? utcDay(b.day) + " UTC" : "blocks " + num(b.from) + "–" + num(b.from + 999);
+    const label = b => name(b) + "\n" + num(b.blocks) + " blocks · minted " + coins(b.minted) +
+      " · withheld " + coins(b.withheld) + " (" + pct(ratio(b.withheld, b.scheduled)) + " of the schedule)";
+    body.replaceChildren(
+      h("div", { class: "chart tall" },
+        h("div", { class: "k" }, "MDW a " + (burnSeries === "days" ? "day" : "1,000 blocks") + " · hover a bar"),
+        stackChart(buckets, label)),
+      h("div", { class: "legend", style: "padding: 0 20px 14px" },
+        h("span", null, h("i", { style: "background:#8b5cf6" }), "minted"),
+        h("span", null, h("i", { style: "background:#ff8a3d" }), "withheld, never minted"),
+        h("span", null, buckets.length > 1 ? name(buckets[0]) + " → " + name(buckets[buckets.length - 1]) : name(buckets[0])),
+        burnSeries === "days" ? h("span", null, "the last day is still filling") : null));
+  };
+  draw();
+  return section("Minted and withheld", aside, body);
+}
+
+// Every bond that signed since the switch, and every registered one.
+function sortableTable(cols, items, state, redraw) {
+  const col = cols.find(c => c.key === state.key) || cols[0];
+  const val = x => x == null || Number.isNaN(x) ? null : x;
+  const sorted = items.slice().sort((a, b) => {
+    const va = val(col.value(a)), vb = val(col.value(b));
+    if (va === vb) return 0;
+    if (va == null) return 1;   // unknowns last, whichever way
+    if (vb == null) return -1;
+    return (va < vb ? -1 : 1) * state.dir;
+  });
+  return h("div", { class: "scroll" }, h("table", null,
+    h("thead", null, h("tr", null, cols.map(c => h("th", {
+      class: "sort" + (c.num ? " num" : ""), title: "sort by " + c.head,
+      onclick: () => { state.dir = state.key === c.key ? -state.dir : (c.num ? -1 : 1); state.key = c.key; redraw(); },
+    }, c.head, state.key === c.key ? (state.dir < 0 ? " ↓" : " ↑") : "")))),
+    h("tbody", null, sorted.map(x => h("tr", null, cols.map(c => h("td", { class: c.num ? "num" : null }, c.cell(x))))))));
+}
+
+function burnBondTable(r) {
+  const w = r.window, capShare = w.size ? w.cap / w.size : null;
+  const share = b => ratio(b.window_signed, w.filled);
+  const cols = [
+    { key: "id", head: "bond", value: b => b.bond_id, cell: b => link("bond", b.bond_id, short(b.bond_id, 14)) },
+    { key: "share", head: "window share", num: true, value: share,
+      cell: b => h("span", { class: b.window_signed > w.cap ? "hot" : null, title: num(b.window_signed) + " of the last " + num(w.filled) + " blocks" }, pct(share(b))) },
+    { key: "cap", head: "cap share", num: true, value: b => b.eligible ? capShare : null,
+      cell: b => b.eligible ? pct(capShare) : h("span", { class: "dim", title: b.registered ? "not eligible: it cannot sign" : "no longer registered" }, "—") },
+    { key: "minted_pct", head: "% minted", num: true, value: b => ratio(b.all.minted, b.all.scheduled), cell: b => mintedPct(b.all) },
+    { key: "withheld", head: "withheld", num: true, value: b => b.all.withheld,
+      cell: b => h("span", { class: b.all.withheld ? "hot" : "dim" }, coins(b.all.withheld)) },
+    { key: "minted", head: "minted", num: true, value: b => b.all.minted, cell: b => coins(b.all.minted) },
+    { key: "blocks", head: "blocks", num: true, value: b => b.all.blocks, cell: b => num(b.all.blocks) },
+  ];
+  const body = h("div");
+  const draw = () => body.replaceChildren(sortableTable(cols, r.bonds, burnSort, draw));
+  draw();
+  return section("By bond", "since the switch · click a column to sort", body,
+    h("div", { class: "note" }, "Window share is the bond's part of the last " + num(w.filled) + " blocks; cap share is what each of the " +
+      num(w.eligible) + " eligible bonds may sign at full pay (" + num(w.cap) + " blocks). A window share above the cap share mints cap/n. " +
+      "% minted compares with each block's own scheduled subsidy, which ramps up over the first 43,200 blocks."));
+}
+
+function burnExplainer(r) {
+  const w = r.window, gh = "https://github.com/ciphernom/midwimble";
+  const ext = (href, text) => h("a", { href, target: "_blank", rel: "noopener" }, text);
+  const s = section("Why over-cap bonds burn", null,
+    h("div", { class: "explain" },
+      h("p", null, h("b", null, "Each bond gets an equal capped share. "),
+        "Every eligible bond may sign up to cap = ⌈1,440 ÷ eligible bonds⌉ of the last 1,440 blocks at full pay, and the share stops shrinking at 360 bonds (4 blocks a day). Now: " +
+        num(w.eligible) + " eligible bond" + (w.eligible === 1 ? "" : "s") + ", a cap of " + num(w.cap) + " blocks, " + pct(ratio(w.cap, w.size)) + " each."),
+      h("p", null, h("b", null, "Past the cap, blocks stay valid but mint less. "),
+        "A bond that has signed n blocks of the window, n above its cap, mints cap/n of each block's scheduled subsidy, rounded down. Fees are always paid in full. The rest is never minted by anyone: not redistributed, just never created, so the final supply settles below 1,000,000."),
+      h("p", null, h("b", null, "Unsigned blocks are never tapered, "),
+        "and nothing was tapered before the mainnet switch, " + utc(r.switch) + "."),
+      h("p", null, h("b", null, "More bonds is the honest way to a bigger share. "),
+        "Each bond carries its own cap, so a producer that locks more bonds, or signs with co-bonds others lock to its mining key, mints in full on more blocks. Burning is what the rule does to hashrate that outruns its bonds."),
+      h("p", { class: "dim" },
+        "Every figure on this page is a coinbase's own: the block's scheduled subsidy, which ramps up over the chain's first 43,200 blocks, less what consensus recorded it minting. The total is checked against the chain's supply accounting.")),
+    h("div", { class: "note" }, "Read more: ",
+      ext(gh + "#emission-coretypesrs-docslaunchmd", "README: over-cap taper"), "  ·  ",
+      ext(gh + "/blob/main/docs/BONDED_POW.md#co-bonding-and-the-per-bond-cap", "docs: the per-bond cap"), "  ·  ",
+      ext(gh + "/blob/main/src/core/bond.rs", "code: capped_subsidy, signer_cap, subsidy_for"), "  ·  JSON ",
+      h("a", { href: "/explorer/burn" }, "/explorer/burn")));
+  s.id = "why";
+  return s;
+}
+
+async function burnPage() {
+  const r = await get("/explorer/burn");
+  view.replaceChildren(
+    h("div", { class: "title" }, h("h1", null, "Burn tracker"),
+      h("span", { class: "dim" }, "what over-cap bonds left unminted since the mainnet switch, " + utc(r.switch))),
+    leaderboard(r),
+    section("Network", "since the switch · refreshes every 30s", burnTotals(r)),
+    burnChart(r),
+    burnBondTable(r),
+    burnExplainer(r));
+  schedule(burnPage, 30000);
+}
+
+// The bond page's share of the same report.
+function bondBurn(burn) {
+  if (!burn) return null;
+  const more = h("a", { href: "#/burn" }, "leaderboard →");
+  if (!burn.active) return section("Burn", more, h("div", { class: "empty" }, "The over-cap taper starts at the mainnet switch, " + utc(burn.switch) + "."));
+  const b = burn.bond;
+  if (!b || !b.all.blocks) return section("Burn", more, h("div", { class: "empty" }, "This bond has signed no block since the mainnet switch, so nothing of its has been withheld."));
+  const { all, day, week } = b, w = burn.window, f = ratio(all.withheld, all.scheduled) || 0;
+  const burned = cell("burned since the switch", coins(all.withheld) + " MDW");
+  burned.appendChild(meter(f, true));
+  const period = (k, t) => t.blocks
+    ? stat(k, coins(t.withheld), "burned · " + pct(ratio(t.minted, t.scheduled)) + " of the full subsidy minted")
+    : stat(k, h("span", { class: "dim" }, "—"), "no blocks");
+  return section("Burn", more,
+    h("div", { class: "grid" },
+      burned,
+      stat("leaderboard", all.rank != null ? "#" + num(all.rank) + " of " + num(burn.ranked) : "—", topBurner(all)),
+      stat("full subsidy minted", mintedPct(all), burnTier(f)),
+      stat("minted since the switch", coins(all.minted) + " MDW"),
+      stat("blocks since the switch", num(all.blocks), num(all.tapered) + " over cap"),
+      stat("burn streak", num(b.streak), "over-cap blocks in a row now · longest " + num(b.longest_streak)),
+      period("last 24h", day),
+      period("last 7 days", week),
+      stat("window share", pct(ratio(b.window_signed, w.filled)), "of the last " + num(w.filled) + " blocks · cap " + pct(ratio(w.cap, w.size)))),
+    h("div", { class: "note" }, "Withheld is the scheduled subsidy of this bond's blocks that the over-cap taper kept from being minted; nobody receives it. Signing above the cap share is what triggers it, and more bonds is what lifts it."));
+}
+
 // ---------- routing, refresh, search ---------------------------------------
 let timer = null, generation = 0;
 function schedule(fn, ms) {
@@ -1124,6 +1438,7 @@ const routes = [
   [/^#\/output\/([0-9a-fA-F]{64})$/, outputPage],
   [/^#\/kernel\/([0-9a-fA-F]{64})$/, kernelPage],
   [/^#\/bonds$/, bondsPage],
+  [/^#\/burn$/, burnPage],
   [/^#\/privacy$/, privacyPage],
   [/^#\/network$/, networkPage],
   [/^#\/mempool$/, mempoolPage],

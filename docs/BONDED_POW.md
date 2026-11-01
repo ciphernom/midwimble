@@ -477,8 +477,11 @@ ever spend the coin, and the pool signs blocks with the bond.
 **The cap is a fork-choice rule, not a validity rule.** Over any 1,440 blocks
 (`CAP_WINDOW`), a bond adds full work to its chain's weight for at most
 `ceil(1440 / min(eligible bonds, 360))` of them (`CAP_K = 360`): four blocks
-a day once 360 or more bonds are eligible. Blocks beyond that stay valid and
-pay, but add only 1/1024 of their work. So:
+a day once 360 or more bonds are eligible. Blocks beyond that stay valid, but
+add only 1/1024 of their work, and from the mainnet switch they mint only
+`cap / n` of their subsidy, where `n` is how many of the window the bond has
+signed (`bond::capped_subsidy`). The rest is never minted by anyone. The
+explorer's burn tracker (`/#/burn`) totals it, by bond and over time. So:
 
 - the chain never stalls: a lone producer can always extend it, and a longer
   chain is always a heavier one;

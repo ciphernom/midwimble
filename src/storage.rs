@@ -212,6 +212,21 @@ impl Default for FinalityInfo {
     }
 }
 
+/// One stored block as a reader of its history needs it, from the header,
+/// signer and subsidy tables: those pruning keeps, so a block whose body is
+/// gone still has one ([`Storage::block_records`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockRecord {
+    pub height: u64,
+    /// The block's hash (its `extension.final_hash`).
+    pub hash: [u8; 32],
+    pub timestamp: u64,
+    /// The bond that signed it, if any.
+    pub signer: Option<[u8; 32]>,
+    /// What it minted ([`Storage::subsidy_at`]).
+    pub minted: Option<u64>,
+}
+
 #[derive(Clone)]
 pub struct Storage {
     db: Arc<Database>,
@@ -719,6 +734,44 @@ impl Storage {
             Some(v) => Some(bincode::deserialize(v.value())?),
             None => None,
         })
+    }
+
+    /// The [`BlockRecord`]s of the stored headers in `start..start + count`,
+    /// oldest first: from the first stored header in that range up to the
+    /// next gap. One read transaction, and no block bodies, so this is cheap
+    /// enough to walk a long history with. The signer comes from the signer
+    /// log, as the fork-choice window takes it, and from the header where the
+    /// log has no entry.
+    pub fn block_records(&self, start: u64, count: u64) -> Result<Vec<BlockRecord>> {
+        let txn = self.db.begin_read()?;
+        let headers = txn.open_table(HEADERS)?;
+        let signers = txn.open_table(SIGNERS)?;
+        let subsidy = txn.open_table(SUBSIDY)?;
+        let mut out: Vec<BlockRecord> = Vec::new();
+        for entry in headers.range(start..start.saturating_add(count))? {
+            let (k, v) = entry?;
+            let height = k.value();
+            if out.last().is_some_and(|last| last.height + 1 != height) {
+                break;
+            }
+            let header: BatchHeader = bincode::deserialize(v.value())?;
+            let signer = match signers.get(height)? {
+                Some(s) => signer_from_log(s.value()),
+                None => header.signer,
+            };
+            let minted = match subsidy.get(height)? {
+                Some(s) => Some(bincode::deserialize(s.value())?),
+                None => None,
+            };
+            out.push(BlockRecord {
+                height,
+                hash: header.extension.final_hash,
+                timestamp: header.timestamp,
+                signer,
+                minted,
+            });
+        }
+        Ok(out)
     }
 
     /// Replaces every block at or above `first_height` with `batches`, whose

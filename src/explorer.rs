@@ -12,6 +12,8 @@
 //! but not to particular outputs inside a block: that link is exactly what
 //! aggregation removes.
 
+pub mod burn;
+
 use crate::core::bond::{signer_cap, CAP_WINDOW};
 use crate::core::mw::transaction::{Kernel, Output};
 use crate::core::state::calculate_work;
@@ -61,6 +63,10 @@ pub struct ExplorerIndex {
     /// Bond id to the heights of the blocks it signed, ascending.
     signed: HashMap<[u8; 32], Vec<u64>>,
     log: VecDeque<BlockLog>,
+    /// The burn tracker's rows and report (`explorer::burn`). It keeps
+    /// itself level with the chain from block records alone, so it shares
+    /// this index's lock but none of its bookkeeping.
+    burn: burn::BurnIndex,
 }
 
 fn body_outputs(b: &Batch) -> impl Iterator<Item = &Output> {
@@ -621,14 +627,16 @@ pub async fn bonds(
     .await
 }
 
-/// One bond: its terms, its quota, and the blocks it signed.
+/// One bond: its terms, its quota, the blocks it signed, and what the
+/// over-cap taper has withheld from them (`explorer::burn`).
 pub async fn bond(
     AxState(node): AxState<NodeHandle>,
     Extension(index): Extension<SharedIndex>,
     Path(id): Path<String>,
 ) -> ApiResult {
     let id = hex32(&id)?;
-    with_index(node, index, move |idx, node| {
+    let (burn_node, burn_index) = (node.clone(), index.clone());
+    let Json(mut v) = with_index(node, index, move |idx, node| {
         let state = node.state();
         if !state.bonds.contains_key(&id) && !idx.registered.contains_key(&id) {
             return Err(not_found("bond"));
@@ -643,7 +651,13 @@ pub async fn bond(
             .unwrap_or_default());
         Ok(Json(v))
     })
-    .await
+    .await?;
+    // The burn figures are extra: a page that cannot have them still shows
+    // the bond.
+    v["burn"] = burn::for_bond(burn_node, burn_index, id)
+        .await
+        .unwrap_or(Value::Null);
+    Ok(Json(v))
 }
 
 /// Most mempool transactions the explorer lists.
