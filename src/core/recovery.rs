@@ -74,6 +74,32 @@ pub fn recovery_master_seed(seed: &[u8]) -> [u8; 32] {
     hash_domain(b"midwimble.wallet.recovery.v1", &[seed])
 }
 
+/// Just the public key of [`derive_recovery_keypair`], which is all an
+/// address carries, computed leaf by leaf the way the browser wallet does.
+///
+/// [`mss::keygen`] on native builds checkpoints its progress to a file in the
+/// working directory and prints to stdout, which suits the CLI but not a
+/// library embedded in someone else's process (midstate's walletd derives a
+/// midwimble account this way). Same leaves, same root, no side effects.
+pub fn recovery_public_key(seed: &[u8], height: u32) -> Result<[u8; 32]> {
+    if height == 0 || height > mss::MAX_HEIGHT {
+        bail!("recovery key height must be in 1..={}", mss::MAX_HEIGHT);
+    }
+    let master = recovery_master_seed(seed);
+    let indices = 0..1u64 << height;
+    #[cfg(not(target_arch = "wasm32"))]
+    let leaves: Vec<[u8; 32]> = {
+        use rayon::prelude::*;
+        indices
+            .into_par_iter()
+            .map(|i| mss::leaf_public_key(&master, i))
+            .collect()
+    };
+    #[cfg(target_arch = "wasm32")]
+    let leaves: Vec<[u8; 32]> = indices.map(|i| mss::leaf_public_key(&master, i)).collect();
+    mss::root_from_leaves(&leaves)
+}
+
 /// The Pedersen generators recovery checks openings against. Always
 /// [`Generators::standard`] in consensus; tests substitute generators with a
 /// known discrete-log relation to model a broken curve.
@@ -336,5 +362,19 @@ mod tests {
             mss::root_from_leaves(&leaves).unwrap(),
             derive_recovery_keypair(b"seed", 2).unwrap().public_key()
         );
+    }
+
+    #[test]
+    fn recovery_public_key_is_the_keypairs_public_key() {
+        for height in [1, 3] {
+            assert_eq!(
+                recovery_public_key(b"seed", height).unwrap(),
+                derive_recovery_keypair(b"seed", height)
+                    .unwrap()
+                    .public_key()
+            );
+        }
+        assert!(recovery_public_key(b"seed", 0).is_err());
+        assert!(recovery_public_key(b"seed", mss::MAX_HEIGHT + 1).is_err());
     }
 }

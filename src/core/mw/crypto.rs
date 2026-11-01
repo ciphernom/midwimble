@@ -231,12 +231,21 @@ pub struct SchnorrSig {
     pub s: Scalar32,
 }
 
+/// The Schnorr challenge `e = H(P ‖ R ‖ m)` that [`schnorr_verify`] checks.
+///
+/// Public so that a signature made by several parties (midstate walletd's
+/// cross-chain swaps sign a jointly owned input this way) is built against
+/// exactly this definition rather than a copy of it.
+pub fn schnorr_challenge(public: &Point32, r: &Point32, msg: &[u8; 32]) -> Scalar {
+    hash_to_scalar(SCHNORR_CHALLENGE, &[public, r, msg])
+}
+
 pub fn schnorr_sign(secret: &Scalar, msg: &[u8; 32]) -> SchnorrSig {
     let public = RistrettoPoint::mul_base(secret).compress().to_bytes();
     let aux: [u8; 32] = rand::random();
     let k = hash_to_scalar(SCHNORR_NONCE, &[secret.as_bytes(), &public, msg, &aux]);
     let r = RistrettoPoint::mul_base(&k).compress().to_bytes();
-    let e = hash_to_scalar(SCHNORR_CHALLENGE, &[&public, &r, msg]);
+    let e = schnorr_challenge(&public, &r, msg);
     let s = k + e * secret;
     SchnorrSig {
         e: e.to_bytes(),
@@ -255,7 +264,7 @@ pub fn schnorr_verify(public: &Point32, msg: &[u8; 32], sig: &SchnorrSig) -> boo
     };
     // R' = s·G − e·P
     let r = RistrettoPoint::vartime_double_scalar_mul_basepoint(&(-e), &p, &s);
-    let expected = hash_to_scalar(SCHNORR_CHALLENGE, &[public, &r.compress().to_bytes(), msg]);
+    let expected = schnorr_challenge(public, &r.compress().to_bytes(), msg);
     expected == e
 }
 
@@ -285,6 +294,22 @@ pub struct KernelSig {
     pub c: Scalar32,
     pub s1: Scalar32,
     pub s2: Scalar32,
+}
+
+/// The kernel challenge `c = H(E ‖ E' ‖ R1 ‖ R2 ‖ m)` that [`kernel_verify`]
+/// checks.
+///
+/// Public for the same reason as [`schnorr_challenge`]: a kernel signed by two
+/// parties, possibly with an adaptor point folded into `R2`, has to agree on
+/// this challenge before either can produce its share.
+pub fn kernel_challenge(
+    excess: &Point32,
+    owner_excess: &Point32,
+    r1: &Point32,
+    r2: &Point32,
+    msg: &[u8; 32],
+) -> Scalar {
+    hash_to_scalar(KERNEL_CHALLENGE, &[excess, owner_excess, r1, r2, msg])
 }
 
 pub fn kernel_sign(
@@ -317,7 +342,7 @@ pub fn kernel_sign(
     );
     let r1 = compress(&(k1 * gen_h()));
     let r2 = compress(&RistrettoPoint::mul_base(&k2));
-    let c = hash_to_scalar(KERNEL_CHALLENGE, &[excess, owner_excess, &r1, &r2, msg]);
+    let c = kernel_challenge(excess, owner_excess, &r1, &r2, msg);
     KernelSig {
         c: c.to_bytes(),
         s1: (k1 + c * excess_secret).to_bytes(),
@@ -345,10 +370,7 @@ pub fn kernel_verify(
     };
     let r1 = RistrettoPoint::vartime_multiscalar_mul([s1, -c], [gen_h(), e_pt]);
     let r2 = RistrettoPoint::vartime_double_scalar_mul_basepoint(&(-c), &o_pt, &s2);
-    let expected = hash_to_scalar(
-        KERNEL_CHALLENGE,
-        &[excess, owner_excess, &compress(&r1), &compress(&r2), msg],
-    );
+    let expected = kernel_challenge(excess, owner_excess, &compress(&r1), &compress(&r2), msg);
     expected == c
 }
 

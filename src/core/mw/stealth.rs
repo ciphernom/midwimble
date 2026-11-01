@@ -177,6 +177,30 @@ impl WalletKeys {
         }
     }
 
+    /// The keys as bytes: scan secret, spend secret, recovery key.
+    ///
+    /// For a wallet that stores what [`WalletKeys::from_seed`] derives rather
+    /// than the seed: midstate's walletd keeps one account per chain, derived
+    /// once from the recovery phrase and never the phrase itself, so the same
+    /// words still restore this account in midwimble's own wallets.
+    pub fn to_bytes(&self) -> [[u8; 32]; 3] {
+        [
+            self.scan_secret.to_bytes(),
+            self.spend_secret.to_bytes(),
+            self.recovery_key,
+        ]
+    }
+
+    /// Inverse of [`WalletKeys::to_bytes`]. `None` if either secret is not a
+    /// canonical scalar, so a corrupted record cannot load as a different key.
+    pub fn from_bytes(bytes: &[[u8; 32]; 3]) -> Option<Self> {
+        Some(Self {
+            scan_secret: scalar_from_bytes(&bytes[0])?,
+            spend_secret: scalar_from_bytes(&bytes[1])?,
+            recovery_key: bytes[2],
+        })
+    }
+
     /// A watch-only view: can detect and value outputs, cannot spend them.
     pub fn view_only(&self) -> ViewKey {
         ViewKey {
@@ -531,6 +555,23 @@ mod tests {
             compress(&RistrettoPoint::mul_base(&owned.owner_secret)),
             created.output.owner_key
         );
+    }
+
+    /// Keys stored as bytes and loaded back are the same wallet: same
+    /// address, and they still find and can spend what was paid to it.
+    #[test]
+    fn wallet_keys_round_trip_through_bytes() {
+        let bob = WalletKeys::from_seed(b"a seed", [7; 32]);
+        let back = WalletKeys::from_bytes(&bob.to_bytes()).unwrap();
+        assert_eq!(back.address(), bob.address());
+        let created = new_output(&bob.address(), 77).unwrap();
+        let owned = scan_output(&back, &created.output).expect("the reloaded keys see it");
+        assert_eq!(owned.value, 77);
+
+        // A secret that is not a canonical scalar is refused, not reduced.
+        let mut bad = bob.to_bytes();
+        bad[1] = [0xff; 32];
+        assert!(WalletKeys::from_bytes(&bad).is_none());
     }
 
     #[test]
