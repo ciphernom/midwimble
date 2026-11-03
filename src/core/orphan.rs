@@ -22,7 +22,8 @@
 //! only when its block there would count in full and outweigh the whole run,
 //! never past a block that counted in full, never past a block one of its own
 //! bonds signed (orphaning that would throw away its own pay), and never more
-//! than [`MAX_ORPHAN_DEPTH`] blocks back.
+//! than [`MAX_ORPHAN_DEPTH`] blocks back ([`COMPATIBLE_ORPHAN_DEPTH`] unless
+//! the node is told otherwise, while older nodes cannot follow more).
 
 use super::bond::{sliver, MinerBond};
 use super::mw::{PayoutReceipt, StealthAddress, Transaction};
@@ -38,8 +39,19 @@ use std::collections::HashSet;
 /// hour and forty minutes of blocks. Deeper runs are left alone: the
 /// replacement would outweigh them just the same, but replacing history that
 /// old surprises the people who saw it confirmed, and their own wallets would
-/// have to rescan it.
+/// have to rescan it. A node takes a replacement that deep from a peer
+/// whatever depth it builds to itself.
 pub const MAX_ORPHAN_DEPTH: u64 = 100;
+
+/// How many blocks a node replaces by default (`NodeConfig::max_orphan_depth`):
+/// twelve. A node from before the sync fix for heavier but shorter chains
+/// asks a peer for headers from sixteen blocks below its own tip
+/// (`sync::INITIAL_STEP_BACK`). So a heavier chain whose tip is lower than
+/// that is one it cannot follow, and it strikes, then bans, the peer that
+/// offers it. Twelve leaves room for a few more of the run's blocks to reach
+/// such a node before the replacement does. Raise it to [`MAX_ORPHAN_DEPTH`]
+/// once the network runs the fix.
+pub const COMPATIBLE_ORPHAN_DEPTH: u64 = 12;
 
 /// Whether a block that added `credited` to its chain's weight, with `work`
 /// behind it, counted in full: not an over-cap block or an unsigned one,

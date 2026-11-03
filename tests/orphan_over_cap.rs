@@ -20,12 +20,14 @@ use midwimble::core::bond::{
 use midwimble::core::mw::{
     build_transaction, scan_output, Payment, Spendable, StealthAddress, Transaction, WalletKeys,
 };
+use midwimble::core::orphan::{COMPATIBLE_ORPHAN_DEPTH, MAX_ORPHAN_DEPTH};
 use midwimble::core::state::apply_batch;
 use midwimble::core::template::build_template_bonded;
 use midwimble::core::types::{hash, Batch, BlockEffects, State, GENESIS_TARGET, GENESIS_TIMESTAMP};
 use midwimble::node::{Node, NodeConfig, NodeHandle};
 use midwimble::rpc::RpcClient;
 use midwimble::storage::Storage;
+use midwimble::sync::INITIAL_STEP_BACK;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -155,13 +157,26 @@ async fn start(
     peers: Vec<String>,
     orphan_over_cap: bool,
 ) -> TestNode {
+    start_with(dir, bond, peers, |config| {
+        config.orphan_over_cap = orphan_over_cap
+    })
+    .await
+}
+
+/// [`start`], with `configure` given the last word on the node's config.
+async fn start_with(
+    dir: tempfile::TempDir,
+    bond: Option<MinerBond>,
+    peers: Vec<String>,
+    configure: impl FnOnce(&mut NodeConfig),
+) -> TestNode {
     let mut config = NodeConfig::new(dir.path(), "/ip4/127.0.0.1/tcp/0".parse().unwrap());
     config.bootstrap = peers.iter().map(|p| p.parse().unwrap()).collect();
     config.mining_bond = bond;
     config.mining_threads = 1;
     config.poll_interval = Duration::from_secs(60);
     config.min_block_interval = Duration::from_millis(250);
-    config.orphan_over_cap = orphan_over_cap;
+    configure(&mut config);
     let (node, handle) = Node::new(config).await.unwrap();
     let task = tokio::spawn(node.run());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -445,4 +460,76 @@ async fn a_mining_node_builds_past_the_run_unless_told_not_to() {
         .iter()
         .all(|b| b.extension.final_hash != replaced.extension.final_hash));
     assert!(ours.handle.info().state.weight() > chain.state.weight());
+}
+
+/// A block that replaces a run leaves a chain that is heavier but shorter.
+/// A node still holding a run longer than a sync steps back takes it all
+/// the same: it asks for headers from below the shorter of the two tips, so
+/// its peer has them, and it strikes nobody. (Older nodes asked from below
+/// their own tip, past the peer's, got no headers, and struck the peer,
+/// then banned it.) By default a node replaces only the latest
+/// `COMPATIBLE_ORPHAN_DEPTH` blocks of a run, which such nodes can follow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_follows_a_heavier_but_shorter_chain() {
+    let mut bonds = bonds(&[b"short big", b"short small"]);
+    let (big, small) = (bonds.remove(0), bonds.remove(0));
+    let mut chain = prefix(&big, &small, &WalletKeys::random());
+    let base_height = chain.state.height - 1;
+    // `big` runs further past its cap than a syncing node steps back.
+    let run = INITIAL_STEP_BACK + 4;
+    for _ in 0..run {
+        chain.extend(&big);
+    }
+
+    // By default, a node replaces the latest blocks of the run only.
+    let capped = start(chain.store(), Some(small.clone()), vec![], true).await;
+    wait_until("the base to be derived", 30, || {
+        capped.handle.info().orphan_base.is_some()
+    })
+    .await;
+    let state = capped.get("/state").await;
+    assert_eq!(state["orphaning"]["replaces"], COMPATIBLE_ORPHAN_DEPTH);
+    assert_eq!(
+        state["orphaning"]["height"],
+        chain.state.height - COMPATIBLE_ORPHAN_DEPTH
+    );
+
+    // Allowed to, a node replaces the whole run, leaving a chain shorter
+    // by all but one of its blocks.
+    let seed = start_with(chain.store(), Some(small), vec![], |config| {
+        config.max_orphan_depth = MAX_ORPHAN_DEPTH
+    })
+    .await;
+    wait_until("the base to be derived", 30, || {
+        seed.handle.info().orphan_base.is_some()
+    })
+    .await;
+    let payouts = json!([{ "address": WalletKeys::random().address().encode(), "weight": 1 }]);
+    let template = seed
+        .post("/mining/template", json!({ "payouts": payouts }))
+        .await
+        .unwrap();
+    assert_eq!(template["orphans"], run);
+    let hash = mine_and_submit(&seed, &template).await.extension.final_hash;
+    assert_eq!(seed.tip(), hash);
+    assert_eq!(seed.handle.info().state.height, base_height + 2);
+
+    // A node still on the run, building on the tip as older nodes do, meets
+    // it afterwards: it hears of the heavier chain from the seed's state,
+    // not from the block, and syncs to it.
+    let old = start_with(
+        chain.store(),
+        None,
+        vec![seed.dial_addr().await],
+        |config| config.orphan_over_cap = false,
+    )
+    .await;
+    wait_until("the node to take the heavier, shorter chain", 60, || {
+        old.tip() == hash
+    })
+    .await;
+    let info = old.handle.info();
+    assert_eq!(info.state.height, base_height + 2);
+    assert!(info.sync_stats.sessions >= 1, "through a sync session");
+    assert!(info.banned.is_empty(), "nobody banned: {:?}", info.banned);
 }

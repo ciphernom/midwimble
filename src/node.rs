@@ -41,7 +41,9 @@ use crate::anchor::{load_records, load_records_from, AnchorRecord};
 use crate::core::auxpow::verify_pow_near;
 use crate::core::filter::CompactFilter;
 use crate::core::mw::{Context, StealthAddress, Transaction};
-use crate::core::orphan::{orphan_template, orphanable_run, OrphanBase, MAX_ORPHAN_DEPTH};
+use crate::core::orphan::{
+    orphan_template, orphanable_run, OrphanBase, COMPATIBLE_ORPHAN_DEPTH, MAX_ORPHAN_DEPTH,
+};
 use crate::core::relay::{MidstateHeaders, RelayFeed};
 use crate::core::snapshot::Snapshot;
 use crate::core::state::{apply_batch, apply_batch_skip_pow, choose_best_state};
@@ -174,6 +176,11 @@ pub struct NodeConfig {
     /// on the last block before the run, so a full-weight block of ours
     /// replaces it (`core::orphan`). On unless turned off.
     pub orphan_over_cap: bool,
+    /// The most blocks of such a run this node's blocks replace, at most
+    /// [`MAX_ORPHAN_DEPTH`]: of a longer run, the latest this many.
+    /// [`COMPATIBLE_ORPHAN_DEPTH`] by default, which nodes from before the
+    /// sync fix for heavier but shorter chains can follow.
+    pub max_orphan_depth: u64,
     /// Test builds only: extra time each synced header takes to verify,
     /// standing in for a slow machine.
     #[cfg(feature = "fast-mining")]
@@ -205,6 +212,7 @@ impl NodeConfig {
             midstate_rpc: None,
             relay_poll: Duration::from_secs(20),
             orphan_over_cap: true,
+            max_orphan_depth: COMPATIBLE_ORPHAN_DEPTH,
             #[cfg(feature = "fast-mining")]
             header_verify_delay: Duration::ZERO,
         }
@@ -2344,7 +2352,12 @@ impl Node {
             }
             None => {
                 let _ = self.storage.clear_sync_headers();
-                let start = our_height.saturating_sub(step_back);
+                // Below the shorter of the two tips: a heavier chain can be
+                // the shorter one (a block that outweighs a run of over-cap
+                // blocks replaces the whole run, `core::orphan`), and asking
+                // from below our own tip would ask for headers past its tip.
+                // The peer would rightly answer with none.
+                let start = our_height.min(height).saturating_sub(step_back);
                 // Below `start` the peer's chain is ours, and so is the work
                 // window its first claims are checked against.
                 let work_floor = match self.storage.work_floor_before(start) {
@@ -2638,8 +2651,16 @@ impl Node {
         if chunk.is_empty() {
             if h.tip.is_none() {
                 // It claimed a heavier chain than ours and has no headers
-                // past our tip's neighbourhood.
-                return HeaderStep::Abort("peer returned no headers", Blame::Strike);
+                // where its chain should have them. Asked past the tip it
+                // claimed, though, an empty answer is the honest one, so not
+                // a strike: the chain may have shortened since (a block that
+                // outweighs a run of over-cap blocks replaces the run).
+                let blame = if h.next_fetch < s.peer_height {
+                    Blame::Strike
+                } else {
+                    Blame::Pause
+                };
+                return HeaderStep::Abort("peer returned no headers", blame);
             }
             if !full {
                 h.done = true;
@@ -3803,15 +3824,17 @@ impl Node {
     /// The run of other producers' over-cap blocks ending at the tip that
     /// this node builds past: the height and hash of the block before it,
     /// and who signed each of its blocks, oldest first. `None` when there is
-    /// no such run, or orphaning is turned off. The run stops short of the
-    /// finalized floor, which no block may replace.
+    /// no such run, or orphaning is turned off. The run is at most
+    /// `max_orphan_depth` blocks (the latest, of a longer one), and stops
+    /// short of the finalized floor, which no block may replace.
     fn orphan_run(&self) -> Option<(u64, [u8; 32], Vec<Option<[u8; 32]>>)> {
         if !self.config.orphan_over_cap {
             return None;
         }
+        let depth = self.config.max_orphan_depth.min(MAX_ORPHAN_DEPTH);
         let tip = self.state.height.checked_sub(1)?;
         let lowest = tip
-            .saturating_sub(MAX_ORPHAN_DEPTH)
+            .saturating_sub(depth)
             .max(self.finality.floor().saturating_sub(1));
         let headers = self.storage.load_headers(lowest, tip + 1 - lowest).ok()?;
         if headers.last().map(|h| h.extension.final_hash) != Some(self.state.header_hash) {
@@ -3821,7 +3844,7 @@ impl Node {
         let ours = |id: &[u8; 32]| {
             bond.is_some_and(|b| b.bond_id == *id || b.co_bonds.iter().any(|c| c.bond_id == *id))
         };
-        let run = orphanable_run(&headers, ours, MAX_ORPHAN_DEPTH) as usize;
+        let run = orphanable_run(&headers, ours, depth) as usize;
         if run == 0 || run >= headers.len() {
             return None;
         }

@@ -92,11 +92,18 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         min_block_interval: u64,
         /// Always build on the tip. By default, while the tip is a run of
-        /// other producers' over-cap blocks (at most 100), this node's blocks
-        /// and the templates its RPC hands out build on the last block
-        /// before the run, so a block that counts in full replaces it.
+        /// other producers' over-cap blocks, this node's blocks and the
+        /// templates its RPC hands out build on the last block before the
+        /// run, so a block that counts in full replaces it.
         #[arg(long)]
         no_orphan_over_cap: bool,
+        /// The most over-cap blocks one of this node's blocks replaces (of a
+        /// longer run, the latest this many), up to 100. The default, 12, is
+        /// what nodes from before the sync fix for heavier but shorter chains
+        /// can follow: replacing more makes them strike, then ban, this node.
+        #[arg(long, default_value_t = midwimble::core::orphan::COMPATIBLE_ORPHAN_DEPTH,
+              value_parser = clap::value_parser!(u64).range(1..=midwimble::core::orphan::MAX_ORPHAN_DEPTH))]
+        max_orphan_depth: u64,
         /// Mining backend: auto, gpu or cpu (gpu needs a build with `--features gpu`).
         #[arg(long, default_value = "auto")]
         backend: String,
@@ -1321,6 +1328,7 @@ fn run(cli: Cli) -> Result<()> {
             public_address,
             min_block_interval,
             no_orphan_over_cap,
+            max_orphan_depth,
             backend,
             checkpoint,
             prune,
@@ -1411,6 +1419,7 @@ fn run(cli: Cli) -> Result<()> {
             config.public_address = public_address.map(|a| a.parse()).transpose()?;
             config.min_block_interval = std::time::Duration::from_millis(min_block_interval);
             config.orphan_over_cap = !no_orphan_over_cap;
+            config.max_orphan_depth = max_orphan_depth;
             config.finality = midwimble::finality::FinalityConfig {
                 anchor_depth,
                 finality_depth,

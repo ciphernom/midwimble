@@ -76,8 +76,10 @@ recovery design.
 - **Over-cap blocks are orphaned:** one block that counts in full outweighs
   up to 1,023 over-cap ones, so while the tip is a run of other producers'
   over-cap blocks, nodes build on the block before the run, and a block there
-  replaces it all, pay and fees included (at most 100 blocks back;
-  `--no-orphan-over-cap` keeps a node on the tip). Past its bonds' share, a
+  replaces it all, pay and fees included (at most 12 blocks back by default,
+  which nodes from before the sync fix can follow, and up to 100 with
+  `--max-orphan-depth`; `--no-orphan-over-cap` keeps a node on the tip).
+  Past its bonds' share, a
   producer's blocks are replaced, not just tapered: see
   `docs/BONDED_POW.md`.
 - **Checkable anywhere:** the schedule is defined by its running total, so any

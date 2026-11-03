@@ -599,9 +599,11 @@ are held up by a block, not lost.
 - **When:** only if the node's own block there would count in full (its
   bond is under its cap there too) and outweigh the whole run. Never past a
   block that counted in full, never past a block one of the node's own bonds
-  signed (that would throw away its own pay), never more than 100 blocks back
-  (`MAX_ORPHAN_DEPTH`, about an hour and forty minutes), and never below the
-  finalized checkpoint.
+  signed (that would throw away its own pay), and never below the finalized
+  checkpoint. Of a longer run, a node replaces the latest 12 blocks by
+  default (`COMPATIBLE_ORPHAN_DEPTH`, below), and up to 100 with
+  `--max-orphan-depth` (`MAX_ORPHAN_DEPTH`, about an hour and forty
+  minutes).
 - **Consensus is unchanged:** fork choice has always taken the heavier chain.
   A node takes a block on one of the last 100 blocks below its tip that
   outweighs its tip by itself as soon as it has checked it against the state
@@ -623,6 +625,16 @@ are held up by a block, not lost.
   builds on, and how many blocks a block there replaces.
 - **Turning it off:** `midwimble node --no-orphan-over-cap` always builds on
   the tip.
+- **Following a shorter chain:** a block that replaces a run leaves a chain
+  that is heavier but shorter, and a node syncing to it asks its peer for
+  headers from 16 blocks below the shorter of the two tips
+  (`sync::INITIAL_STEP_BACK`). Nodes from before that fix asked from below
+  their own tip. Offered a heavier chain more than about 16 blocks shorter
+  than theirs, they asked past its tip, got no headers, and struck the peer
+  for not backing its claim: banned at the third strike, for an hour,
+  doubling for repeats. Hence the default of 12, which such a node can
+  follow with a few more of the run's blocks in hand. Raise
+  `--max-orphan-depth` once the network has upgraded.
 
 The explorer marks over-cap blocks, and counts a block's *full-weight
 confirmations* beside its confirmations: the full-weight blocks from it to
