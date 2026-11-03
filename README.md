@@ -401,9 +401,10 @@ verify. The vendored copy keys the file by a seed fingerprint.
   assumed; pruning stays off (`docs/ANCHORING.md`).
 - [x] `EXTENSION_ITERATIONS` stays 1,000,000: midstate compatibility, and so
   merged mining.
-- [ ] Midstate Walk: confirm `WALK_ACTIVATION_HEIGHT` (expected a few hours
-  before midstate's switch, so this chain stops taking GPU-friendly work
-  first), `WALK_TARGET_SHIFT`, and that `MIDSTATE_WALK_ACTIVATION_HEIGHT` and
+- [ ] Midstate Walk: confirm `WALK_ACTIVATION_HEIGHT` (37,300 from
+  v1.3-DIMEBAG, expected a few hours before midstate's switch at 371,500, so
+  this chain stops taking GPU-friendly work first), `WALK_TARGET_SHIFT`, and
+  that `MIDSTATE_WALK_ACTIVATION_HEIGHT` and
   `MIDSTATE_WALK_TARGET_SHIFT` equal midstate's release. Merged mining pauses
   between the two switches; the merge miner and pools mine midstate alone
   meanwhile.

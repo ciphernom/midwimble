@@ -4,7 +4,7 @@ midwimble is a privacy chain. it's merge-mined with midstate and anchored to it.
 
 this guide is about how to mine it, and nothing else. it isn't advice on whether you should.
 
-**heads up: from block 37,300 (around 10 november 2026) the proof of work is midstate walk.** it runs on cpu cores, and a raspberry pi 5 is the smallest machine that mines it well. gpus stop helping: `--backend gpu` mines it on the cpu. run a release that switches at 37,300 before then (v1.2-DIMEBAG to v1.2.2 switch at 86,400). midstate makes the same switch a few hours later, at its block 371,500, and merged mining pauses in between.
+**heads up: from block 37,300 (around 10 november 2026) the proof of work is midstate walk.** it runs on cpu cores, and a raspberry pi 5 is the smallest machine that mines it well. gpus stop helping: `--backend gpu` mines it on the cpu. run v1.3-DIMEBAG or later before then, and v6.2.0 or later on any midstate node (older builds switch at 86,400 and 420,000, and split off). midstate makes the same switch a few hours later, at its block 371,500, and merged mining pauses in between.
 
 ---
 
@@ -28,6 +28,7 @@ not sure? you're (a).
 | when | what happens |
 |---|---|
 | **31 oct 2026 00:00 UTC** | the early phase ends and the network becomes mainnet. early (tiny, 2^24 unit) bonds stop counting. from then on a bond needs **128 gMDS** with **more than 30 days** of its lock left. **anyone running a node must be on v1.1.2-WONKABURN by then.** older builds split off. |
+| **~10 nov 2026** (block 37,300, then midstate's 371,500 a few hours later) | the proof of work becomes **midstate walk** on both chains. **anyone running a node must be on v1.3-DIMEBAG (and v6.2.0 for midstate) by then.** older builds split off. merged mining pauses between the two switches. |
 | **30 nov 2026 00:00 UTC** | the minimum for **new** bonds starts following midwimble's difficulty: 128 gMDS, doubling for every 16x rise in work since genesis, capped at **512 gMDS**. bonds already registered keep the price they were registered at. |
 
 pool miners (path a): nothing for you to do. but ask your pool whether its bonds clear the 31 oct bar. if they don't, its blocks stop counting, and so do your payouts.
@@ -81,8 +82,8 @@ you do **not** need a bond, a co-bond or a midwimble node to pool mine. your old
 
 what you need:
 
-- the midwimble release (v1.1.2-WONKABURN)
-- your own midstate node, running any release from v4.2.0 on (the latest is fine). it has what bond registration needs built in
+- the midwimble release (v1.3-DIMEBAG or later)
+- your own midstate node, running v6.2.0 or later (older releases split off at block 371,500). it has what bond registration needs built in
 - a midstate wallet holding at least 128 gMDS
 - a midwimble wallet (path a, step 3)
 

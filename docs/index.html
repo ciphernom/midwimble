@@ -718,6 +718,7 @@ finality   1,000 midstate confs + 100 blocks</code></pre>
           <li class="done"><b>Slow start.</b><br><span class="dim">The reward ramps over the first 30 days. About 1,270 coins, an eighth of a percent of the supply, are issued before mainnet.</span></li>
           <li><b>31 Oct 2026, 00:00 UTC: mainnet.</b><br><span class="dim">Only the bond changes. Blocks stamped from then on need mainnet's 128 gMDS bond. Every node must run a build with the early phase before then; older builds split off at the first block after the switch.</span></li>
           <li><b>After the switch: anchor.</b><br><span class="dim">A checkpoint from past the switch is anchored in Midstate. Once it's final, the early history is settled for good.</span></li>
+          <li><b>About 10 Nov 2026: Midstate Walk.</b><br><span class="dim">From block 37,300 the proof of work is Midstate Walk, a few hours before Midstate switches at its block 371,500. Every node must run v1.3-DIMEBAG or later before then, and any Midstate node v6.2.0 or later; older builds reject the first Walk block. Merged mining pauses between the two switches.</span></li>
         </ol>
         <div>
           <div class="card">
