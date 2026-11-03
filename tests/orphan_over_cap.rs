@@ -475,6 +475,7 @@ async fn a_node_follows_a_heavier_but_shorter_chain() {
     let (big, small) = (bonds.remove(0), bonds.remove(0));
     let mut chain = prefix(&big, &small, &WalletKeys::random());
     let base_height = chain.state.height - 1;
+    let mut replaced = chain.clone();
     // `big` runs further past its cap than a syncing node steps back.
     let run = INITIAL_STEP_BACK + 4;
     for _ in 0..run {
@@ -494,25 +495,29 @@ async fn a_node_follows_a_heavier_but_shorter_chain() {
         chain.state.height - COMPATIBLE_ORPHAN_DEPTH
     );
 
-    // Allowed to, a node replaces the whole run, leaving a chain shorter
-    // by all but one of its blocks.
-    let seed = start_with(chain.store(), Some(small), vec![], |config| {
+    // Allowed to, a node builds past the whole run.
+    let deep = start_with(chain.store(), Some(small.clone()), vec![], |config| {
         config.max_orphan_depth = MAX_ORPHAN_DEPTH
     })
     .await;
     wait_until("the base to be derived", 30, || {
-        seed.handle.info().orphan_base.is_some()
+        deep.handle.info().orphan_base.is_some()
     })
     .await;
-    let payouts = json!([{ "address": WalletKeys::random().address().encode(), "weight": 1 }]);
-    let template = seed
-        .post("/mining/template", json!({ "payouts": payouts }))
-        .await
-        .unwrap();
-    assert_eq!(template["orphans"], run);
-    let hash = mine_and_submit(&seed, &template).await.extension.final_hash;
-    assert_eq!(seed.tip(), hash);
-    assert_eq!(seed.handle.info().state.height, base_height + 2);
+    assert_eq!(deep.get("/state").await["orphaning"]["replaces"], run);
+
+    // A node whose chain replaced the run: heavier, and shorter by all but
+    // two of the run's blocks. (Two full-weight blocks, because this build's
+    // targets carry so little work that a sliver's floor of one lets twenty
+    // over-cap blocks outweigh a single one.)
+    replaced.extend(&small);
+    let hash = replaced.extend(&small).extension.final_hash;
+    assert!(
+        replaced.state.weight() > chain.state.weight(),
+        "outweighs the run"
+    );
+    let seed = start(replaced.store(), None, vec![], true).await;
+    wait_until("the seed to load its chain", 10, || seed.tip() == hash).await;
 
     // A node still on the run, building on the tip as older nodes do, meets
     // it afterwards: it hears of the heavier chain from the seed's state,
@@ -529,7 +534,7 @@ async fn a_node_follows_a_heavier_but_shorter_chain() {
     })
     .await;
     let info = old.handle.info();
-    assert_eq!(info.state.height, base_height + 2);
+    assert_eq!(info.state.height, base_height + 3);
     assert!(info.sync_stats.sessions >= 1, "through a sync session");
     assert!(info.banned.is_empty(), "nobody banned: {:?}", info.banned);
 }
