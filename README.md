@@ -32,10 +32,10 @@ recovery design.
 ### Consensus (midstate)
 
 - **Proof of work:** sequential BLAKE3 (`H^N(H(header ‖ nonce))`, N = 1,000,000)
-  below `WALK_ACTIVATION_HEIGHT` (86,400), then **Midstate Walk**
+  below `WALK_ACTIVATION_HEIGHT` (37,300), then **Midstate Walk**
   (`core/walk.rs`, shared with midstate), a CPU-friendly walk over a 256 KiB
   scratchpad, natively and merged. Relayed and anchored midstate headers
-  follow midstate's own switch at its height 420,000
+  follow midstate's own switch at its height 371,500
   (`MIDSTATE_WALK_ACTIVATION_HEIGHT`, which must match midstate's).
 - **Difficulty and time:** ASERT with a 4-hour half-life and a 60-second target.
   Timestamps must beat the median of the last 11 blocks and may be at most 15

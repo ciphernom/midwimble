@@ -91,7 +91,7 @@ pool's jobs (midstate shares) for its own midwimble address, over HTTPS
   (`search_nonces_pow`): the BLAKE3 chain four at a time with SIMD (about 23
   attempts a second a thread), and Midstate Walk from its activation (about
   270). They follow the proof of work each job names, so they switch when the
-  pool does. Before then, a countdown to block 86,400 says what changes.
+  pool does. Before then, a countdown to block 37,300 says what changes.
 - **The numbers.** Attempts a second; shares sent, late and refused; the
   wallet's score at the pool out of the total, which is its part of the
   pool's next midwimble block; and an estimate a day at this speed, after the

@@ -4,7 +4,7 @@ midwimble is a privacy chain. it's merge-mined with midstate and anchored to it.
 
 this guide is about how to mine it, and nothing else. it isn't advice on whether you should.
 
-**heads up: from block 86,400 (around mid-december 2026) the proof of work is midstate walk.** it runs on cpu cores, and a raspberry pi 5 is the smallest machine that mines it well. gpus stop helping: `--backend gpu` mines it on the cpu. run release v1.2-DIMEBAG or later before then. midstate makes the same switch a few hours later, at its block 420,000, and merged mining pauses in between.
+**heads up: from block 37,300 (around 10 november 2026) the proof of work is midstate walk.** it runs on cpu cores, and a raspberry pi 5 is the smallest machine that mines it well. gpus stop helping: `--backend gpu` mines it on the cpu. run a release that switches at 37,300 before then (v1.2-DIMEBAG to v1.2.2 switch at 86,400). midstate makes the same switch a few hours later, at its block 371,500, and merged mining pauses in between.
 
 ---
 
@@ -38,7 +38,7 @@ pool miners (path a): nothing for you to do. but ask your pool whether its bonds
 
 the pool at **https://rpc.cypherpunk.gold/pool** is a midstate pool that merge-mines midwimble. you mine midstate shares like normal. if a share also clears midwimble's target, it's a midwimble block too. the pool's own bonds sign those blocks. you need nothing extra.
 
-**easiest of all: mine in your browser.** open **https://ciphernom.github.io/midwimble/wallet/#/mine**, write down the 24 words, pick a password and tap start mining. it makes a midwimble wallet and mines for it on this pool, with nothing to install. payouts show up as "mined" in the wallet. the midstate part of your shares goes to the pool unless you give it a midstate (MSS) address under mine → midstate payouts. a browser earns very little until midstate walk (block 86,400). the steps below are the same thing with a real miner.
+**easiest of all: mine in your browser.** open **https://ciphernom.github.io/midwimble/wallet/#/mine**, write down the 24 words, pick a password and tap start mining. it makes a midwimble wallet and mines for it on this pool, with nothing to install. payouts show up as "mined" in the wallet. the midstate part of your shares goes to the pool unless you give it a midstate (MSS) address under mine → midstate payouts. a browser earns very little until midstate walk (block 37,300). the steps below are the same thing with a real miner.
 
 you don't need to download midwimble at all for this.
 

@@ -268,8 +268,10 @@ pub const EXTENSION_ITERATIONS: u64 = 100;
 /// # Safety / Invariants
 /// - **Consensus-critical (hard fork).** Every block keeps the proof of work
 ///   in force at its height for ever ([`pow_algo_at`]).
+/// - Moved forward from 86,400 along with midstate's switch (420,000 to
+///   371,500). Releases v1.2-DIMEBAG to v1.2.2 still switch at 86,400.
 #[cfg(not(feature = "fast-mining"))]
-pub const WALK_ACTIVATION_HEIGHT: u64 = 86_400;
+pub const WALK_ACTIVATION_HEIGHT: u64 = 37_300;
 /// Test builds switch early, so tests cross the boundary.
 #[cfg(feature = "fast-mining")]
 pub const WALK_ACTIVATION_HEIGHT: u64 = 20;
@@ -287,7 +289,7 @@ pub const WALK_TARGET_SHIFT: i64 = 0;
 /// chain or offered as anchor evidence follow. **Must equal midstate's
 /// `WALK_ACTIVATION_HEIGHT`.**
 #[cfg(not(feature = "fast-mining"))]
-pub const MIDSTATE_WALK_ACTIVATION_HEIGHT: u64 = 420_000;
+pub const MIDSTATE_WALK_ACTIVATION_HEIGHT: u64 = 371_500;
 /// Test builds: a few dozen headers above the stand-in midstate's root
 /// (`relay::devnet`), so relay and bond tests cross it.
 #[cfg(feature = "fast-mining")]
