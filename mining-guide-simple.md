@@ -206,6 +206,8 @@ about `360 × your share of midwimble's hashrate`. on a laptop that rounds to on
 **"what happens if a bond goes over its cap?"**
 the blocks are still valid. they just count for almost nothing in fork choice (1/1024 of their work), and from 31 oct the reward tapers: a bond that has signed `n` of the last 1,440 blocks (a day) against a cap of `cap` mints `reward × cap / n`. fees are always paid in full. the withheld part is never minted by anyone. nothing stops and there's no cliff.
 
+and from v1.2.2-DIMEBAG, nodes replace them. while the tip is a run of other people's over-cap blocks, a node builds on the block before the run, and its next block that counts in full outweighs the whole run, so the run is gone, pay and fees with it. so over-cap blocks usually earn nothing at all, and the way to keep your blocks is enough bonds for your hashrate. (a node replaces at most the latest 12 blocks of a run for now, which older nodes can follow.)
+
 **"i added a lot of hashrate and my blocks seem to count late."**
 that's the work cap. no block counts for more than a quarter above the lowest-work block of the week before it (the last 10,080 blocks). if you add a lot of hashrate suddenly, the extra is credited over time, not all at once. it's there so raw hashrate can't stand in for bonds.
 
