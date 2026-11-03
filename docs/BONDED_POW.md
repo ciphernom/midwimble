@@ -583,6 +583,53 @@ carries at startup, carries the registrations in its blocks one a block (each
 once the relay buries its header), and signs each block with whichever bond,
 its own or a co-bond, has the most quota left.
 
+## Orphaning over-cap blocks
+
+An over-cap block stays valid, but adds only 1/1024 of its work to fork
+choice, so one block that counts in full outweighs up to 1,023 of them. Nodes
+act on that (`core/orphan.rs`). While the tip is a run of other producers'
+over-cap blocks, a node builds on the last block before the run instead of
+on the tip: its own miner's blocks, and the templates `/mining/template` and
+`/merge/job` hand out. If it finds a block there that counts in full, that
+block's chain is the heavier one and every node follows it. The run is
+orphaned: its blocks pay their producer nothing, and their transactions go
+back to the mempool. The replacement carries those that still apply, so they
+are held up by a block, not lost.
+
+- **When:** only if the node's own block there would count in full (its
+  bond is under its cap there too) and outweigh the whole run. Never past a
+  block that counted in full, never past a block one of the node's own bonds
+  signed (that would throw away its own pay), never more than 100 blocks back
+  (`MAX_ORPHAN_DEPTH`, about an hour and forty minutes), and never below the
+  finalized checkpoint.
+- **Consensus is unchanged:** fork choice has always taken the heavier chain.
+  A node takes a block on one of the last 100 blocks below its tip that
+  outweighs its tip by itself as soon as it has checked it against the state
+  there, without a sync session, and relays it on.
+- **What it changes:** the cost of signing past the cap. An over-cap block
+  used to keep `cap / n` of its subsidy and lose fork races only to blocks
+  that happened to compete with it. Now any producer under its cap replaces
+  it, so it keeps nothing, and its room and fees go to a block that counts.
+  A producer keeps its blocks by bonding enough to cover them: about `360 × s`
+  bonds for a share `s` of the hashrate.
+- **Templates say where they build:** `/mining/template` and `/merge/job`
+  answer `prev_hash`, the block the template builds on, and `orphans`, how
+  many blocks its block would replace (0 on the tip). `"orphan_over_cap":
+  false` in the request keeps a template on the tip. The pool
+  (`midwimble pool`) asks for that: its draw is seeded by the block a job
+  builds on, and only a block newer than the window it pays keeps the pool
+  from knowing the seed when it freezes that window. `/state` reports
+  `orphaning`: the height the node builds at instead of the tip, the block it
+  builds on, and how many blocks a block there replaces.
+- **Turning it off:** `midwimble node --no-orphan-over-cap` always builds on
+  the tip.
+
+The explorer marks over-cap blocks, and counts a block's *full-weight
+confirmations* beside its confirmations: the full-weight blocks from it to
+the tip, itself included. Only those cost bonds to undo. A block with none,
+however many confirmations it has, is one full-weight block away from being
+replaced; a payment is settled by its full-weight confirmations.
+
 ## Still to build
 
 - **Paying co-bond contributors.** The node signs with co-bonds, but the

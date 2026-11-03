@@ -1916,7 +1916,14 @@ async fn build_job(
         })
         .collect::<Result<_>>()?;
     let extra = job_commitment(&paying.root, &next.root);
-    let body = json!({ "payouts": payouts, "extra": hex::encode(extra) });
+    // On the tip, never past a run of over-cap blocks (`core::orphan`): the
+    // draw is seeded with the block a job builds on, and only the tip is new
+    // enough that the paying window was frozen before it existed.
+    let body = json!({
+        "payouts": payouts,
+        "extra": hex::encode(extra),
+        "orphan_over_cap": false,
+    });
     let node = state.cfg.node_rpc.clone();
     let tpl =
         tokio::task::spawn_blocking(move || RpcClient::new(node).post("/mining/template", &body))

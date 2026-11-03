@@ -55,6 +55,7 @@ Two endpoints on the midwimble node, and no new process:
 { "payouts": [ { "address": "mw1…", "weight": 41 }, … ] }
 → { "commitment": "<32 bytes hex>", "target": "<32 bytes hex>",
     "mining_hash": "<32 bytes hex>", "height": 1234,
+    "prev_hash": "<32 bytes hex>", "orphans": 0,
     "reward": 23932616, "pow": "blake3-chain" }
 ```
 
@@ -64,6 +65,15 @@ and returns the commitment to plant plus the target a share must beat to be a
 midwimble block. `reward` is what that block mints, subsidy plus fees, in base
 units; midstate's pool passes it on to browser miners, which estimate their
 earnings with it. `pow` is the proof of work the block takes.
+
+`prev_hash` is the block the template builds on, normally midwimble's tip.
+While the tip is a run of other producers' over-cap blocks, the node builds
+on the block before the run instead, if its bond counts in full there
+(`docs/BONDED_POW.md`, orphaning over-cap blocks): the block outweighs the
+whole run and replaces it. `orphans` says how many blocks it would replace,
+0 on the tip. Nothing changes for the pool: `/merge/found` takes the block
+just the same. `"orphan_over_cap": false` in the request keeps the template
+on the tip.
 
 **`POST /merge/found`** — the pool found one.
 
@@ -112,15 +122,18 @@ the proof itself rather than trusting the pool.
   dependency.
 - **Every bond lapses, or the node has none:** `/merge/job` fails, and the
   same thing happens. The pool keeps mining midstate.
-- **The pool is short of bonds:** nothing fails. Its blocks past the cap are
-  still valid and still pay, but add almost no weight, so they lose fork races.
-  Add bonds or co-bonds.
+- **The pool is short of bonds:** nothing fails at first. Its blocks past the
+  cap are still valid, but add almost no weight, so a producer under its own
+  cap replaces them with a single block (`docs/BONDED_POW.md`, orphaning
+  over-cap blocks), and replaced blocks pay nothing. Add bonds or co-bonds.
 - **A midwimble block is rejected:** the midstate block, if the share cleared
   midstate's target too, is unaffected. The two submissions are independent.
 - **Refreshing jobs:** a commitment names one midwimble block, so a job's
   commitment goes stale when midwimble's tip moves. The pool should refresh
   jobs on midwimble's tip as well as midstate's. A stale commitment costs
-  nothing; those shares simply don't yield midwimble blocks.
+  nothing; those shares simply don't yield midwimble blocks, unless every
+  block since was over cap and the job's own counts in full: then the node
+  still takes it, and it replaces them.
 
 ## Paying miners in midwimble
 

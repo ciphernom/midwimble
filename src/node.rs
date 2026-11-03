@@ -41,13 +41,14 @@ use crate::anchor::{load_records, load_records_from, AnchorRecord};
 use crate::core::auxpow::verify_pow_near;
 use crate::core::filter::CompactFilter;
 use crate::core::mw::{Context, StealthAddress, Transaction};
+use crate::core::orphan::{orphan_template, orphanable_run, OrphanBase, MAX_ORPHAN_DEPTH};
 use crate::core::relay::{MidstateHeaders, RelayFeed};
 use crate::core::snapshot::Snapshot;
 use crate::core::state::{apply_batch, apply_batch_skip_pow, choose_best_state};
-use crate::core::template::select_transactions;
+use crate::core::template::{select_transactions, transaction_budget};
 use crate::core::types::{
-    compute_header_hash, utxo_leaf, Batch, BatchHeader, State, DIFFICULTY_LOOKBACK, KERNEL_WEIGHT,
-    MAX_BLOCK_WEIGHT, MEDIAN_TIME_PAST_WINDOW, OUTPUT_WEIGHT,
+    compute_header_hash, utxo_leaf, Batch, BatchHeader, State, DIFFICULTY_LOOKBACK,
+    MEDIAN_TIME_PAST_WINDOW,
 };
 use crate::finality::{
     precheck, verify_evidence, CheckedLinks, FinalityConfig, FinalityTracker, RecordFault,
@@ -168,6 +169,11 @@ pub struct NodeConfig {
     pub midstate_rpc: Option<String>,
     /// How often the midstate node is polled.
     pub relay_poll: Duration,
+    /// When the tip is a run of other producers' over-cap blocks, build this
+    /// node's blocks (its own miner's, and the templates its RPC hands out)
+    /// on the last block before the run, so a full-weight block of ours
+    /// replaces it (`core::orphan`). On unless turned off.
+    pub orphan_over_cap: bool,
     /// Test builds only: extra time each synced header takes to verify,
     /// standing in for a slow machine.
     #[cfg(feature = "fast-mining")]
@@ -198,6 +204,7 @@ impl NodeConfig {
             ban_duration: Duration::from_secs(BAN_SECS),
             midstate_rpc: None,
             relay_poll: Duration::from_secs(20),
+            orphan_over_cap: true,
             #[cfg(feature = "fast-mining")]
             header_verify_delay: Duration::ZERO,
         }
@@ -254,6 +261,10 @@ pub struct NodeInfo {
     pub anchors_known: usize,
     /// Peers banned now, soonest to be heard again first.
     pub banned: Vec<BannedPeer>,
+    /// Where templates go while the tip is a run of other producers'
+    /// over-cap blocks (`core::orphan`): `None` while it is not, or while
+    /// orphaning is turned off. The template RPC builds there first.
+    pub orphan_base: Option<Arc<OrphanBase>>,
 }
 
 pub enum Command {
@@ -441,6 +452,21 @@ enum Internal {
         from: Option<PeerId>,
         pow_ok: bool,
     },
+    /// A block on the block at `parent` (below the tip) applied to the state
+    /// there: the state it leaves, and the timestamps up to and including
+    /// it.
+    ForkBlockChecked {
+        parent: u64,
+        batch: Batch,
+        from: Option<PeerId>,
+        result: std::result::Result<(State, Vec<u64>), ForkCheckError>,
+    },
+    /// The state after the block `parent`, derived from undo records for an
+    /// orphan base, with the timestamps up to and including that block.
+    OrphanBaseDerived {
+        parent: [u8; 32],
+        result: Result<(State, Vec<u64>)>,
+    },
     TxValidated {
         tx: Transaction,
         origin: TxOrigin,
@@ -532,6 +558,52 @@ impl OrphanPool {
     }
 }
 
+/// Where this node builds for the tip it was worked out for: on the tip, or
+/// past a run of other producers' over-cap blocks (`core::orphan`).
+#[derive(Default)]
+struct OrphanPlan {
+    /// The tip this plan is for.
+    tip: [u8; 32],
+    /// The run's base, once its state is to hand. `None` while there is no
+    /// run to orphan, or while the base's state is being derived.
+    base: Option<Arc<OrphanBase>>,
+    /// This node's own miner tried the base for this tip, and its block
+    /// there would not have counted in full or outweighed the tip.
+    declined: bool,
+    /// Whether this node's own miner has said it is building on the base.
+    announced: bool,
+    /// The parent whose state is being derived from undo records, and the
+    /// last state derived that way, kept until a plan uses it.
+    deriving: Option<[u8; 32]>,
+    derived: Option<(State, Vec<u64>)>,
+}
+
+/// Blocks on an earlier parent than the tip (`Node::check_fork_block`)
+/// checked at once.
+const MAX_FORK_CHECKS: usize = 4;
+
+/// Why a block on an earlier parent was not taken.
+enum ForkCheckError {
+    /// It does not apply on its parent: the block is invalid.
+    Invalid(anyhow::Error),
+    /// Its parent's state could not be worked out (the chain was
+    /// reorganised meanwhile, say): nothing is known about the block.
+    Unavailable(anyhow::Error),
+}
+
+/// The state after the block at height `parent`, from undo records below
+/// `current` (the tip when asked), and the timestamps up to and including
+/// that block.
+fn derive_state_after(
+    storage: &Storage,
+    current: &State,
+    parent: u64,
+) -> Result<(State, Vec<u64>)> {
+    let state = storage.state_at(current, parent + 1)?;
+    let timestamps = storage.load_timestamps(parent + 1, DIFFICULTY_LOOKBACK)?;
+    Ok((state, timestamps))
+}
+
 /// What `on_headers` decided, acted on once the session is back in place.
 enum HeaderStep {
     Continue,
@@ -560,6 +632,10 @@ pub struct Node {
     recent_blocks: VecDeque<[u8; 32]>,
     block_validation: Option<[u8; 32]>,
     block_queue: VecDeque<(Batch, Option<PeerId>)>,
+    /// Blocks on an earlier parent being checked (`check_fork_block`).
+    fork_checking: HashSet<[u8; 32]>,
+    /// Where this node builds (`core::orphan`).
+    orphan: OrphanPlan,
     sync: Option<SyncSession>,
     next_session_id: u64,
     sync_stats: SyncStats,
@@ -713,6 +789,7 @@ impl Node {
             finality: storage.finality()?,
             anchors_known: 0,
             banned: Vec::new(),
+            orphan_base: None,
         }));
         // Headers the producer's bond files carry, for registrations the
         // relay cannot back yet. A live midstate node's view replaces them.
@@ -754,6 +831,8 @@ impl Node {
             recent_blocks: VecDeque::new(),
             block_validation: None,
             block_queue: VecDeque::new(),
+            fork_checking: HashSet::new(),
+            orphan: OrphanPlan::default(),
             sync: None,
             next_session_id: 1,
             sync_stats: SyncStats::default(),
@@ -865,8 +944,15 @@ impl Node {
 
     fn publish_info(&mut self) {
         self.sync_stats.batch_sources = self.batch_sources.len();
+        // Templates the RPC builds go where this node's own would.
+        self.plan_orphaning();
         let mut info = self.info.write().expect("node info lock poisoned");
         info.state = self.state.clone();
+        info.orphan_base = self
+            .orphan
+            .base
+            .clone()
+            .filter(|b| b.tip == self.state.header_hash);
         info.peers = self
             .network
             .connected_peers()
@@ -1362,6 +1448,15 @@ impl Node {
                 from,
                 pow_ok,
             } => self.on_orphan_checked(batch, from, pow_ok),
+            Internal::ForkBlockChecked {
+                parent,
+                batch,
+                from,
+                result,
+            } => self.on_fork_block_checked(parent, batch, from, result),
+            Internal::OrphanBaseDerived { parent, result } => {
+                self.on_orphan_base_derived(parent, result)
+            }
             Internal::TxValidated { tx, origin, result } => {
                 self.on_tx_validated(tx, origin, result)
             }
@@ -1453,7 +1548,12 @@ impl Node {
             let _ = reply.send(Err(anyhow!("node is syncing; template is stale")));
             return;
         }
-        if batch.prev_header_hash != self.state.header_hash {
+        // A block on an earlier block than the tip (a template that orphans
+        // a run of over-cap blocks, or one the tip has since passed) is
+        // taken where it makes the heavier chain (`check_fork_block`).
+        if batch.prev_header_hash != self.state.header_hash
+            && self.fork_parent(&batch.prev_header_hash).is_none()
+        {
             let _ = reply.send(Err(anyhow!("stale template: the chain tip has moved")));
             return;
         }
@@ -1474,6 +1574,7 @@ impl Node {
             || self.recent_blocks.contains(&hash)
             || self.block_validation == Some(hash)
             || self.orphan_checking.contains(&hash)
+            || self.fork_checking.contains(&hash)
             || self
                 .block_queue
                 .iter()
@@ -1485,6 +1586,8 @@ impl Node {
         if batch.prev_header_hash != self.state.header_hash {
             // Orphan: screen its proof of work off-thread before holding it.
             if self.orphan_checking.len() >= MAX_ORPHAN_CHECKS {
+                // A miner waiting on its block hears so.
+                self.resolve_block(&hash, Err("node busy".into()));
                 return;
             }
             self.orphan_checking.insert(hash);
@@ -1613,14 +1716,17 @@ impl Node {
     }
 
     fn on_orphan_checked(&mut self, batch: Batch, from: Option<PeerId>, pow_ok: bool) {
-        self.orphan_checking.remove(&batch.extension.final_hash);
+        let hash = batch.extension.final_hash;
+        self.orphan_checking.remove(&hash);
         if !pow_ok {
+            self.resolve_block(&hash, Err("invalid proof of work".into()));
             if let Some(peer) = from {
                 self.ban_peer(peer, "block with invalid proof of work");
             }
             return;
         }
         if self.chain_syncing() {
+            self.resolve_block(&hash, Err("node is syncing".into()));
             return;
         }
         if batch.prev_header_hash == self.state.header_hash {
@@ -1628,6 +1734,28 @@ impl Node {
             self.handle_new_batch(batch, from);
             return;
         }
+        // A block on one of the blocks just below the tip that outweighs the
+        // tip by itself: typically one that orphans a run of over-cap blocks
+        // (`core::orphan`), whether this node built it or a peer did. It is
+        // checked on its parent's state and, if it holds up, replaces
+        // everything after its parent, without a sync session.
+        let parent = self.fork_parent(&batch.prev_header_hash);
+        if let Some(parent) = parent.filter(|_| batch.chain_weight > self.state.weight()) {
+            self.check_fork_block(batch, from, parent);
+            return;
+        }
+        let Some(peer) = from else {
+            // This node's own (its miner's, or one the RPC took): there is
+            // no peer to ask for whatever it builds on.
+            self.resolve_block(
+                &hash,
+                Err(match parent {
+                    Some(_) => "the block does not outweigh the chain's tip".into(),
+                    None => "stale template: the chain tip has moved".into(),
+                }),
+            );
+            return;
+        };
         let ours = primitive_types::U256::from_big_endian(&self.state.target);
         let theirs = primitive_types::U256::from_big_endian(&batch.target);
         let (limit, overflow) = ours.overflowing_mul(primitive_types::U256::from(16u64));
@@ -1635,9 +1763,171 @@ impl Node {
             return;
         }
         self.orphans.insert(batch);
-        if let Some(peer) = from {
-            self.network.send(peer, Message::GetState);
+        self.network.send(peer, Message::GetState);
+    }
+
+    /// The height of the block `hash` names on this node's chain, if it is
+    /// one of the [`MAX_ORPHAN_DEPTH`] blocks below the tip and a block on it
+    /// would be at or above the finalized floor: a parent a block may be
+    /// taken on, replacing everything after it (`check_fork_block`).
+    fn fork_parent(&self, hash: &[u8; 32]) -> Option<u64> {
+        let tip = self.state.height.checked_sub(1)?;
+        let lowest = tip
+            .saturating_sub(MAX_ORPHAN_DEPTH)
+            .max(self.finality.floor().saturating_sub(1));
+        if lowest >= tip {
+            return None;
         }
+        self.storage
+            .load_headers(lowest, tip - lowest)
+            .ok()?
+            .iter()
+            .find(|h| h.extension.final_hash == *hash)
+            .map(|h| h.height)
+    }
+
+    /// The state after the block `hash` at height `height`, and the
+    /// timestamps up to and including it, if this node has it to hand: the
+    /// orphan base, a state derived for one, or the cache of recent states.
+    fn state_after(&self, height: u64, hash: &[u8; 32]) -> Option<(State, Vec<u64>)> {
+        if let Some(base) = self.orphan.base.as_ref().filter(|b| b.parent() == *hash) {
+            return Some((base.state.clone(), base.timestamps.clone()));
+        }
+        if let Some((state, ts)) = self.orphan.derived.as_ref() {
+            if state.header_hash == *hash {
+                return Some((state.clone(), ts.clone()));
+            }
+        }
+        self.state_cache
+            .get(&(height + 1))
+            .filter(|(s, _)| s.header_hash == *hash)
+            .map(|(s, ts)| (s.clone(), ts.iter().copied().collect()))
+    }
+
+    /// Checks `batch`, a block on the block at height `parent` below the tip,
+    /// against the state there, off the event loop
+    /// (`on_fork_block_checked`).
+    fn check_fork_block(&mut self, batch: Batch, from: Option<PeerId>, parent: u64) {
+        let hash = batch.extension.final_hash;
+        if self.fork_checking.contains(&hash) {
+            return;
+        }
+        if self.fork_checking.len() >= MAX_FORK_CHECKS {
+            self.resolve_block(&hash, Err("node busy".into()));
+            return;
+        }
+        self.fork_checking.insert(hash);
+        let found = self.state_after(parent, &batch.prev_header_hash);
+        let (storage, current, tx) = (
+            self.storage.clone(),
+            self.state.clone(),
+            self.internal_tx.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            let result = match found {
+                Some(found) => Ok(found),
+                None => derive_state_after(&storage, &current, parent),
+            }
+            .map_err(ForkCheckError::Unavailable)
+            .and_then(|(mut state, mut timestamps)| {
+                apply_batch(&mut state, &batch, &timestamps).map_err(ForkCheckError::Invalid)?;
+                timestamps.push(batch.timestamp);
+                let excess = timestamps
+                    .len()
+                    .saturating_sub(DIFFICULTY_LOOKBACK as usize);
+                timestamps.drain(..excess);
+                Ok((state, timestamps))
+            });
+            let _ = tx.send(Internal::ForkBlockChecked {
+                parent,
+                batch,
+                from,
+                result,
+            });
+        });
+    }
+
+    fn on_fork_block_checked(
+        &mut self,
+        parent: u64,
+        batch: Batch,
+        from: Option<PeerId>,
+        result: std::result::Result<(State, Vec<u64>), ForkCheckError>,
+    ) {
+        let hash = batch.extension.final_hash;
+        self.fork_checking.remove(&hash);
+        let (candidate, timestamps) = match result {
+            Ok(checked) => checked,
+            Err(ForkCheckError::Invalid(e)) => {
+                tracing::debug!("Block on an earlier parent rejected: {:#}", e);
+                self.resolve_block(&hash, Err(format!("block rejected: {e:#}")));
+                if let Some(peer) = from {
+                    if !crate::core::state::is_future_timestamp(&e) {
+                        self.ban_peer(peer, "relayed an invalid block");
+                    }
+                }
+                return;
+            }
+            Err(ForkCheckError::Unavailable(e)) => {
+                // Not the block's fault: the chain moved while its parent's
+                // state was being worked out.
+                tracing::debug!("Could not check a block on an earlier parent: {:#}", e);
+                self.resolve_block(&hash, Err(format!("could not check the block: {e:#}")));
+                return;
+            }
+        };
+        if self.chain_syncing() {
+            self.resolve_block(&hash, Err("node started syncing".into()));
+            return;
+        }
+        // The tip may have moved meanwhile: the parent must still be on this
+        // chain, and the block must still make it heavier.
+        let on_chain = parent < self.state.height
+            && self
+                .storage
+                .load_header(parent)
+                .ok()
+                .flatten()
+                .is_some_and(|h| h.extension.final_hash == batch.prev_header_hash);
+        if !on_chain || candidate.weight() <= self.state.weight() {
+            self.resolve_block(
+                &hash,
+                Err("the block no longer outweighs the chain's tip".into()),
+            );
+            return;
+        }
+        let first = parent + 1;
+        if let Err(e) = self.storage.commit_chain(
+            first,
+            std::slice::from_ref(&batch),
+            std::slice::from_ref(&candidate.effects),
+            &candidate,
+        ) {
+            tracing::error!("Failed to persist block {}: {:#}", first, e);
+            self.resolve_block(&hash, Err(format!("storage error: {e:#}")));
+            return;
+        }
+        tracing::warn!(
+            "REORG: block {} at height {} outweighs the {} block(s) it replaces{}",
+            hex::encode(&hash[..8]),
+            first,
+            self.state.height - first,
+            if from.is_none() { " (ours)" } else { "" },
+        );
+        self.adopt_chain(
+            candidate,
+            timestamps.into(),
+            first,
+            std::slice::from_ref(&batch),
+            true,
+        );
+        self.publish_info();
+        self.resolve_block(&hash, Ok(()));
+        self.network.broadcast_except(from, Message::Batch(batch));
+        for child in self.orphans.take_children(&hash) {
+            self.handle_new_batch(child, None);
+        }
+        self.refresh_mining();
     }
 
     /// Adopts `state`, the result of applying `batch` at `height`.
@@ -3378,56 +3668,186 @@ impl Node {
             self.miner.stop();
             return;
         }
+        self.plan_orphaning();
         // Signed as this node's bond, whose registration rides in its blocks
         // (taking room from transactions) until the chain has it, as do the
         // midstate headers the relay lacks.
         let bond = self.config.mining_bond.clone();
-        let registration_weight = bond
-            .as_ref()
-            .filter(|b| !self.state.bonds.contains_key(&b.bond_id))
-            .and_then(|b| b.registration.as_ref())
-            .map_or(0, |r| r.weight());
-        let relay_weight = self.relay_proposal().map_or(0, |r| r.weight());
-        let budget = (MAX_BLOCK_WEIGHT - OUTPUT_WEIGHT - KERNEL_WEIGHT)
-            .saturating_sub(registration_weight)
-            .saturating_sub(relay_weight);
-        let txs = select_transactions(&self.mempool.candidates(), self.state.height, budget);
         let payouts = [(payout, 1u64)];
-        let state = &self.state;
-        let timestamps: &[u64] = self.timestamps.make_contiguous();
+        let pool = self.mempool.candidates();
         let feed = self.relay_feed.read().expect("relay feed lock poisoned");
-        let template = crate::core::template::build_template_relayed(
-            state,
-            timestamps,
-            &txs,
-            &payouts,
-            [0u8; 32],
-            None,
-            bond.as_ref(),
-            Some(&feed),
-        )
-        .or_else(|e| {
-            tracing::warn!(
-                "Template with {} transactions failed ({:#}); mining an empty block",
-                txs.len(),
-                e
-            );
-            crate::core::template::build_template_relayed(
-                state,
-                timestamps,
-                &[],
-                &payouts,
-                [0u8; 32],
-                None,
-                bond.as_ref(),
-                Some(&feed),
-            )
-        })
-        .map(|(t, _)| t);
+        // Past a run of other producers' over-cap blocks, on the block before
+        // it, while a block of ours there would count in full and outweigh
+        // the tip (`core::orphan`). Whether it would is the same for every
+        // template on this tip, so a refusal holds until the tip moves.
+        let base = self.orphan.base.clone().filter(|_| !self.orphan.declined);
+        let orphaning = base.as_ref().and_then(|b| {
+            orphan_template(b, &pool, &payouts, [0u8; 32], bond.as_ref(), Some(&feed))
+        });
+        let template = match orphaning {
+            Some((t, _)) => Ok(t),
+            None => {
+                if base.is_some() {
+                    self.orphan.declined = true;
+                }
+                let state = &self.state;
+                let timestamps: &[u64] = self.timestamps.make_contiguous();
+                let budget = transaction_budget(state, payouts.len(), bond.as_ref(), Some(&feed));
+                let txs = select_transactions(&pool, state.height, budget);
+                crate::core::template::build_template_relayed(
+                    state,
+                    timestamps,
+                    &txs,
+                    &payouts,
+                    [0u8; 32],
+                    None,
+                    bond.as_ref(),
+                    Some(&feed),
+                )
+                .or_else(|e| {
+                    tracing::warn!(
+                        "Template with {} transactions failed ({:#}); mining an empty block",
+                        txs.len(),
+                        e
+                    );
+                    crate::core::template::build_template_relayed(
+                        state,
+                        timestamps,
+                        &[],
+                        &payouts,
+                        [0u8; 32],
+                        None,
+                        bond.as_ref(),
+                        Some(&feed),
+                    )
+                })
+                .map(|(t, _)| t)
+            }
+        };
         drop(feed);
         match template {
-            Ok(t) => self.miner.start(t),
+            Ok(t) => {
+                if let Some(b) = base.filter(|b| b.height() == t.height) {
+                    if !self.orphan.announced {
+                        self.orphan.announced = true;
+                        tracing::info!(
+                            "Mining on block {} past {} over-cap block(s) by other producers: \
+                             a block there outweighs them",
+                            b.height() - 1,
+                            b.replaces()
+                        );
+                    }
+                }
+                self.miner.start(t)
+            }
             Err(e) => tracing::error!("Cannot build a block template: {:#}", e),
+        }
+    }
+
+    /// Works out where this node builds for the current tip
+    /// (`core::orphan`): past a run of other producers' over-cap blocks, on
+    /// the last block before it, if the tip ends one. The base's state comes
+    /// from the plan before (a run one block longer keeps its base), from the
+    /// cache of recent states, or else from undo records off the event loop,
+    /// the plan being made again once it arrives.
+    fn plan_orphaning(&mut self) {
+        let tip = self.state.header_hash;
+        // While a session downloads a heavier chain the tip is about to
+        // move; the plan is made once it has.
+        if self.orphan.tip == tip || self.chain_syncing() {
+            return;
+        }
+        let previous = self.orphan.base.take();
+        self.orphan.tip = tip;
+        self.orphan.declined = false;
+        self.orphan.announced = false;
+        let Some((parent, parent_hash, run_signers)) = self.orphan_run() else {
+            return;
+        };
+        let found = match previous.filter(|b| b.parent() == parent_hash) {
+            Some(b) => Some((b.state.clone(), b.timestamps.clone())),
+            None => self.state_after(parent, &parent_hash),
+        };
+        match found {
+            Some((state, timestamps)) => {
+                self.orphan.derived = None;
+                self.orphan.base = Some(Arc::new(OrphanBase {
+                    state,
+                    timestamps,
+                    tip,
+                    tip_weight: self.state.weight(),
+                    run_signers,
+                    carried: self.reorg_cache.since(parent + 1),
+                }));
+            }
+            // One derivation at a time; the plan is made again when it ends.
+            None if self.orphan.deriving.is_some() => {}
+            None => {
+                self.orphan.deriving = Some(parent_hash);
+                let (storage, current, tx) = (
+                    self.storage.clone(),
+                    self.state.clone(),
+                    self.internal_tx.clone(),
+                );
+                tokio::task::spawn_blocking(move || {
+                    let result = derive_state_after(&storage, &current, parent);
+                    let _ = tx.send(Internal::OrphanBaseDerived {
+                        parent: parent_hash,
+                        result,
+                    });
+                });
+            }
+        }
+    }
+
+    /// The run of other producers' over-cap blocks ending at the tip that
+    /// this node builds past: the height and hash of the block before it,
+    /// and who signed each of its blocks, oldest first. `None` when there is
+    /// no such run, or orphaning is turned off. The run stops short of the
+    /// finalized floor, which no block may replace.
+    fn orphan_run(&self) -> Option<(u64, [u8; 32], Vec<Option<[u8; 32]>>)> {
+        if !self.config.orphan_over_cap {
+            return None;
+        }
+        let tip = self.state.height.checked_sub(1)?;
+        let lowest = tip
+            .saturating_sub(MAX_ORPHAN_DEPTH)
+            .max(self.finality.floor().saturating_sub(1));
+        let headers = self.storage.load_headers(lowest, tip + 1 - lowest).ok()?;
+        if headers.last().map(|h| h.extension.final_hash) != Some(self.state.header_hash) {
+            return None;
+        }
+        let bond = self.config.mining_bond.as_ref();
+        let ours = |id: &[u8; 32]| {
+            bond.is_some_and(|b| b.bond_id == *id || b.co_bonds.iter().any(|c| c.bond_id == *id))
+        };
+        let run = orphanable_run(&headers, ours, MAX_ORPHAN_DEPTH) as usize;
+        if run == 0 || run >= headers.len() {
+            return None;
+        }
+        let base = &headers[headers.len() - 1 - run];
+        let signers = headers[headers.len() - run..]
+            .iter()
+            .map(|h| h.signer)
+            .collect();
+        Some((base.height, base.extension.final_hash, signers))
+    }
+
+    fn on_orphan_base_derived(&mut self, parent: [u8; 32], result: Result<(State, Vec<u64>)>) {
+        if self.orphan.deriving == Some(parent) {
+            self.orphan.deriving = None;
+        }
+        match result {
+            Ok(derived) => {
+                self.orphan.derived = Some(derived);
+                // Plan again, with it to hand.
+                self.orphan.tip = [0; 32];
+                self.plan_orphaning();
+                self.publish_info();
+                self.refresh_mining();
+            }
+            // Planned again when the tip next moves.
+            Err(e) => tracing::debug!("Could not derive an orphan base: {:#}", e),
         }
     }
 

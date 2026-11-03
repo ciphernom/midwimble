@@ -509,6 +509,14 @@ async fn state(AxState(node): AxState<NodeHandle>) -> Json<Value> {
         "mempool_weight": info.mempool_weight,
         "mining": info.mining,
         "hashes": info.hashes,
+        // While the tip is a run of other producers' over-cap blocks: the
+        // block this node's templates build on instead, and how many blocks
+        // a block there replaces (`core::orphan`).
+        "orphaning": info.orphan_base.as_ref().map(|b| json!({
+            "height": b.height(),
+            "prev_hash": hex::encode(b.parent()),
+            "replaces": b.replaces(),
+        })),
     }))
 }
 
@@ -821,13 +829,17 @@ async fn merge_job(
     AxState(node): AxState<NodeHandle>,
     Json(body): Json<TemplateBody>,
 ) -> ApiResult {
-    let (template, _) = build_mining_template(&node, body).await?;
+    let (template, _, orphans) = build_mining_template(&node, body).await?;
     let commitment = crate::core::auxpow::merge_commitment(&template.mining_hash);
     let answer = json!({
         "commitment": hex::encode(commitment),
         "target": hex::encode(template.batch.target),
         "mining_hash": hex::encode(template.mining_hash),
         "height": template.height,
+        // The block it builds on, and how many over-cap blocks after that
+        // one it replaces (`core::orphan`): 0 for a block on the tip.
+        "prev_hash": hex::encode(template.batch.prev_header_hash),
+        "orphans": orphans,
         // What the block mints, subsidy plus fees: pools pass it on to
         // browser miners, which estimate their earnings with it.
         "reward": template.subsidy.saturating_add(template.fees),
@@ -884,11 +896,25 @@ struct TemplateBody {
     payouts: Vec<PayoutWeight>,
     #[serde(default)]
     extra: Option<String>,
+    /// `false` keeps the template on the tip even while the node would build
+    /// past a run of over-cap blocks (`core::orphan`): for a caller that
+    /// needs its block to follow the tip it announced, as the pool's draw
+    /// does. Absent, the node's own setting stands.
+    #[serde(default)]
+    orphan_over_cap: Option<bool>,
 }
 
-/// A block template for external miners (pools, merged miners, GPUs).
-/// Builds a signed block template for an external miner: pools, merged
-/// miners and GPUs all come through here.
+/// The tip, and the bond, for which a block on the base was found not to
+/// count in full or not to outweigh the run (`core::orphan::orphan_template`),
+/// so later templates on that tip go straight to the tip.
+type Declined = Option<([u8; 32], Option<[u8; 32]>)>;
+static ORPHAN_DECLINED: std::sync::Mutex<Declined> = std::sync::Mutex::new(None);
+
+/// A signed block template for an external miner: pools, merged miners and
+/// GPUs all come through here. While the tip is a run of other producers'
+/// over-cap blocks, it builds on the block before the run where the node's
+/// bond counts in full there (`core::orphan`), as the node's own miner does;
+/// the caller hears how many blocks it would replace.
 async fn build_mining_template(
     node: &NodeHandle,
     body: TemplateBody,
@@ -896,6 +922,7 @@ async fn build_mining_template(
     (
         crate::core::template::BlockTemplate,
         Vec<(StealthAddress, crate::core::mw::PayoutReceipt)>,
+        u64,
     ),
     (StatusCode, Json<Value>),
 > {
@@ -914,25 +941,45 @@ async fn build_mining_template(
         return Err(bad("node is syncing"));
     }
     let state = info.state;
+    let bond = node.mining_bond();
+    let signer = bond.as_ref().map(|b| b.bond_id);
+    let declined = *ORPHAN_DECLINED.lock().map_err(|e| bad(e.to_string()))?;
+    let base = info
+        .orphan_base
+        .filter(|_| body.orphan_over_cap.unwrap_or(true))
+        .filter(|b| b.tip == state.header_hash && declined != Some((b.tip, signer)));
     let timestamps = node
         .storage()
         .load_timestamps(state.height, crate::core::types::DIFFICULTY_LOOKBACK)
         .map_err(bad)?;
     let pool = node.mempool().await.map_err(bad)?;
-    let bond = node.mining_bond();
     let feed = node.relay_feed();
-    let (template, receipts) = tokio::task::spawn_blocking(move || {
-        use crate::core::types::{KERNEL_WEIGHT, MAX_BLOCK_WEIGHT, OUTPUT_WEIGHT};
+    let built = tokio::task::spawn_blocking(move || {
         let feed = feed.read().expect("relay feed lock poisoned");
-        let registration_weight = bond
-            .as_ref()
-            .filter(|b| !state.bonds.contains_key(&b.bond_id))
-            .and_then(|b| b.registration.as_ref())
-            .map_or(0, |r| r.weight());
-        let relay_weight = feed.next_for(&state.relay).map_or(0, |r| r.weight());
-        let budget = (MAX_BLOCK_WEIGHT - (payouts.len() as u64) * OUTPUT_WEIGHT - KERNEL_WEIGHT)
-            .saturating_sub(registration_weight)
-            .saturating_sub(relay_weight);
+        if let Some(base) = &base {
+            let orphaning = crate::core::orphan::orphan_template(
+                base,
+                &pool,
+                &payouts,
+                extra,
+                bond.as_ref(),
+                Some(&feed),
+            );
+            match orphaning {
+                Some((template, receipts)) => return Ok((template, receipts, base.replaces())),
+                None => {
+                    if let Ok(mut d) = ORPHAN_DECLINED.lock() {
+                        *d = Some((base.tip, signer));
+                    }
+                }
+            }
+        }
+        let budget = crate::core::template::transaction_budget(
+            &state,
+            payouts.len(),
+            bond.as_ref(),
+            Some(&feed),
+        );
         let txs = crate::core::template::select_transactions(&pool, state.height, budget);
         let build = |txs: &[crate::core::mw::Transaction]| {
             crate::core::template::build_template_relayed(
@@ -946,12 +993,14 @@ async fn build_mining_template(
                 Some(&feed),
             )
         };
-        build(&txs).or_else(|_| build(&[]))
+        build(&txs)
+            .or_else(|_| build(&[]))
+            .map(|(template, receipts)| (template, receipts, 0))
     })
     .await
     .map_err(bad)?
     .map_err(bad)?;
-    Ok((template, receipts))
+    Ok(built)
 }
 
 /// Recent templates by mining hash, newest last.
@@ -1025,7 +1074,7 @@ async fn mining_template(
     AxState(node): AxState<NodeHandle>,
     Json(body): Json<TemplateBody>,
 ) -> ApiResult {
-    let (template, receipts) = build_mining_template(&node, body).await?;
+    let (template, receipts, orphans) = build_mining_template(&node, body).await?;
     {
         let mut templates = mining_templates().lock().map_err(|e| bad(e.to_string()))?;
         templates.push_back((template.mining_hash, template.clone()));
@@ -1050,6 +1099,8 @@ async fn mining_template(
         "pow": crate::core::types::pow_algo_at(template.height).name(),
         "target": hex::encode(template.batch.target),
         "mining_hash": hex::encode(template.mining_hash),
+        "prev_hash": hex::encode(template.batch.prev_header_hash),
+        "orphans": orphans,
         "reward": template.subsidy,
         "fees": template.fees,
         "template_hex": hex::encode(bincode::serialize(&template.batch).map_err(bad)?),

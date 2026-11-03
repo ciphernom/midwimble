@@ -545,3 +545,100 @@ fn a_relay_far_behind_catches_up_before_the_first_bond_registers() {
         .to_string();
     assert!(err.contains("a registered bond could sign it"), "{err}");
 }
+
+/// Applies `batch` to `chain`, keeping its header (height filled in) as
+/// storage would.
+fn apply_keeping(chain: &mut Chain, batch: &Batch, headers: &mut Vec<BatchHeader>) {
+    let mut header = batch.header();
+    header.height = chain.state.height;
+    chain.apply(batch);
+    headers.push(header);
+}
+
+/// Orphaning over-cap blocks (`core::orphan`), on the production cap. With
+/// enough bonds registered that each signs only a handful of the window at
+/// full weight, one producer signs past its cap. Another, under its own cap,
+/// builds on the last block before that run: its block counts in full,
+/// outweighs the whole run, and applies there. The producer that signed the
+/// run is sent to the tip: past its own blocks lies only its own lost pay.
+#[test]
+fn a_block_under_its_cap_outweighs_a_run_of_over_cap_blocks() {
+    use super::orphan::{orphan_template, orphanable_run, OrphanBase, MAX_ORPHAN_DEPTH};
+    let mut chain = Chain::new();
+    for seed in 100..=250 {
+        with_bond(&mut chain, seed, locked_long());
+    }
+    let big = with_bond(&mut chain, 7, locked_long());
+    let small = with_bond(&mut chain, 9, locked_long());
+    let cap = signer_cap(&chain.state.bonds, chain.next_stamp());
+    assert!(cap < 16, "a handful of full-weight blocks a bond ({cap})");
+
+    let mut headers = Vec::new();
+    for _ in 0..cap {
+        let (parent, creditable) = (chain.state.weight(), chain.creditable());
+        let block = chain.template(Some(&big)).unwrap().batch;
+        apply_keeping(&mut chain, &block, &mut headers);
+        assert_eq!(chain.state.weight(), parent + creditable, "under its cap");
+    }
+    let (base_state, base_ts) = (chain.state.clone(), chain.ts.clone());
+    for _ in 0..3 {
+        let (parent, creditable) = (chain.state.weight(), chain.creditable());
+        let block = chain.template(Some(&big)).unwrap().batch;
+        apply_keeping(&mut chain, &block, &mut headers);
+        assert_eq!(
+            chain.state.weight(),
+            parent + sliver(creditable),
+            "over its cap"
+        );
+    }
+
+    // The run, as each producer sees it from the headers alone.
+    let is = |id: [u8; 32]| move |x: &[u8; 32]| *x == id;
+    assert_eq!(
+        orphanable_run(&headers, is(small.bond_id), MAX_ORPHAN_DEPTH),
+        3
+    );
+    assert_eq!(
+        orphanable_run(&headers, is(big.bond_id), MAX_ORPHAN_DEPTH),
+        0
+    );
+
+    let base = OrphanBase {
+        state: base_state.clone(),
+        timestamps: base_ts.clone(),
+        tip: chain.state.header_hash,
+        tip_weight: chain.state.weight(),
+        run_signers: vec![Some(big.bond_id); 3],
+        carried: Vec::new(),
+    };
+    let payout = [(WalletKeys::random().address(), 1)];
+    let (template, _) = orphan_template(&base, &[], &payout, [0; 32], Some(&small), None)
+        .expect("a full-weight block on the base");
+    assert_eq!(template.height, base_state.height);
+    assert_eq!(template.batch.prev_header_hash, base_state.header_hash);
+    assert_eq!(
+        template.batch.miner.as_ref().unwrap().bond_id,
+        small.bond_id
+    );
+    assert!(
+        template.batch.chain_weight > chain.state.weight(),
+        "outweighs the run"
+    );
+
+    // It applies on the base, and the chain it makes is the heavier one.
+    let at_base = Chain {
+        state: base_state,
+        ts: base_ts,
+    };
+    let replaced = at_base.try_apply(&template.batch).unwrap();
+    assert_eq!(replaced.weight(), template.batch.chain_weight);
+    assert!(std::ptr::eq(
+        crate::core::choose_best_state(&chain.state, &replaced),
+        &replaced
+    ));
+
+    // The run's own producer builds on the tip, and so does anyone without
+    // a bond: an unsigned block counts for a sliver.
+    assert!(orphan_template(&base, &[], &payout, [0; 32], Some(&big), None).is_none());
+    assert!(orphan_template(&base, &[], &payout, [0; 32], None, None).is_none());
+}

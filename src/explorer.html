@@ -105,6 +105,8 @@
   @keyframes slidein { from { opacity: 0; transform: translateX(-26px); } }
   .train .hh { font: 600 15px var(--mono); color: var(--lilac); }
   .train .sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .train a.light { border-style: dashed; border-color: rgba(245, 196, 81, .45); }
+  .train a.light .hh, .train .sub.light { color: var(--amber); }
   svg a { cursor: pointer; }
   svg a:hover rect, svg a:hover circle, svg a:hover path { opacity: 1; }
   .txrow { border-bottom: 1px solid var(--line); }
@@ -699,6 +701,11 @@ function signerHeatmap(r) {
 }
 
 // ---------- shared block table --------------------------------------------
+// A block that added only a sliver of its work to fork choice: over its
+// signer's cap (or unsigned). Valid, but one full-weight block on the block
+// below it outweighs it, so it is the first thing a reorganisation takes.
+const LIGHT_NOTE = "over cap: adds 1/1024 of its work to fork choice, so a full-weight block on the block below it would orphan it";
+const overCap = () => h("span", { class: "tag warn", title: LIGHT_NOTE }, "over cap");
 function blockRows(blocks) {
   return blocks.map(b => [
     link("block", b.height, num(b.height)),
@@ -709,6 +716,7 @@ function blockRows(blocks) {
     num(b.size),
     b.miner ? link("bond", b.miner) : h("span", { class: "dim" }, "unsigned"),
     [tag(b.merged ? "merged" : "native", b.merged ? "merge-mined" : "native"),
+     b.full_weight === false ? overCap() : null,
      b.registrations ? tag("ok", "+" + b.registrations + " bond") : null],
   ]);
 }
@@ -732,11 +740,13 @@ function blockTrain(blocks) {
   let rebuilt = false;
   const card = b => {
     const age = h("div", { class: "sub" }, ago(b.timestamp));
-    const el = h("a", { href: "#/block/" + b.height },
+    const light = b.full_weight === false;
+    const el = h("a", { href: "#/block/" + b.height, class: light ? "light" : null, title: light ? LIGHT_NOTE : null },
       h("div", { class: "hh" }, num(b.height)),
       age,
       h("div", { class: "sub" }, (b.kernels || 0) + " tx \u00b7 " + num(b.size) + " B"),
-      h("div", { class: "sub" }, b.merged ? "merge-mined" : "native"));
+      light ? h("div", { class: "sub light" }, "over cap")
+            : h("div", { class: "sub" }, b.merged ? "merge-mined" : "native"));
     el._ts = b.timestamp;
     el._age = age;
     return el;
@@ -816,9 +826,17 @@ async function overview() {
     h("div", { class: "chart" }, h("div", { class: "k" }, "block interval · last " + intervals.length + " · dashed = 60s · click a bar"),
       intervalChart(intervals, 60, i => "#/block/" + timed[i].height)),
     h("div", { class: "chart" }, h("div", { class: "k" }, "difficulty (bits) · last " + blocks.length), lineChart(blocks.map(b => b.difficulty_bits).reverse())));
+  // The tip ends a run of over-cap blocks: one full-weight block on the
+  // block before them outweighs the lot, and producers build there.
+  const run = s.orphaning;
+  const runNote = run && h("div", { class: "note" },
+    h("span", { class: "hot" }, num(run.replaces) + " over-cap block" + (run.replaces === 1 ? "" : "s") + " at the tip. "),
+    "Together they add less to fork choice than one full-weight block, so a full-weight block on ",
+    link("block", run.height - 1, "block " + num(run.height - 1)),
+    " would orphan them all.");
   view.replaceChildren(
     section("Chain", "refreshes every 10s", stats, charts),
-    section("Latest blocks", h("a", { href: "#/blocks" }, "all blocks →"), blockTrain(blocks), blockTable(blocks.slice(0, 15))),
+    section("Latest blocks", h("a", { href: "#/blocks" }, "all blocks →"), blockTrain(blocks), blockTable(blocks.slice(0, 15)), runNote),
     section("Mining bonds", h("a", { href: "#/bonds" }, "details →"), bondTable(bonds)));
   schedule(overview, 10000);
 }
@@ -846,14 +864,35 @@ function outputRows(outputs) {
   ]);
 }
 
+// How settled a block is (`burial` in explorer.rs): its confirmations, and
+// how many of them counted in full in fork choice. Only those cost anything
+// to undo; over-cap blocks on top add a sliver each, and a block with none
+// at full weight can be orphaned by a single full-weight block.
+function burialText(x) {
+  const n = x.confirmations, f = x.full_weight_confirmations;
+  const text = num(n) + " confirmation" + (n === 1 ? "" : "s");
+  if (x.finalized) return text + " · finalized";
+  return f == null ? text : text + " · " + num(f) + " at full weight";
+}
+function burialNote(x) {
+  if (x.finalized) return "below the finalized checkpoint: no reorganisation can replace it";
+  const f = x.full_weight_confirmations;
+  if (f == null) return "deeper than any reorganisation this node will make";
+  if (f === 0) return "nothing at full weight yet: one full-weight block on an earlier block could replace it";
+  return "replacing it takes a branch heavier than " + num(f) + " full-weight block" + (f === 1 ? "" : "s");
+}
+
 async function blockPage(m) {
   const b = await get("/explorer/block/" + m[1]);
   const prev = b.height > 0 ? h("a", { class: "btn", href: "#/block/" + (b.height - 1) }, "← " + num(b.height - 1)) : h("span", { class: "btn off" }, "←");
   const next = b.next_hash ? h("a", { class: "btn", href: "#/block/" + (b.height + 1) }, num(b.height + 1) + " →") : h("span", { class: "btn off" }, "tip");
   const cb = b.coinbase;
+  const weight = b.full_weight == null ? null
+    : b.full_weight ? h("span", null, tag("ok", "full weight"), h("span", { class: "dim" }, " all its work counts in fork choice"))
+    : h("span", null, overCap(), h("span", { class: "dim" }, " counts 1/1024 of its work: a full-weight block on block " + num(b.height - 1) + " would orphan it"));
   const parts = [
     h("div", { class: "title" }, h("h1", null, "Block " + num(b.height)), h("span", { class: "dim" }, utc(b.timestamp) + " · " + ago(b.timestamp)), h("div", { class: "pager" }, prev, next)),
-    section("Header", b.confirmations + " confirmation" + (b.confirmations === 1 ? "" : "s"), dl([
+    section("Header", burialText(b), dl([
       ["hash", full(b.hash)],
       ["previous", b.height > 0 ? link("block", b.height - 1, b.prev_hash) : full(b.prev_hash)],
       ["next", b.next_hash ? link("block", b.height + 1, b.next_hash) : h("span", { class: "dim" }, "none yet")],
@@ -870,6 +909,8 @@ async function blockPage(m) {
       b.merged && ["midstate time", utc(b.merged.midstate_timestamp)],
       b.merged && ["commit", full(b.merged.commit_address) ],
       ["signed by", b.miner ? link("bond", b.miner.bond_id, b.miner.bond_id) : h("span", { class: "dim" }, "unsigned")],
+      weight && ["fork choice", weight],
+      ["settled", h("span", null, burialText(b), h("span", { class: "dim" }, " · " + burialNote(b)))],
       ...b.registrations.map(r => ["registers bond", h("span", null, link("bond", r.bond_id, short(r.bond_id, 16)),
         h("span", { class: "dim" }, ` · ${gmds(r.value)} · locked to midstate ${num(r.bonded_until)} · ${r.headers} headers`))]),
     ])),
@@ -937,6 +978,7 @@ async function outputPage(m) {
       ["recovery commitment", full(o.recovery_commitment)],
       ["encrypted payload", o.payload_bytes + " bytes"],
       ["created in", link("block", o.created_height, o.created_hash)],
+      o.created_burial && ["settled", h("span", null, burialText(o.created_burial), h("span", { class: "dim" }, " · " + burialNote(o.created_burial)))],
       o.spent_hash && ["spent in", link("block", o.spent_height, o.spent_hash)],
     ]), h("div", { class: "note" }, "The amount is hidden in the commitment; only the recipient's keys can open the payload. A spent output can be followed to the block that spent it, but not to the outputs that block created: aggregation removes that link.")));
 }
@@ -945,8 +987,9 @@ async function kernelPage(m) {
   const k = await get("/explorer/kernel/" + m[1]);
   view.replaceChildren(
     h("div", { class: "title" }, h("h1", null, (k.coinbase ? "Coinbase kernel " : "Kernel ") + short(k.excess, 12))),
-    section("Kernel", null, dl([
+    section("Kernel", burialText(k), dl([
       ["block", link("block", k.height, "block " + num(k.height) + " · " + short(k.hash, 16))],
+      ["settled", h("span", null, burialText(k), h("span", { class: "dim" }, " · " + burialNote(k)))],
       ["fee", coins(k.fee)],
       ["features", typeof k.features === "string" ? k.features : JSON.stringify(k.features)],
       ["min height", k.min_height ? num(k.min_height) : "—"],

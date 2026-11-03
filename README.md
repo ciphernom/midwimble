@@ -73,6 +73,13 @@ recovery design.
   enough bonds, and the capital locked grows with the hashrate it covers. It
   is the same `n > cap` test that already drops an over-cap block's
   fork-choice weight to 1/1024 of its work, so pay and weight agree.
+- **Over-cap blocks are orphaned:** one block that counts in full outweighs
+  up to 1,023 over-cap ones, so while the tip is a run of other producers'
+  over-cap blocks, nodes build on the block before the run, and a block there
+  replaces it all, pay and fees included (at most 100 blocks back;
+  `--no-orphan-over-cap` keeps a node on the tip). Past its bonds' share, a
+  producer's blocks are replaced, not just tapered: see
+  `docs/BONDED_POW.md`.
 - **Checkable anywhere:** the schedule is defined by its running total, so any
   node can check that a supply claimed at any height is one the schedule could
   have produced -- never above it, and below it by whatever has been burned;
@@ -341,7 +348,7 @@ shares the CLI's phrases, addresses and wallet file format. See
 - `POST /mempool/txs` (those transactions, for wallets to see payments before a block confirms them)
 - `POST /tx`
 - `POST /mining`
-- `POST /mining/template` (weighted payouts, `extra`, receipts)
+- `POST /mining/template` (weighted payouts, `extra`, receipts; `prev_hash` and `orphans` say whether it builds past over-cap blocks)
 - `POST /mining/bind` (copies of a template with their own `extra`, re-signed, one per pool miner)
 - `POST /mining/submit`
 - `POST /peers`
@@ -352,7 +359,9 @@ shares the CLI's phrases, addresses and wallet file format. See
 It also serves the block explorer (`/`, `/explorer/...`) for the machine it
 runs on, including a burn tracker (`/#/burn`, `GET /explorer/burn`): what the
 over-cap taper has withheld since the mainnet switch, in total, per day and
-per bond, checked against the chain's supply. The RPC answers only requests
+per bond, checked against the chain's supply. It marks over-cap blocks, and
+gives each block's, kernel's and output's *full-weight confirmations*: the
+confirmations that would take bonds to undo. The RPC answers only requests
 addressed to an IP address, `localhost`, or a name given with
 `--rpc-allow-host` (a proxy's or container network's name for the node), so a
 web page cannot reach it by pointing a domain of its own at 127.0.0.1. To

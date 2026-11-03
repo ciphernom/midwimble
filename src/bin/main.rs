@@ -91,6 +91,12 @@ enum Cmd {
         /// Minimum milliseconds between blocks we mine (for local devnets).
         #[arg(long, default_value_t = 0)]
         min_block_interval: u64,
+        /// Always build on the tip. By default, while the tip is a run of
+        /// other producers' over-cap blocks (at most 100), this node's blocks
+        /// and the templates its RPC hands out build on the last block
+        /// before the run, so a block that counts in full replaces it.
+        #[arg(long)]
+        no_orphan_over_cap: bool,
         /// Mining backend: auto, gpu or cpu (gpu needs a build with `--features gpu`).
         #[arg(long, default_value = "auto")]
         backend: String,
@@ -1314,6 +1320,7 @@ fn run(cli: Cli) -> Result<()> {
             amino,
             public_address,
             min_block_interval,
+            no_orphan_over_cap,
             backend,
             checkpoint,
             prune,
@@ -1403,6 +1410,7 @@ fn run(cli: Cli) -> Result<()> {
             config.amino = amino;
             config.public_address = public_address.map(|a| a.parse()).transpose()?;
             config.min_block_interval = std::time::Duration::from_millis(min_block_interval);
+            config.orphan_over_cap = !no_orphan_over_cap;
             config.finality = midwimble::finality::FinalityConfig {
                 anchor_depth,
                 finality_depth,

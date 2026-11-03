@@ -267,6 +267,17 @@ impl ReorgCache {
         }
     }
 
+    /// Every cached transaction mined at `height` or above, left in place:
+    /// what a block replacing those blocks can carry again
+    /// (`core::orphan::OrphanBase::carried`).
+    pub fn since(&self, height: u64) -> Vec<Transaction> {
+        self.blocks
+            .iter()
+            .filter(|(h, _)| *h >= height)
+            .flat_map(|(_, txs)| txs.iter().cloned())
+            .collect()
+    }
+
     /// Removes and returns every cached transaction mined at `height` or above.
     pub fn take_from(&mut self, height: u64) -> Vec<Transaction> {
         let mut out = Vec::new();

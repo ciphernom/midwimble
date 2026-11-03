@@ -11,6 +11,7 @@ pub mod gpu_mining;
 pub mod mmr;
 pub mod mss;
 pub mod mw;
+pub mod orphan;
 pub mod recovery;
 pub mod relay;
 pub mod scan;

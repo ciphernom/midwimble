@@ -192,6 +192,39 @@ fn choose_relay(
     None
 }
 
+/// The block weight a block on `state` paying `payouts` coinbase outputs has
+/// left for transactions: what its coinbase kernel, the next registration
+/// the producer's bonds carry (its own, then its co-bonds', one a block until
+/// the chain has them) and the midstate headers `feed` would relay leave
+/// over.
+pub fn transaction_budget(
+    state: &State,
+    payouts: usize,
+    bond: Option<&MinerBond>,
+    feed: Option<&RelayFeed>,
+) -> u64 {
+    let registration = bond
+        .into_iter()
+        .flat_map(|b| {
+            std::iter::once((b.bond_id, b.registration.as_ref())).chain(
+                b.co_bonds
+                    .iter()
+                    .map(|c| (c.bond_id, c.registration.as_ref())),
+            )
+        })
+        .filter(|(id, _)| !state.bonds.contains_key(id))
+        .find_map(|(_, r)| r)
+        .map_or(0, |r| r.weight());
+    let relay = feed
+        .and_then(|f| f.next_for(&state.relay))
+        .map_or(0, |r| r.weight());
+    MAX_BLOCK_WEIGHT
+        .saturating_sub((payouts as u64).saturating_mul(OUTPUT_WEIGHT))
+        .saturating_sub(KERNEL_WEIGHT)
+        .saturating_sub(registration)
+        .saturating_sub(relay)
+}
+
 /// Picks transactions greedily by fee per weight until the block is full,
 /// skipping any that conflict with one already chosen or that are not yet
 /// valid at `height`.

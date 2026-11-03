@@ -480,6 +480,27 @@ impl Storage {
         load_header_range(&self.db, HEADERS, start, count)
     }
 
+    /// How many of the blocks from `height` up to the tip of a chain `tip`
+    /// blocks long counted in full in fork choice, the block at `height`
+    /// included: its confirmations that would take bonds to undo
+    /// (`core::orphan::full_weight_blocks`). `None` for a block more than
+    /// `limit` blocks deep, which is not counted, or one not on the chain.
+    pub fn full_weight_confirmations(
+        &self,
+        height: u64,
+        tip: u64,
+        limit: u64,
+    ) -> Result<Option<u64>> {
+        if height >= tip || tip - height > limit {
+            return Ok(None);
+        }
+        let start = height.saturating_sub(1);
+        let headers = self.load_headers(start, tip - start)?;
+        Ok(Some(crate::core::orphan::full_weight_blocks(
+            &headers, height,
+        )))
+    }
+
     /// Timestamps of the (up to) `n` blocks below `end`, oldest first.
     pub fn load_timestamps(&self, end: u64, n: u64) -> Result<Vec<u64>> {
         let start = end.saturating_sub(n);
@@ -632,6 +653,19 @@ impl Storage {
         }
         let mut state = current.clone();
         let txn = self.db.begin_read()?;
+        // The undo records must be the ones `current`'s blocks left: a caller
+        // off the event loop may hold a tip that a reorganisation has since
+        // replaced, whose blocks' records are gone. Blocks added on top
+        // since change nothing below it.
+        if let Some(last) = current.height.checked_sub(1) {
+            let stored = match txn.open_table(HEADERS)?.get(last)? {
+                Some(v) => Some(bincode::deserialize::<BatchHeader>(v.value())?),
+                None => None,
+            };
+            if stored.map(|h| h.extension.final_hash) != Some(current.header_hash) {
+                bail!("the chain has been reorganised since the state was taken");
+            }
+        }
         let undo_table = txn.open_table(UNDO)?;
         for h in (height..current.height).rev() {
             let undo: BlockUndo = match undo_table.get(h)? {

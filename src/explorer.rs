@@ -16,9 +16,11 @@ pub mod burn;
 
 use crate::core::bond::{signer_cap, CAP_WINDOW};
 use crate::core::mw::transaction::{Kernel, Output};
+use crate::core::orphan::full_weight;
 use crate::core::state::calculate_work;
 use crate::core::types::{block_reward, Batch, State, COINBASE_MATURITY};
 use crate::node::NodeHandle;
+use crate::sync::MAX_REORG_DEPTH;
 use axum::extract::{Path, Query, State as AxState};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -263,10 +265,22 @@ fn fees(b: &Batch) -> u64 {
 /// whole scheduled reward -- but from the switch on it is genuinely unknown,
 /// and reporting the schedule there would show a tapered block as full pay.
 /// Unknown is published as `null`, not guessed.
-fn summary(height: u64, b: &Batch, prev_timestamp: Option<u64>, minted: Option<u64>) -> Value {
+///
+/// `weight_before` is the chain's weight before the block, which says what
+/// the block added to it: all its work (as far as the work cap allows), or,
+/// over its signer's cap, a sliver (`core::orphan::full_weight`). `None`
+/// leaves that unsaid.
+fn summary(
+    height: u64,
+    b: &Batch,
+    prev_timestamp: Option<u64>,
+    minted: Option<u64>,
+    weight_before: Option<u128>,
+) -> Value {
     let scheduled = block_reward(height);
     let minted = minted
         .or_else(|| (b.timestamp < crate::core::bond::EARLY_BONDS_UNTIL).then_some(scheduled));
+    let credited = weight_before.map(|w| b.chain_weight.saturating_sub(w));
     json!({
         "height": height,
         "hash": hex::encode(b.extension.final_hash),
@@ -300,7 +314,37 @@ fn summary(height: u64, b: &Batch, prev_timestamp: Option<u64>, minted: Option<u
         "miner": b.miner.as_ref().map(|m| hex::encode(m.bond_id)),
         "merged": b.aux_pow.is_some(),
         "registrations": b.registrations.len(),
+        // What the block added to fork choice, and whether that was all its
+        // work: an over-cap block adds a sliver, and one full-weight block
+        // on the block below it would orphan it (`core::orphan`).
+        "credited": credited.map(|c| c.to_string()),
+        "full_weight": credited.map(|c| full_weight(c, calculate_work(&b.target))),
     })
+}
+
+/// How deep the block at `height` lies under the tip of a chain `tip`
+/// blocks long: its confirmations, how many of those counted in full (each
+/// one more full-weight block, so more bonds, that replacing it would take),
+/// and whether it is final, below the finalized checkpoint. Full-weight
+/// confirmations are counted down to `MAX_REORG_DEPTH`, past which this node
+/// does not reorganise; deeper, they are `null`.
+fn burial(storage: &crate::storage::Storage, height: u64, tip: u64) -> Value {
+    let floor = storage.finality().map(|f| f.floor).unwrap_or(0);
+    json!({
+        "confirmations": tip.saturating_sub(height),
+        "full_weight_confirmations": storage
+            .full_weight_confirmations(height, tip, MAX_REORG_DEPTH)
+            .ok()
+            .flatten(),
+        "finalized": height < floor,
+    })
+}
+
+/// Copies `burial`'s fields into `v`.
+fn bury(v: &mut Value, burial: Value) {
+    if let (Some(v), Value::Object(fields)) = (v.as_object_mut(), burial) {
+        v.extend(fields);
+    }
 }
 
 fn output_json(o: &Output, idx: &ExplorerIndex, state: &State) -> Value {
@@ -364,9 +408,15 @@ pub async fn blocks(
             .enumerate()
             .filter(|(i, _)| from + *i as u64 >= start)
             .map(|(i, b)| {
-                let prev = i.checked_sub(1).map(|p| batches[p].timestamp);
+                let prev = i.checked_sub(1).map(|p| &batches[p]);
                 let h = from + i as u64;
-                summary(h, b, prev, node.storage().subsidy_at(h).ok().flatten())
+                summary(
+                    h,
+                    b,
+                    prev.map(|p| p.timestamp),
+                    node.storage().subsidy_at(h).ok().flatten(),
+                    prev.map(|p| p.chain_weight),
+                )
             })
             .collect();
         out.reverse();
@@ -407,14 +457,15 @@ pub async fn block(
         let mut v = summary(
             height,
             &b,
-            prev.map(|p| p.timestamp),
+            prev.as_ref().map(|p| p.timestamp),
             storage.subsidy_at(height).ok().flatten(),
+            prev.as_ref().map(|p| p.chain_weight),
         );
 
         let body = &b.body.body;
         v["prev_hash"] = json!(hex::encode(b.prev_header_hash));
         v["next_hash"] = json!(next.map(|n| hex::encode(n.extension.final_hash)));
-        v["confirmations"] = json!(tip - height);
+        bury(&mut v, burial(storage, height, tip));
         v["target"] = json!(hex::encode(b.target));
         v["work"] = json!(calculate_work(&b.target).to_string());
         v["nonce"] = json!(b.extension.nonce);
@@ -518,6 +569,7 @@ pub async fn output(
         v["spent_height"] = json!(spent);
         v["spent_hash"] = json!(spent_hash);
         v["tip"] = json!(state.height);
+        v["created_burial"] = burial(storage, created, state.height);
         Ok(Json(v))
     })
     .await
@@ -546,6 +598,8 @@ pub async fn kernel(
         v["hash"] = json!(hex::encode(b.extension.final_hash));
         v["coinbase"] = json!(coinbase);
         v["block_kernels"] = json!(b.body.body.kernels.len());
+        // How settled the transaction is: its block's burial.
+        bury(&mut v, burial(node.storage(), height, node.state().height));
         Ok(Json(v))
     })
     .await
